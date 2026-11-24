@@ -1,0 +1,80 @@
+{
+  "containers_running_before": 0,
+  "vm_memory_limit_bytes": 8319770624,
+  "idle": {
+    "processes": 11,
+    "rss_total_mb": 1469.328125,
+    "footprint_total_mb": 2070.595703125,
+    "vm_footprint_mb": 1605.0,
+    "samples": [
+      {
+        "processes": 11,
+        "rss_total_mb": 1468.03125,
+        "footprint_total_mb": 2069.595703125,
+        "vm_footprint_mb": 1605.0
+      },
+      {
+        "processes": 11,
+        "rss_total_mb": 1469.046875,
+        "footprint_total_mb": 2070.595703125,
+        "vm_footprint_mb": 1605.0
+      },
+      {
+        "processes": 11,
+        "rss_total_mb": 1469.328125,
+        "footprint_total_mb": 2070.595703125,
+        "vm_footprint_mb": 1605.0
+      },
+      {
+        "processes": 11,
+        "rss_total_mb": 1469.390625,
+        "footprint_total_mb": 2070.595703125,
+        "vm_footprint_mb": 1605.0
+      },
+      {
+        "processes": 11,
+        "rss_total_mb": 1469.46875,
+        "footprint_total_mb": 2070.595703125,
+        "vm_footprint_mb": 1605.0
+      }
+    ]
+  },
+  "one_container": {
+    "processes": 11,
+    "rss_total_mb": 1468.5625,
+    "footprint_total_mb": 2067.595703125,
+    "vm_footprint_mb": 1605.0,
+    "samples": [
+      {
+        "processes": 11,
+        "rss_total_mb": 1468.265625,
+        "footprint_total_mb": 2066.595703125,
+        "vm_footprint_mb": 1605.0
+      },
+      {
+        "processes": 11,
+        "rss_total_mb": 1468.484375,
+        "footprint_total_mb": 2066.595703125,
+        "vm_footprint_mb": 1605.0
+      },
+      {
+        "processes": 11,
+        "rss_total_mb": 1468.5625,
+        "footprint_total_mb": 2067.595703125,
+        "vm_footprint_mb": 1605.0
+      },
+      {
+        "processes": 11,
+        "rss_total_mb": 1472.1875,
+        "footprint_total_mb": 2067.595703125,
+        "vm_footprint_mb": 1605.0
+      },
+      {
+        "processes": 11,
+        "rss_total_mb": 1477.359375,
+        "footprint_total_mb": 2067.595703125,
+        "vm_footprint_mb": 1605.0
+      }
+    ]
+  }
+}
