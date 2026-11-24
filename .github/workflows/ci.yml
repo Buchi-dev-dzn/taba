@@ -39,3 +39,16 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --locked
+      - name: Debug (temporary)
+        if: failure() && runner.os == 'macOS'
+        run: |
+          set -x
+          export TABA_HOME=$RUNNER_TEMP/dbg
+          which -a python3; python3 --version
+          ./target/debug/taba run --scope d --name web --port 18999 --wait=10 -- python3 -m http.server 18999 --bind 127.0.0.1 || true
+          sleep 2
+          ./target/debug/taba ps --json || true
+          cat $TABA_HOME/logs/d/web.log || true
+          curl -sv http://127.0.0.1:18999/ -o /dev/null || true
+          ps -axo pid,pgid,stat,command | grep -i "[h]ttp.server" || true
+          lsof -nP -iTCP:18999 || true
