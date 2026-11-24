@@ -24,9 +24,9 @@ without containers. It's one binary, with no daemon and no config file.
 When you work with AI coding agents and several terminals, `localhost` ports
 pile up. One task alone can leave three servers running. A few hours later,
 nobody knows what is on `:5173`, which checkout it runs from, or whether it is
-safe to kill. `taba` records the owner (a named **scope**) when a process
-starts, so anyone can later see what belongs to which task and stop exactly
-that task's processes.
+safe to kill. `taba` records the owner (a **scope**: by default the git
+worktree you run it in) when a process starts, so anyone can later see what
+belongs to which task, and only that task can stop its processes.
 
 ## Install
 
@@ -46,13 +46,31 @@ command a second time reuses the service that is already running and does not
 start a copy.
 
 ```sh
-taba run --scope login-fix --name web --port 5173 -- npm run dev -- --port 5173 --strictPort
+# Inside a git worktree, the worktree is the scope: no --scope needed.
+taba run --name web --port auto --wait -- npm run dev -- --port {port} --strictPort
+# started login-fix-3f9a/web → http://localhost:4100
+#   ...
+#   ready tcp check passed in 840 ms
+
+# Or name the scope and the port yourself.
+taba run --scope login-fix --name web --port 5173 -- npm run dev -- --port {port} --strictPort
 ```
 
 ![taba run starting services in two checkouts, then re-running one](docs/images/run.svg)
 
-> `--port` only tells taba which port to track. Pass the port to your own
-> command as well.
+- **`--port auto`** picks the lowest free port in 4100–4999 (`--port auto:5173`
+  starts the search at 5173). The choice is recorded before taba lets go of
+  its lock, so parallel runs never get the same port.
+- **taba hands the port to the app** in two ways: it replaces every `{port}`
+  in the command, and it sets `PORT` in the app's environment. With
+  `--port auto` and no `{port}` in the command, taba warns that the app may
+  ignore `PORT`.
+- **`--wait[=SECS]`** (default 30 s) returns only once the service is ready:
+  its port accepts connections (`--ready tcp`, the default), an HTTP request
+  answers below 500 (`--ready http:/health`), or a log line matches
+  (`--ready 'log:listening on'`). If the process exits first, `run` fails
+  with the end of its log. If the time runs out, `run` fails and leaves the
+  process running, so you can read its log.
 
 **What `taba run` does.** It wraps the command you already use, such as
 `npm run dev`. It starts it detached in its own process group, records the
@@ -66,6 +84,14 @@ gives you the prompt back. The server itself runs unchanged.
 | Output | in that terminal only | in a log file, `taba logs` from any terminal |
 | Later | find it with `ps` / `lsof` | `taba ps` shows task, URL and directory |
 
+**Check where you are.** `taba whoami` prints the scope taba would use here
+and where it comes from (`--scope`, `$TABA_SCOPE`, or the git worktree), the
+branch, and the scope's services:
+
+```sh
+taba whoami          # scope login-fix-3f9a (from git), worktree, branch, agent, services
+```
+
 **See what is running**, across every scope or for a single one:
 
 ```sh
@@ -76,8 +102,9 @@ taba ps --json              # every field with absolute paths, for scripts and a
 ```
 
 **Port conflicts are reported before anything starts.** If the port is in use,
-taba names the owner (with its command line, for a process taba didn't start)
-and starts nothing:
+taba names the owner (with its command line, for a process taba didn't start),
+starts nothing, and suggests `--port auto`. It never offers to kill the
+holder:
 
 ![taba run refusing ports held by another taba service and by an unmanaged process](docs/images/port-conflict.svg)
 
@@ -94,8 +121,18 @@ taba logs billing/web -f    # follow it until the service exits
 running:
 
 ```sh
-taba stop billing/web
-taba stop --scope billing
+taba stop web                 # in the service's worktree (or with $TABA_SCOPE)
+taba stop --scope billing     # every service of scope billing
+```
+
+**Only the owner stops a service.** `stop` and `rm` refuse a service of
+another scope with `E_NOT_OWNER`, also for a person in a terminal with no
+scope at all. To override, give a reason; it is appended to
+`$TABA_HOME/events.jsonl` with who, where and why:
+
+```sh
+taba stop billing/web                                    # from elsewhere: refused (exit 3)
+taba stop billing/web --force --reason "stuck since lunch"
 ```
 
 ![taba stop --scope billing stops two services and leaves login-fix running](docs/images/stop-scope.svg)
@@ -118,9 +155,35 @@ runs `python3 -m http.server` sample services under a throwaway `TABA_HOME`.
 
 taba is meant for AI coding agents as much as for people:
 
-- **Set `TABA_SCOPE` once per task.** `run` uses it when `--scope` is omitted.
-  `logs` and `stop` use it when you give a bare `NAME` instead of `SCOPE/NAME`.
-  `stop` with no target always needs an explicit `--scope`.
+- **Start servers with `run --port auto --wait --json`.** The agent never
+  invents a port, and the reply says when the server is ready and where:
+
+  ```console
+  $ taba run --name web --port auto --wait --json -- npm run dev -- --port {port} --strictPort
+  {
+    "ok": true,
+    "status": "started",
+    "service": "login-fix-3f9a/web",
+    "url": "http://localhost:4100",
+    "port": 4100,
+    "ready": { "check": "tcp", "ms": 840 },
+    ...
+  }
+  ```
+
+  Running the same command again returns `"status": "already_running"` with
+  the same URL, so it is safe to repeat.
+- **Each worktree is its own scope.** Agents in separate git worktrees get
+  separate scopes without configuring anything, and successive agents in one
+  worktree share its services. `$TABA_SCOPE` or `--scope` still override
+  this, for orchestrators that want task-named scopes. Run `taba whoami` to
+  see which scope applies.
+- **Errors are machine-readable.** With `--json` (or `TABA_OUTPUT=json`),
+  `run`, `stop` and `whoami` print one JSON document for success and
+  failure. A failure has `error.code`, `error.message`, `error.details` and
+  `error.next`, a list of allowed next steps, most preferred first. `next`
+  never suggests `kill` or `--force`; when only a person can resolve the
+  error, it ends with "ask the human". See [Errors](#errors).
 - **Use `taba ps --json`** to find a service that is already running before
   starting another, and to read its URL, directory, pid and log path:
 
@@ -128,6 +191,13 @@ taba is meant for AI coding agents as much as for people:
   $ taba ps --scope login-fix --json
   [
     {
+      "service": "login-fix/web",
+      "scope": "login-fix",
+      "name": "web",
+      "status": "running",
+      "url": "http://localhost:8001",
+      "port": 8001,
+      "directory": "/Users/Shared/demo/shop-login-fix",
       "command": [
         "python3",
         "-u",
@@ -135,17 +205,11 @@ taba is meant for AI coding agents as much as for people:
         "http.server",
         "8001"
       ],
-      "directory": "/Users/Shared/demo/shop-login-fix",
+      "pid": 72306,
+      "pgid": 72306,
+      "start_time": 1795509874101287,
       "log_path": "/Users/Shared/demo/taba-home/logs/login-fix/web.log",
-      "name": "web",
-      "pgid": 29031,
-      "pid": 29031,
-      "port": 8001,
-      "scope": "login-fix",
-      "service": "login-fix/web",
-      "start_time": 1795502011043765,
-      "status": "running",
-      "url": "http://localhost:8001"
+      "instance": "72306-1795509874101287"
     }
   ]
   ```
@@ -155,7 +219,8 @@ taba is meant for AI coding agents as much as for people:
 
 [`skills/taba/SKILL.md`](skills/taba/SKILL.md) is a skill in the Agent Skills
 format. It tells an agent when and how to use taba: reuse before starting,
-explicit ports, staying inside its own scope, and what to report at hand-off.
+`--port auto --wait --json`, reading `error.next`, staying inside its own
+scope, and what to report at hand-off.
 To install it, copy or symlink the `skills/taba` directory into a skills
 folder your agent reads:
 
@@ -174,16 +239,20 @@ If your agent doesn't load skills, paste this into `AGENTS.md` or `CLAUDE.md`:
 ```markdown
 ## Long-running processes (dev servers, watchers, databases)
 
-- Start them with `taba run --scope <task> --name <name> --port <port> -- <cmd>`,
-  never with `&` or `nohup`. Pass the same port to the command itself.
-- Use one scope per task or branch (or `$TABA_SCOPE` if set).
-- Before starting, run `taba ps --scope <task> --json` and reuse a service that
-  is already running.
-- If a port is taken, do not kill the other process. Pick another port or ask.
-- Read output with `taba logs <task>/<name>`.
-- Stop only your own scope: `taba stop --scope <task>`, then clean up with
-  `taba rm --scope <task>`. Never stop or remove other scopes, or touch
-  processes taba didn't start.
+- Start them with
+  `taba run --name <name> --port auto --wait --json -- <cmd with {port}>`,
+  never with `&` or `nohup`, and use the `url` from the reply. Never invent a
+  port.
+- The git worktree you work in is your scope (`taba whoami` shows it). If
+  `$TABA_SCOPE` is set, it wins.
+- Before starting, run `taba ps --scope <scope> --json` and reuse a service
+  that is already running.
+- On an error, read `error.code` and do the first item of `error.next`. Never
+  answer `E_PORT_IN_USE` or `E_NOT_OWNER` with `kill`, `pkill` or `--force`.
+- Read output with `taba logs <name>`.
+- Stop only your own scope: `taba stop --scope <scope>`, then clean up with
+  `taba rm --scope <scope>`. Never touch other scopes or processes taba
+  didn't start.
 - At hand-off, report each service's name and URL, and say whether you left
   it running or stopped it.
 ```
@@ -214,8 +283,17 @@ that. Measurements against Docker are in [docs/benchmarks.md](docs/benchmarks.md
 
 ## Ownership model
 
-- **A scope owns its processes.** The owner is a named task, not the terminal
-  or agent that started the process. Ownership survives closing the terminal.
+- **A scope owns its processes.** The owner is a task, not the terminal or
+  agent that started the process. By default it is the git worktree folder
+  (`<folder>-<hash4>`; the branch is not part of it), else `$TABA_SCOPE` or
+  `--scope`. Ownership survives closing the terminal.
+- **Only the owner stops or removes.** `stop` and `rm` of another scope's
+  service are refused with `E_NOT_OWNER`, for agents and people alike.
+  `--force --reason TEXT` is the only override, and every use is recorded in
+  `events.jsonl`.
+- **One change per service at a time.** A `stop`, and a `run` until its
+  service is ready, hold a per-service operation lock. A second `stop` of
+  the same service gets `E_BUSY` instead of signalling it again.
 - **taba stops only what it started and can still verify.** A service is
   signalled only if its identity still matches: the leader pid with its exact
   start time or, if the leader has exited, a surviving process group whose
@@ -236,33 +314,71 @@ that. Measurements against Docker are in [docs/benchmarks.md](docs/benchmarks.md
 
 | Command | What it does |
 | --- | --- |
-| `taba run [--scope S] --name N [--port P] -- CMD...` | Start `CMD` detached as service `S/N`, in its own process group, with output appended to its log. |
-| `taba ps [--scope S] [--running] [--json]` | List services with status `running` or `exited`, plus URL and directory (`~` for your home; absolute in `--json`). `--running` hides exited ones. |
-| `taba logs [-f] S/N` (or `N` with `$TABA_SCOPE`) | Print the log. Add `-f` to follow it until the service exits. |
-| `taba stop S/N` (or `N` with `--scope` / `$TABA_SCOPE`) | Stop one service. |
+| `taba run [--scope S] --name N [--port P \| auto \| auto:START] [--wait[=SECS]] [--ready CHECK] [--json] -- CMD...` | Start `CMD` detached as service `S/N`, in its own process group, with output appended to its log. `{port}` in `CMD` is replaced by the port, and `PORT` is set. |
+| `taba whoami [--scope S] [--json]` | Show the scope taba uses here, its source (`flag`, `env`, `git`), worktree, branch, agent and services. |
+| `taba ps [--scope S] [--running] [--json]` | List services with status `running`, `starting`, `stopping` or `exited`, plus URL and directory (`~` for your home; absolute in `--json`). `--running` hides exited ones. |
+| `taba logs [-f] S/N` (or `N` in your scope) | Print the log. Add `-f` to follow it until the service exits. |
+| `taba stop S/N` (or `N` in your scope) | Stop one service of your own scope. |
 | `taba stop --scope S` | Stop every service in scope `S`. |
 | `taba stop ... --timeout SECS` | Seconds to wait between SIGTERM and SIGKILL (default 5). |
-| `taba rm S/N` (or `N` with `--scope` / `$TABA_SCOPE`) | Delete a stopped service's record and log. Refuses a running service. |
+| `taba stop ... --force --reason TEXT` | Stop a service of another scope; recorded in `events.jsonl`. |
+| `taba rm S/N` (or `N` in your scope) | Delete a stopped service's record and log. Refuses a running service, and another scope's service without `--force --reason`. |
 | `taba rm --scope S` | Delete the records and logs of every stopped service in scope `S`; running ones are kept and reported. |
 
-Run `taba <command> --help` to see all flags.
+`--ready` is `tcp` (default when there is a port), `http:PATH` or
+`log:REGEX`, and needs `--wait`. `--agent NAME` on `run`, `stop`, `rm` and
+`whoami` overrides `$TABA_AGENT`. Run `taba <command> --help` to see all
+flags.
+
+### Errors
+
+With `--json` or `TABA_OUTPUT=json`, `run`, `stop` and `whoami` print
+`{"ok": true, ..., "warnings": [...]}` or
+`{"ok": false, "error": {"code", "message", "details", "next"}, ...}`.
+Without it, the message and the next steps go to stderr. The exit status
+follows the code:
+
+| Code | Exit | Meaning |
+| --- | --- | --- |
+| `E_USAGE`, `E_INVALID_IDENT`, `E_FORCE_NEEDS_REASON` | 2 | Bad flags or names; `--force` without `--reason`. |
+| `E_NO_SCOPE` | 2 | No `--scope`, no `$TABA_SCOPE`, and not inside a git worktree. |
+| `E_NOT_OWNER` | 3 | The service belongs to another scope. |
+| `E_BUSY` | 3 | Another `stop` or starting `run` of that service is in progress. |
+| `E_CONFLICT` | 3 | Same name already running with a different command, directory or port. |
+| `E_STILL_RUNNING` | 3 | `rm` of a running service. |
+| `E_PORT_IN_USE`, `E_PORT_CLAIMED` | 4 | The port is held by a process, or reserved by another taba service. |
+| `E_NO_FREE_PORT` | 4 | `--port auto` found no free port in its range. |
+| `E_START_FAILED` | 4 | The process exited before it was ready; `details.log_tail` has its last lines. |
+| `E_NOT_READY` | 4 | `--wait` timed out; the process is still running. |
+| `E_NOT_FOUND` | 5 | No such service. |
+| `E_STATE`, `E_SIGNAL_FAILED` | 1 | State directory unreadable or too new; a signal failed. |
+
+`stop --scope` reports each service in `results` (`stopped`, `killed`,
+`not_running`, or `refused` with its error) and exits 3 if any was refused.
 
 ### Environment variables
 
 | Variable | Meaning |
 | --- | --- |
-| `TABA_SCOPE` | Default scope for `run`, and for `logs` / `stop` when the target is a bare `NAME`. |
+| `TABA_SCOPE` | The caller's scope when `--scope` is not given; beats the git worktree. |
+| `TABA_AGENT` | Name of the acting agent, recorded with services and `--force` events (default `human`). |
+| `TABA_OUTPUT` | `json` makes `run`, `stop`, `whoami` and `ps` print JSON. |
 | `TABA_HOME` | State directory (default `~/.taba`). |
-| `TABA_SCOPE`, `TABA_SERVICE` | Set *inside* each started process, so it knows its own scope and service. |
+| `TABA_SCOPE`, `TABA_SERVICE`, `PORT` | Set *inside* each started process: its scope, its service name and (with `--port`) its port. |
 
 ### State and logs
 
 ```text
 $TABA_HOME (default ~/.taba)
-├── services/<scope>/<name>.json   # command, directory, port, pid, pgid, start time, log path
+├── services/<scope>/<name>.json   # command, directory, port, pid, pgid, start time, log path, instance
 ├── logs/<scope>/<name>.log        # stdout + stderr, appended across runs
-└── lock                           # serialises concurrent `run`s
+├── ops/<scope>/<name>.json        # in-flight stop or start of that service (operation lock)
+├── events.jsonl                   # audit log of --force overrides
+├── version                        # state schema version (2)
+└── lock                           # serialises changes to the state
 ```
+
+State written by taba 0.1 is read unchanged.
 
 ## Limitations
 
@@ -277,15 +393,24 @@ taba is an early prototype:
 - **Some children are not tracked.** Children that move into a different
   process group or session are not tracked, and `stop` won't reach them.
 - **No log rotation.** Logs grow across runs until you `taba rm` the service.
+- **Ownership is a convention, not security.** `--scope`, `$TABA_SCOPE` and
+  `$TABA_AGENT` are claims: any process of your user can name any scope, and
+  `taba stop --scope S` acts as `S`. The rules prevent accidents between
+  cooperating agents, not deliberate misuse. Agent leases, which tell a live
+  holder of a scope from its successor, come in a later milestone.
 
 ## Roadmap
 
+- The rest of [design v0.2](docs/design-v0.2.md): JSON for every command and
+  `ps --all` (M2), agent leases and `gc` (M3), borrows of another scope's
+  service (M4), hand-over with `move` (M5), agent hooks (M6)
 - Log rotation
 - Linux support
 - Better port detection (non-loopback binds)
 - Prebuilt binaries and a Homebrew formula
 
-See [docs/plan.md](docs/plan.md) for the design notes.
+See [docs/design-v0.2.md](docs/design-v0.2.md) for the current design and
+[docs/plan.md](docs/plan.md) for v0.1.
 
 ## License
 

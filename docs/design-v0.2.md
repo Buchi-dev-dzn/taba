@@ -1,6 +1,7 @@
 # taba design v0.2: traffic rules for agents sharing localhost
 
-Status: design only, not implemented. Date: 2026-11-24. Supersedes
+Status: M1 implemented on `feat/taba-prototype` (see "M1 implementation
+notes" in section 8); M2 to M6 are design only. Date: 2026-11-24. Supersedes
 [plan.md](plan.md) (v0.1). Describes the code on `feat/taba-prototype` as of
 commit `ee809eb` wherever it says "today" or "v0.1". The owner's decisions
 of 2026-11-24 are recorded in [section 9](#9-decisions-2026-11-24) and are
@@ -1655,6 +1656,42 @@ operation lock for `stop`.
 10. One scope, many services: in `wt-a`, `web`, `api` and `worker` (no
     port) all run under the derived scope; `ps --scope` lists all three, and
     `stop --scope` stops all three.
+
+#### M1 implementation notes
+
+Where the design left a choice open, M1 does this:
+
+- `--port auto:START` tries 1000 ports, `START` to `START + 999` (capped at
+  65535). `{port}` is substituted for explicit ports too, and `PORT` is set
+  whenever there is a port. The "app may ignore `PORT`" warning is
+  `W_PORT_NOT_IN_COMMAND` and is given for `--port auto` only.
+- `--ready` requires `--wait`; `--ready tcp` or `http:` without `--port` is
+  `E_USAGE`.
+- `run` spawns while it holds the global lock (spawning is fast) and records
+  the service with its pid before releasing it, so no `starting` record
+  without a pid is ever written. The ready wait runs under the operation
+  lock (`op: start` for a new service, `replace` for an exited one), and
+  `ps` shows `starting` meanwhile.
+- `--scope` names the caller, as everywhere: `stop S/N --scope X` acts as
+  scope `X`, and `stop --scope S` (no target) acts as `S` and so always
+  owns its targets. Until M3 adds leases, nothing tells a live holder from
+  anyone else naming the same scope.
+- `rm` gets the same ownership rule as `stop` (section 4, `taba rm`), with
+  `force_rm` events, although M1 lists only `stop`.
+- `--force` is recorded (`force_stop`, `force_rm`) whenever it is given and
+  the stop or removal goes ahead, also by the owner; `overrode` lists the
+  checks it skipped.
+- `E_UNVERIFIABLE` is reported as result `not_running` with
+  `"unverifiable": true` instead of an error, so that `ps` (which shows
+  `exited`) and `stop` agree and v0.1 behaviour (exit 0) is kept.
+- `whoami` has no `holder`, `lease` or `takeover` yet (M3), and
+  `W_BRANCH_CHANGED` needs the scope record of M3. `ps --json` is still a
+  bare array (M2) with `instance` added. `--agent` exists on `run`, `stop`,
+  `rm` and `whoami`.
+- The v0.1 acceptance tests that stopped or removed services from a
+  directory without a scope now pass `--scope`: decision 4 deliberately
+  changes that behaviour, so "keeps every v0.1 test passing" holds only
+  with that change.
 
 ### M2: JSON everywhere and `ps --all`
 

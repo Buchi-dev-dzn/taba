@@ -1,114 +1,122 @@
 ---
 name: taba
-description: Start, reuse, inspect and stop long-running local processes (dev servers, databases, file watchers, workers) with the `taba` CLI, grouped by task scope. Use whenever you need a process that outlives a single command, need to check what is already running or on which port, read a background process's output, or clean up before handing work back.
+description: Start, reuse, inspect and stop long-running local processes (dev servers, databases, file watchers, workers) with the `taba` CLI, grouped by task scope (by default the git worktree). Use whenever you need a process that outlives a single command, need a free port, need to check what is already running or on which port, read a background process's output, or clean up before handing work back.
 ---
 
 # taba: long-running local processes, bundled per task
 
 `taba` records which task (a **scope**) owns each process it starts, so that
-you and the human can later see what is running and stop exactly your own
-processes. Everything below uses only these commands:
+you, other agents and the human can see what is running, and so that only
+the owning task stops it. By default your scope is the git worktree you work
+in. Everything below uses only these commands:
 
 ```sh
-taba run [--scope S] --name N [--port P] -- CMD...
+taba whoami [--json]
+taba run [--scope S] --name N [--port P | --port auto | --port auto:START]
+         [--wait[=SECS]] [--ready tcp|http:PATH|log:REGEX] [--json] -- CMD...
 taba ps [--scope S] [--running] [--json]
-taba logs [-f] S/N
-taba stop S/N
-taba stop --scope S [--timeout SECS]
-taba rm S/N
-taba rm --scope S
+taba logs [-f] S/N | N
+taba stop S/N | N | --scope S [--timeout SECS] [--json]
+taba rm S/N | N | --scope S
 ```
 
-## Rules
+## Procedure
 
-1. **Start long-running processes with `taba run`.** Never use `&`, `nohup`,
-   `disown`, `setsid` or a terminal you leave behind. `run` already detaches
-   and returns immediately.
-2. **Reuse before you start.** Run `taba ps --scope <scope> --json` first. If a
-   service you need has `"status": "running"`, use its `url` and don't start
-   another. Re-running the exact same `taba run` (same scope, name, command,
-   directory and port) is safe: it prints
-   `already running <scope>/<name> ...` and starts nothing.
-3. **Stay inside your own scope.** Never stop or `rm` another scope's
-   services, and never `kill` a process taba reports as not managed by taba.
+1. **First call: `taba whoami --json`.** It shows your `scope`, where it
+   comes from (`scope_source`: `flag`, `env` or `git`) and the `services`
+   that already exist in it. If `scope` is `null`, you are outside a git
+   worktree: `cd` into the worktree you work in, or pass `--scope`.
+2. **Reuse before you start.** If a service you need is listed, check it with
+   `taba ps --scope <scope> --json`. If it has `"status": "running"`, use its
+   `url` and don't start another.
+3. **Start with `--port auto --wait --json`** and put `{port}` where the app
+   takes its port:
+
+   ```sh
+   taba run --name web --port auto --wait --json -- npm run dev -- --port {port} --strictPort
+   taba run --name api --port auto --wait --json -- uvicorn app:app --port {port}
+   taba run --name worker --json -- npm run worker          # no port
+   ```
+
+   Read `url` from the reply and use exactly that URL. Never invent a port,
+   never use a port you did not get from taba, and make the app fail instead
+   of moving to another port (`--strictPort` for Vite). taba also sets `PORT`
+   in the app's environment. Re-running the same command is safe: it returns
+   `"status": "already_running"` with the same URL.
+4. **On an error, read `error.code` and do the first item of `error.next`.**
+   Every reply is one JSON document with `"ok"`. Never answer
+   `E_PORT_IN_USE`, `E_PORT_CLAIMED` or `E_NOT_OWNER` with `kill`, `pkill`,
+   `lsof … | xargs kill` or `--force`, whether the holder is a taba service
+   or a process taba didn't start. Start on another port with `--port auto`,
+   or ask the human, who can stop it themselves.
+5. **Stay inside your own scope.** Never stop or `rm` another scope's
+   services. taba refuses it with `E_NOT_OWNER` (exit 3), and `--force` is
+   for the human only.
+6. **Finish:** stop and clean up your scope, unless the human needs a server
+   (see "Hand-off").
+
+## Errors you will meet
+
+| `error.code` | What happened | What to do |
+| --- | --- | --- |
+| `E_NO_SCOPE` | No `--scope`, no `$TABA_SCOPE`, not in a git worktree. | `cd` into your worktree or pass `--scope`. |
+| `E_PORT_IN_USE`, `E_PORT_CLAIMED` | The port is taken. Nothing was started. | `--port auto` (the command is in `next`); never kill the holder. |
+| `E_START_FAILED` | The process exited before it was ready. | Read `error.details.log_tail` or `taba logs <name>`, fix, re-run. |
+| `E_NOT_READY` | `--wait` timed out; the process still runs. | `taba logs <name>`; `taba stop <name>` if it is stuck. |
+| `E_CONFLICT` | The name already runs with another command, directory or port. | `taba stop <name>` and run again, or use another `--name`. |
+| `E_NOT_OWNER` | The service belongs to another scope. | Use its URL read-only, or ask the human. |
+| `E_BUSY` | Someone else is stopping or starting that service right now. | Wait, then `taba ps --scope <scope> --json`. |
 
 ## Choosing a scope
 
-- If `$TABA_SCOPE` is set, use it. It is then the default for `run`, and for
-  `logs` / `stop` when the target is a bare `NAME`.
-- Otherwise use one scope per task or branch, and pass `--scope` on every
-  `run`.
-- Names: lowercase, short, stable, e.g. the branch or ticket (`login-fix`,
-  `eng-142`). Service names describe the role: `web`, `api`, `db`, `worker`.
-- `taba stop` with no target needs an explicit `--scope` even when
-  `$TABA_SCOPE` is set.
-
-## Ports
-
-Give the port to **both** taba and the app, and make the app fail instead of
-silently moving to another port:
-
-```sh
-taba run --scope login-fix --name web --port 5173 -- npm run dev -- --port 5173 --strictPort
-taba run --scope login-fix --name api --port 8000 -- uvicorn app:app --port 8000
-```
-
-`--port` only tells taba what to track. taba doesn't configure the app.
-
-If `run` fails with `port N is already claimed by taba service ...` or
-`port N is in use by pid ..., which is not managed by taba` (followed by that
-process's command line), **do not kill that process.** Pick another free port, or ask the human if it has to be that
-port. Nothing was started.
+- Inside a git worktree, the worktree folder is the scope (for example
+  `login-fix-3f9a`), whatever branch is checked out. Agents in other
+  worktrees have other scopes. A later agent in the same worktree shares
+  your services.
+- If `$TABA_SCOPE` is set, it wins over the worktree. Orchestrators use it to
+  name scopes after tasks. `--scope` wins over both.
+- Service names describe the role: `web`, `api`, `db`, `worker`.
+- `taba stop` with no target needs an explicit `--scope`.
 
 ## Logs
 
 ```sh
-taba logs login-fix/web        # whole log so far (stdout + stderr)
-taba logs login-fix/web -f     # follow until the service exits
+taba logs web            # whole log so far (stdout + stderr), in your scope
+taba logs login-fix-3f9a/web -f   # follow until the service exits
 ```
 
 `-f` blocks until the service exits. In a non-interactive tool call, prefer
 the plain form, or pipe it through `tail`. The log path is also in
-`taba ps --json` (`log_path`).
+`taba ps --json` (`log_path`). Logs of any scope are readable.
 
-## Stopping
+## Stopping and cleaning up
 
 ```sh
-taba stop login-fix/web        # one service
-taba stop --scope login-fix    # everything in your scope
+taba stop web --json                 # one service of your scope
+taba stop --scope <scope> --json     # everything in your scope
+taba rm --scope <scope>              # delete records + logs of stopped services
 ```
 
 taba only signals process groups it started and can still verify. It sends
 SIGTERM, then SIGKILL after `--timeout` seconds (default 5). Stopping never
 deletes logs or records: stopped services stay in `taba ps` (status
-`exited`) so their logs can still be read.
-
-## Cleaning up
-
-```sh
-taba rm --scope login-fix      # delete records + logs of your stopped services
-taba rm login-fix/web          # one stopped service
-```
-
-`rm` refuses running services (`still running; stop it first`), so run
-`taba stop` first. Only remove your own scope, and only once nobody needs the
-logs any more.
+`exited`). `rm` refuses running services, so stop first, and skip `rm` if the
+human may still want the logs.
 
 ## Hand-off
 
-When you hand work back to the human, report each service you started, for
-example:
+When you hand work back, or may be cut off (usage limits), report each
+service you started, for example:
 
-- `login-fix/web`, http://localhost:5173, **left running** (needed for
+- `login-fix-3f9a/web`, http://localhost:4100, **left running** (needed for
   review), or **stopped**
-- how to stop and clean it up: `taba stop --scope login-fix && taba rm --scope login-fix`
+- how to stop and clean it up:
+  `taba stop --scope login-fix-3f9a && taba rm --scope login-fix-3f9a`
 
-By default, stop what you no longer need and clean up its records and logs:
+By default, stop what you no longer need and clean up:
 
 ```sh
 taba stop --scope <scope> && taba rm --scope <scope>
 ```
 
-Leave a service running only when the human will use it, and say so (then
-leave its records alone too). Skip the `rm` if the human may still want to
-read the logs.
+Leave a service running only when the human will use it, and say so.
