@@ -64,7 +64,7 @@ pub fn no_scope() -> TabaError {
 /// current directory > none.
 pub fn resolve(scope_flag: Option<String>, agent_flag: Option<String>) -> Result<Caller> {
     let cwd = std::env::current_dir()
-        .and_then(|d| d.canonicalize())
+        .and_then(|d| crate::util::canonicalize(&d))
         .map_err(|e| TabaError::state(format!("cannot resolve current directory: {e}")))?;
     let agent = resolve_agent(agent_flag)?;
     let worktree = find_worktree(&cwd);

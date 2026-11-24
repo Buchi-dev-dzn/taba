@@ -8,7 +8,6 @@ use serde_json::json;
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
-use std::process::{Command, Stdio};
 use std::time::Duration;
 
 /// Default range of `--port auto`. It avoids the common defaults 3000, 5173,
@@ -60,8 +59,18 @@ pub fn parse_port_spec(s: &str) -> std::result::Result<PortSpec, String> {
     port(s).map(PortSpec::Fixed)
 }
 
+/// Whether something listens on `port`: a loopback connect succeeds (this
+/// also sees servers forwarded from WSL, a VM or a container), a wildcard
+/// bind fails, or (Windows) the TCP table lists a listener.
 pub fn port_in_use(port: u16) -> bool {
-    let timeout = Duration::from_millis(300);
+    // A refused loopback connect is immediate on macOS and Linux; Windows
+    // retries it for about two seconds, so it gets a short timeout, and the
+    // TCP table check comes first.
+    #[cfg(windows)]
+    if !proc::listeners(port).is_empty() {
+        return true;
+    }
+    let timeout = Duration::from_millis(if cfg!(windows) { 150 } else { 300 });
     let loopbacks: [SocketAddr; 2] = [
         ([127, 0, 0, 1], port).into(),
         (std::net::Ipv6Addr::LOCALHOST, port).into(),
@@ -73,26 +82,14 @@ pub fn port_in_use(port: u16) -> bool {
         return true;
     }
     let wildcard: SocketAddr = ([0, 0, 0, 0], port).into();
-    matches!(TcpListener::bind(wildcard), Err(e) if e.kind() == io::ErrorKind::AddrInUse)
-}
-
-/// Pids listening on `port`, with their command names, via lsof.
-fn listeners(port: u16) -> Vec<(i32, String)> {
-    let out = Command::new("lsof")
-        .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-Fpc"])
-        .stderr(Stdio::null())
-        .output();
-    let Ok(out) = out else { return Vec::new() };
-    let mut res = Vec::new();
-    let mut cur: Option<i32> = None;
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        if let Some(p) = line.strip_prefix('p') {
-            cur = p.parse().ok();
-        } else if let (Some(c), Some(pid)) = (line.strip_prefix('c'), cur) {
-            res.push((pid, c.to_string()));
-        }
+    match TcpListener::bind(wildcard) {
+        Err(e) if e.kind() == io::ErrorKind::AddrInUse => true,
+        // Windows refuses binds in reserved ranges (`netsh int ipv4 show
+        // excludedportrange`, e.g. Hyper-V's) with WSAEACCES: no server can
+        // use such a port either.
+        Err(e) if cfg!(windows) && e.kind() == io::ErrorKind::PermissionDenied => true,
+        _ => false,
     }
-    res
 }
 
 /// Command line of `pid` for messages: the program's file name plus its
@@ -121,6 +118,12 @@ pub fn command_line(pid: i32) -> Option<String> {
     let head: String = chars[..MAX / 2].iter().collect();
     let tail: String = chars[chars.len() - (MAX / 2 - 3)..].iter().collect();
     Some(format!("{head} … {tail}"))
+}
+
+/// `wslrelay.exe` listens on Windows for ports of servers inside WSL 2
+/// (NAT networking with localhost forwarding).
+fn is_wsl_relay(comm: &str) -> bool {
+    comm.eq_ignore_ascii_case("wslrelay.exe") || comm.eq_ignore_ascii_case("wslrelay")
 }
 
 /// What the caller asked for, used to build `next` suggestions.
@@ -200,15 +203,16 @@ pub fn check_port_free(store: &Store, port: u16, scope: &str, req: &RunRequest) 
     if !port_in_use(port) {
         return Ok(());
     }
-    let holders = listeners(port);
+    let holders = proc::listeners(port);
     let running: Vec<Service> = store
         .list(None)?
         .into_iter()
         .filter(|s| s.is_running())
         .collect();
     for (pid, comm) in &holders {
-        if let Some(pi) = proc::info(*pid)
-            && let Some(owner) = running.iter().find(|s| s.pgid == pi.pgid)
+        if let Some(owner) = running
+            .iter()
+            .find(|s| proc::in_group(*pid, s.pid, s.pgid, s.start_time))
         {
             return Err(TabaError::new(
                 "E_PORT_IN_USE",
@@ -230,6 +234,13 @@ pub fn check_port_free(store: &Store, port: u16, scope: &str, req: &RunRequest) 
         }
     }
     let (message, holder) = match holders.first() {
+        Some((pid, comm)) if is_wsl_relay(comm) => (
+            format!(
+                "port {port} is in use by a server inside WSL, forwarded to Windows by {comm}                  (pid {pid}); taba on Windows cannot see or manage processes inside WSL
+                 nothing was started"
+            ),
+            json!({ "kind": "unknown", "pid": pid, "command": comm, "outside": "wsl" }),
+        ),
         Some((pid, comm)) => {
             let line = command_line(*pid).unwrap_or_else(|| comm.clone());
             (
@@ -241,7 +252,9 @@ pub fn check_port_free(store: &Store, port: u16, scope: &str, req: &RunRequest) 
             )
         }
         None => (
-            format!("port {port} is in use by a process taba cannot identify; nothing was started"),
+            format!(
+                "port {port} is in use by a process taba cannot identify (another user's, or one                  outside this OS, e.g. in WSL, a VM or a container); nothing was started"
+            ),
             json!({ "kind": "unknown" }),
         ),
     };

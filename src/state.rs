@@ -8,7 +8,7 @@
 //! ops/<scope>/<name>.json         in-flight mutation of one service (operation lock)
 //! events.jsonl                    append-only audit log
 //! version                         state schema version
-//! lock                            global flock
+//! lock                            global lock (flock / LockFileEx)
 //! ```
 //!
 //! Every field added in v0.2 is optional when reading, so v0.1 records load
@@ -17,7 +17,6 @@
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -159,8 +158,8 @@ impl Store {
             Some(v) if !v.is_empty() => PathBuf::from(v),
             _ => {
                 let home =
-                    std::env::var_os("HOME").ok_or_else(|| io::Error::other("HOME is not set"))?;
-                Path::new(&home).join(".taba")
+                    crate::util::home_dir().ok_or_else(|| io::Error::other("HOME is not set"))?;
+                home.join(".taba")
             }
         };
         fs::create_dir_all(root.join("services"))?;
@@ -203,9 +202,9 @@ impl Store {
             .truncate(false)
             .write(true)
             .open(self.root.join("lock"))?;
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
+        // flock(LOCK_EX) on Unix, LockFileEx on Windows; released when the
+        // file is closed, also if taba dies.
+        file.lock()?;
         Ok(Lock { _file: file })
     }
 
