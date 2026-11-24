@@ -185,16 +185,20 @@ replacing `run` take a per-service operation lock. The second one gets
      queue** (decision 7): when the owner's lease ends, or the owner runs
      `taba disown S/N`, the service goes to the first live claimant
      (`taba claim S/N`), and after explicit claimants to its current
-     borrowers. This is how a borrowed service such as a database outlives
+     borrowers. After a lease end, the claim queue waits for `claim_grace`
+     (default 2 min) first, so that a successor agent in the same folder
+     can take the whole scope over (decision 8). This is how a borrowed service such as a database outlives
      the work that started it.
 
    After a move, the old holder or scope is no longer the owner, and its
    mutations are refused like any other non-owner's. A move never restarts
    anything: instances, URLs and borrows stay valid.
 
-5. **Drop.** When the holder's lease ends, `gc` first offers each of the
-   scope's services to its claim queue (decision 7): explicit claimants in
-   order, then current borrowers. A service with a live claimant is handed
+5. **Drop.** When the holder's lease ends, a successor agent in the same
+   folder has priority for `claim_grace` (default 2 min, decision 8): if it
+   calls taba in that time, it takes the scope over with every service.
+   After that, `gc` offers each of the scope's services to its claim queue
+   (decision 7): explicit claimants in order, then current borrowers. A service with a live claimant is handed
    over, not stopped. What nobody waits for is dropped once no agent has
    taken the scope over within the grace period (`gc_grace`, decision 2):
    `gc` stops those services and removes their records. Logs are kept for
@@ -227,9 +231,11 @@ replacing `run` take a per-service operation lock. The second one gets
    gets `E_NOT_OWNER` like an agent and needs `--force --reason`. Every use
    is appended to `events.jsonl` with the caller's agent, scope, directory
    and reason, and shows in `ps` as a warning on the affected scope. The
-   hook denies `--force` from agent tool calls, so in practice only a human
-   terminal (or an orchestrator process outside the agent's shell) can use
-   it. This is not foolproof (section "Limits").
+   hook does not let an agent's tool call use `--force` on its own: it
+   returns "ask", so the human confirms each forced command before it runs
+   (decision 9). Without the hook, nothing stops an agent from typing
+   `--force`; the skill tells workers never to. This is not foolproof
+   (section "Limits").
 
 ### Limits
 
@@ -360,11 +366,13 @@ taba disown login-fix-3f9a/db
 taba claim login-fix-3f9a/db           # explicit claimants come before borrowers
 ```
 
-If A's agent is gone before it disowns anything, nothing is lost either: at
-the next `gc` (lazy, in any agent's `run` or `whoami`) A's scope has expired,
-and `db` is handed to the first live claimant (explicit claimants first,
-then borrowers in borrow order), with an event and `W_HANDED_OVER` for the
-new owner. Only a service that nobody claims or borrows waits for
+If A's agent is gone before it disowns anything, nothing is lost either.
+For `claim_grace` (default 2 min, decision 8) the scope waits for a
+successor in `wt/login-fix`; if one calls taba in that time, it takes the
+whole scope over, `db` included. Otherwise, at the next `gc` after the
+grace (lazy, in any agent's `run` or `whoami`), `db` is handed to the first
+live claimant (explicit claimants first, then borrowers in borrow order),
+with an event and `W_HANDED_OVER` for the new owner. Only a service that nobody claims or borrows waits for
 `gc_grace` and is dropped. `taba move S/db --to <scope>` remains for a human
 or coordinator who wants to pick the new owner by hand.
 
@@ -384,8 +392,9 @@ taba claim --cancel S/N   # leave it
 ```
 
 - **When it is served.** When the owner's lease ends (agent process gone,
-  `lease end`, TTL), at the next `gc`, before the grace period; and at once
-  when the owner runs `taba disown S/N` (or `disown --scope S` for all its
+  `lease end`, TTL), at the first `gc` after `claim_grace` (default 2 min,
+  decision 8) and before the drop; and at once when the owner runs
+  `taba disown S/N` (or `disown --scope S` for all its
   services). An explicit `stop` is not a hand-over: it still refuses while
   the service is borrowed (`E_BORROWED`) and otherwise stops the service
   and discards its claims.
@@ -404,12 +413,14 @@ taba claim --cancel S/N   # leave it
   `W_HANDED_OVER` on its next taba call.
 - **Nobody waiting.** Only then does the normal grace period and drop
   apply.
-- **Same-folder successor.** Automatic scope take-over (decision 6) and the
-  claim queue both react to an expired lease; whichever runs first wins. If
-  the next agent in the same folder calls taba first, it takes the whole
-  scope and the claims stay queued for the next expiry. If `gc` runs first,
-  claimed services leave the folder's scope and the successor can borrow
-  them back.
+- **Same-folder successor first** (decision 8). Automatic scope take-over
+  (decision 6) and the claim queue both react to an expired lease, and the
+  successor has priority. For `claim_grace` after the lease ended, `gc`
+  does not serve the queue. If an agent in the same scope calls taba in
+  that time, it takes the whole scope over with every service, and the
+  claims stay queued for the next expiry. Only after the grace does `gc`
+  hand claimed services to their claimants; a successor that arrives later
+  takes over what is left and can borrow the rest back.
 - **`keep`** scopes are never handed over or dropped.
 - A scope cannot claim its own service (`E_USAGE`). Claiming creates the
   claimant's scope record, as `borrow` does.
@@ -449,7 +460,7 @@ $TABA_HOME (default ~/.taba)
 ├── claims/<scope>/<name>.json        # new: the service's claim queue, in order
 ├── ops/<scope>/<name>.json           # new: in-flight mutation (operation lock)
 ├── events.jsonl                      # new: append-only audit log
-├── config.toml                       # new, optional: lease_ttl, gc_grace, log_retention
+├── config.toml                       # new, optional: lease_ttl, claim_grace, gc_grace, log_retention
 ├── version                           # new: state schema version ("2")
 └── lock                              # unchanged: global flock
 ```
@@ -595,9 +606,12 @@ than 60 s old, so read-heavy agents don't write on every call. A `human`
 holder has no pid and, by default, TTL `none`, so its lease ends only with
 `lease end` (or an explicit TTL).
 
-An expired lease is not dropped at once. For `gc_grace` (default 10 min)
-the scope waits for a new holder: the next agent that calls taba in it
-takes it over (decision 6, "Hand-off" below). After that, `gc` may drop it.
+An expired lease is not dropped at once. For `claim_grace` (default
+2 min) only a successor in the same scope can take it over (decision 8):
+the next agent that calls taba in it takes it over with every service
+(decision 6, "Hand-off" below). After `claim_grace`, `gc` serves the claim
+queues; for the rest of `gc_grace` (default 10 min) the scope still waits
+for a new holder. After that, `gc` may drop it.
 
 ### Lease TTL configuration
 
@@ -624,12 +638,16 @@ keys are optional:
 ```toml
 # $TABA_HOME/config.toml
 lease_ttl     = "4h"    # default lease TTL; "none" = no expiry by time
+claim_grace   = "2m"    # how long a same-folder successor has priority before claim queues are served
 gc_grace      = "10m"   # how long an expired scope waits for a new holder before gc may drop it
 log_retention = "24h"   # how long logs of dropped services are kept
 ```
 
-`gc_grace` and `log_retention` come only from the config file or the
-built-in default (no flag or environment variable in v0.2). An invalid
+`claim_grace`, `gc_grace` and `log_retention` come only from the config
+file or the built-in default (no flag or environment variable in v0.2).
+Both graces count from the moment the lease ended. A drop never happens
+before claims have been served, so with `claim_grace` longer than
+`gc_grace` the drop waits for `claim_grace` too. An invalid
 value, in the file or in `$TABA_TTL`, fails the command with `E_CONFIG`
 naming the source and key; taba does not fall back silently. An invalid
 `--ttl` is `E_USAGE`.
@@ -718,9 +736,9 @@ goes. taba therefore does not depend on the old agent doing anything.
   worker A's worktree normally does nothing: if A's process has ended, B's
   first `taba whoami` takes the scope over. If A is still alive (for
   example, stuck at a usage-limit prompt), the coordinator or a human runs
-  `taba move --scope S --to B --force --reason "A hit usage limit"`. A
-  coordinator that is itself a hooked agent cannot run `--force` (decision
-  4); see section 9, "Still open".
+  `taba move --scope S --to B --force --reason "A hit usage limit"`. When
+  the coordinator is itself a hooked agent, the hook turns that command
+  into an "ask": the human confirms it before it runs (decision 9).
 
 ### Concurrency safety of taba's own state
 
@@ -1133,8 +1151,8 @@ when `CMD` exits, also on Ctrl-C.
 `--check` returns the same shape if the instance is still running, otherwise
 `E_DANGLING` with `details.current` (the new instance and URL, if the service
 was restarted). If the service moved to another scope, `service` shows the
-new `S/N` and the borrow stays valid. If the owner's lease has ended, the
-check serves the claim queue first; if that handed the service to the
+new `S/N` and the borrow stays valid. If the owner's lease ended more than
+`claim_grace` ago, the check serves the claim queue first; if that handed the service to the
 caller, the result carries `W_HANDED_OVER`, and if no hand-over was
 possible, `W_OWNER_GONE`.
 
@@ -1243,8 +1261,10 @@ taba gc [--dry-run] [--json]
 For every scope whose lease has ended and which is not `keep`, first serve
 each service's claim queue (decision 7): hand it to the first live explicit
 claimant, else to the first live borrower, as described in section 3,
-"Claim queue". This happens as soon as the lease has ended, without waiting
-for the grace period. Then, once the lease ended more than `gc_grace` ago
+"Claim queue". This happens once the lease ended more than `claim_grace`
+ago (default 2 min), so that a successor in the same folder can take the
+scope over first (decision 8). Then, once the lease ended more than
+`gc_grace` ago
 (default 10 min, decision 2): stop the services nobody claimed (with the
 identity check), delete their records, end the borrows the scope itself
 holds, and remove the scope record. A borrowed service is never stopped by
@@ -1257,8 +1277,9 @@ process is gone, and delete logs of dropped services after `log_retention`
 (default 24 h). Every hand-over and every drop is an event.
 
 `run` and `whoami` perform a **bounded lazy gc**, at most 5 services per
-call: claim queues of expired scopes are served at once, and scopes whose
-lease ended more than `gc_grace` ago are dropped (in `run`, before port
+call: claim queues of scopes whose lease ended more than `claim_grace` ago
+are served, and scopes whose lease ended more than `gc_grace` ago are
+dropped (in `run`, before port
 selection). That
 releases ports leaked by crashed agents without any daemon. No launchd job
 in v0.2.
@@ -1399,11 +1420,14 @@ one `lsof` at most.
    | taba service in another scope, lease expired | **deny**, with `next`: `taba stop S/N` (which is allowed for expired leases that nobody borrows) |
    | unmanaged process listening on a TCP port, or whose cwd is in another git worktree | **deny** (decision 5), with `next`: `--port auto`, or ask the human, who can stop it themselves |
    | any other unmanaged process | **allow** |
-   | `taba … --force` | **deny**: agents never override; the human runs it in their own terminal |
+   | `taba … --force` | **ask** (decision 9): the human confirms or rejects the forced command in the agent's permission prompt; the reason names the target and the `--reason` text |
    | command not parseable (variables, `eval`, scripts, `sh -c "$X"`) | **allow**, and record `hook_unchecked` in `events.jsonl` |
 
 5. Explain. A deny uses `hookSpecificOutput.permissionDecision: "deny"` and
-   a `permissionDecisionReason`, which Claude sees. The reason states the
+   a `permissionDecisionReason`, which Claude sees. The `--force` case uses
+   `permissionDecision: "ask"` instead (decision 9), so Claude Code shows the
+   human a confirmation prompt with the same kind of reason; the forced
+   command is recorded by taba as usual once it runs. The reason states the
    fact, the rule and the next step, for example:
 
    ```text
@@ -1450,7 +1474,9 @@ Codex documents a `PreToolUse` event with matcher `Bash`, `tool_input.command`
 in stdin, and blocking by exit code 2 or
 `hookSpecificOutput.permissionDecision: "deny"`. That is the same shape as
 Claude Code, so `taba hook codex pre-tool-use` shares the implementation and
-differs only in identity (`codex:<session_id>`). Codex requires non-managed
+differs only in identity (`codex:<session_id>`). Whether Codex honours
+`permissionDecision: "ask"` is **not confirmed**; until it is, the Codex hook
+denies `--force` instead of asking (decision 9 falls back to decision 4). Codex requires non-managed
 hooks to be trusted through `/hooks` before they run, and its own docs call
 tool hooks "a useful guardrail, not a complete enforcement boundary". A
 SessionStart env file and SessionEnd behaviour are **not confirmed** for
@@ -1667,18 +1693,24 @@ operation lock for `stop`.
 8. Claim queue: a1 runs `web` in `wt-a`. Agents in `wt-b` and then `wt-c`
    run `taba claim <wt-a scope>/web`; `ps --json` shows `claims` with
    `wt-b` first and `wt-c` second, and the text table shows `wt-b` under
-   `NEXT`. a1's `TABA_AGENT_PID` is killed; with `gc_grace = "1h"`, the
-   next `whoami` anywhere hands `web` to `wt-b` at once: `ps` shows
+   `NEXT`. a1's `TABA_AGENT_PID` is killed; with `claim_grace = "0s"` and
+   `gc_grace = "1h"`, the next `whoami` in another folder hands `web` to
+   `wt-b` at once: `ps` shows
    `<wt-b scope>/web` with the same instance, URL and pid, a
    `service_moved` event with `how: claim` is recorded, `wt-b`'s next call
    has `W_HANDED_OVER`, and the service now follows `wt-b`'s lease and TTL.
 9. Dead claimants are skipped: as in test 8, but `wt-b`'s claimant agent
    pid is killed first. The hand-over goes to `wt-c`, and `wt-b`'s claim is
    removed with a `claim_skipped` event.
-10. `claim --cancel` removes the claim. With an empty queue the expired
+10. Successor first (decision 8): as in test 8, but with the default
+    `claim_grace` (2 min). A `whoami` from `wt-c` right after a1's pid is
+    killed hands nothing over. a2's first `whoami` in `wt-a` within the
+    grace takes the scope over with `web` (`W_TOOK_OVER`), and `wt-b`'s and
+    `wt-c`'s claims stay queued.
+11. `claim --cancel` removes the claim. With an empty queue the expired
     scope waits for `gc_grace` and is then dropped as in test 2. `claim` of
     one's own scope's service returns `E_USAGE`.
-11. `disown`: the holder runs `taba disown <wt-a scope>/web` with `wt-c`
+12. `disown`: the holder runs `taba disown <wt-a scope>/web` with `wt-c`
     queued; the service moves to `wt-c` with `how: disown`. With nobody
     queued, `disown` returns `E_NO_CLAIMANT` and changes nothing. A plain
     `stop` of a claimed but unborrowed service succeeds and discards the
@@ -1700,7 +1732,8 @@ second borrower).
 3. Killing the taba process of a `-- CMD` borrow frees the lock on the next
    call.
 4. Borrowers inherit: `wt-a` runs `web` and `db`; `wt-b` and then `wt-c`
-   borrow `db`. `wt-a`'s holder pid is killed and `gc_grace` is 0. `gc`
+   borrow `db`. `wt-a`'s holder pid is killed and `claim_grace` and
+   `gc_grace` are 0. `gc`
    hands `db` to `wt-b` (`handed_over`, `how: borrower`) and drops `web`.
    The database never stops: same instance and URL, `wt-b`'s borrow has
    ended because it is now the owner, and `wt-c`'s `borrow --check`
@@ -1746,7 +1779,8 @@ second borrower).
    `lsof -ti:<other scope's port> | xargs kill` is denied with a reason that
    contains the owner scope and a `taba run --port auto` suggestion. `kill
    <own pid>` is allowed. `pkill -f http.server` is denied if any match
-   belongs to another scope. `taba stop x --force` is denied. `kill <pid>`
+   belongs to another scope. `taba stop x --force --reason r` returns
+   "ask" (decision 9), with the target in the reason. `kill <pid>`
    of an unmanaged `python3 -m http.server` started with `nohup` is
    **denied** (not ask), and the reason contains `--port auto` and "ask
    the human".
@@ -1778,8 +1812,9 @@ are kept so that "decision N" references above stay valid.
    - TTL precedence: `--ttl` on `run` (or `renew`) > `$TABA_TTL` >
      `$TABA_HOME/config.toml` (`lease_ttl`) > built-in default (4 h for
      agents, `none` for `human`). `none` means no expiry by time. The
-     config file is optional and also holds `gc_grace` (default 10 min)
-     and `log_retention` (default 24 h); taba works with zero
+     config file is optional and also holds `claim_grace` (default 2 min,
+     decision 8), `gc_grace` (default 10 min) and `log_retention`
+     (default 24 h); taba works with zero
      configuration. `whoami` and `ps --json` show the effective TTL and its
      source. Consequence: the per-service limit that was `run --ttl` is
      renamed `--service-ttl`.
@@ -1807,8 +1842,9 @@ are kept so that "decision N" references above stay valid.
    (no `TABA_AGENT`) mutating a service in another scope, or with no scope
    at all, gets `E_NOT_OWNER` / `E_SCOPE_HELD` like an agent and needs
    `--force --reason`, which is recorded. This replaces the draft's
-   recommendation to allow unscoped humans without `--force`. The hook
-   denies `--force` in agent tool calls.
+   recommendation to allow unscoped humans without `--force`. In agent
+   tool calls the hook turns `--force` into an "ask", so the human confirms
+   it (decision 9; this replaces "the hook denies `--force`").
 
 5. **Unmanaged processes: deny, not ask.** The hook denies killing an
    unmanaged process that listens on a TCP port or runs in another git
@@ -1830,7 +1866,7 @@ are kept so that "decision N" references above stay valid.
    S/N` registers interest in owning a service (FIFO, recorded with the
    claimant scope, agent and time; `taba claim --cancel` leaves). When the
    owner's lease ends or its agent is gone, `gc` first offers the service
-   to the queue: the first claimant whose agent is still alive becomes the
+   to the queue (after `claim_grace`, decision 8): the first claimant whose agent is still alive becomes the
    new owner by an automatic move of that one service, recorded as an
    event, under the claimant's lease and TTL. Dead claimants are skipped
    and removed. Current borrowers are implicit claimants after the explicit
@@ -1843,6 +1879,29 @@ are kept so that "decision N" references above stay valid.
    (section 2, "Limits"). (Section 3, "Claim queue"; section 4,
    `taba claim` and `taba disown`.)
 
+8. **A same-folder successor beats the claim queue** (added later on
+   2026-11-24). When a lease expires, `gc` waits for a short grace period,
+   `claim_grace` (configurable in `config.toml`, default 2 min), before it
+   serves any claim queue of that scope. If a successor agent in the same
+   scope (the same folder) calls taba during the grace, it takes the scope
+   over automatically (decision 6) with every service, and the claims stay
+   queued. After the grace, claims are served as in decision 7, and the
+   drop still waits for `gc_grace`. This replaces "whichever runs first
+   wins". (Section 2, rules 4 and 5; section 3, "Claim queue" and "Leases";
+   section 4, `taba gc`.)
+
+9. **`--force` from a hooked agent asks the human** (added later on
+   2026-11-24). When a hooked agent's tool call contains a taba command
+   with `--force` (the coordinator case: a forced `move --take` or `stop`
+   for a stuck worker), the PreToolUse hook returns
+   `permissionDecision: "ask"` instead of `"deny"`, so the human confirms
+   or rejects it in the agent's permission prompt. The hook cannot tell a
+   coordinator from a worker (both are just agents), so this applies to
+   every hooked agent; the skill still tells workers never to use
+   `--force`. Raw kills stay denied (decision 5). If a harness does not
+   support "ask" (Codex: not confirmed), its hook keeps denying. (Section
+   2, rule 8; section 3, "Hand-off"; section 5, "Claude Code hooks".)
+
 ### Still open
 
 - **Does a usage-limited agent's process exit?** Automatic take-over
@@ -1850,16 +1909,9 @@ are kept so that "decision N" references above stay valid.
   Codex stays alive at a usage-limit prompt, the next agent gets
   `E_SCOPE_HELD` until the TTL passes or someone forces a take. To verify
   in M6 for each harness.
-- **Coordinators that are agents.** A forced `move` by a coordinator that
-  is itself a hooked Claude Code or Codex session is denied by the hook
-  (decision 4). It has to ask the human, or the orchestrator program (for
-  example Orca, outside any agent's Bash tool) runs it. Whether Orca can
-  run taba commands itself at dispatch time is **unknown** (section 7).
-- **Claim queue vs. a successor in the same folder.** Both react to an
-  expired lease, and whichever runs first wins (section 3, "Claim queue").
-  If the owner prefers that a successor dispatched into the same worktree
-  keeps its folder's services, the claim queue would have to wait for
-  `gc_grace` like Drop does. The design follows the request as given:
-  claims are served at once.
+- **Coordinators that are agents.** Resolved by decision 9: a forced
+  command from a hooked coordinator asks the human. Still **unknown**:
+  whether Orca can run taba commands itself at dispatch time, outside any
+  agent's Bash tool (section 7), which would need no confirmation.
 - **Agent identity for Codex and Orca** (section 5): unchanged, still
   unknown.
