@@ -1,7 +1,12 @@
-//! Integration tests for the acceptance criteria in docs/plan.md.
+//! Integration tests for the acceptance criteria in docs/plan.md (v0.1).
 //!
 //! Each test uses its own temporary TABA_HOME and small `python3 -m
 //! http.server` processes on free high ports.
+//!
+//! Since v0.2 (decision 4), `stop` and `rm` refuse callers outside the
+//! service's scope, humans included, so these tests act from the owning
+//! scope (`--scope S`). The cross-scope refusal itself is tested in
+//! tests/m1.rs.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -57,6 +62,8 @@ impl Env {
             .current_dir(cwd)
             .env("TABA_HOME", self.home())
             .env_remove("TABA_SCOPE")
+            .env_remove("TABA_AGENT")
+            .env_remove("TABA_OUTPUT")
             .output()
             .expect("run taba")
     }
@@ -74,7 +81,14 @@ impl Env {
 
 impl Drop for Env {
     fn drop(&mut self) {
-        for s in self.scopes.clone() {
+        let mut scopes = self.scopes.clone();
+        if let Ok(dirs) = std::fs::read_dir(self.home().join("services")) {
+            scopes.extend(
+                dirs.flatten()
+                    .map(|d| d.file_name().to_string_lossy().into_owned()),
+            );
+        }
+        for s in scopes {
             let _ = Command::new(BIN)
                 .args(["stop", "--scope", &s, "--timeout", "2"])
                 .env("TABA_HOME", self.home())
@@ -364,7 +378,7 @@ fn survives_terminal_close_and_stop_is_targeted() {
     );
 
     // Stop one service.
-    let out = env.taba(&b, &["stop", "feat-a/web"]);
+    let out = env.taba(&b, &["stop", "feat-a/web", "--scope", "feat-a"]);
     assert!(out.status.success(), "{}", text(&out));
     wait_until("server a to stop", || !http_ok(pa));
     assert!(http_ok(pb), "other taba service was affected");
@@ -407,7 +421,7 @@ fn stop_ignores_process_with_mismatched_identity() {
     v["start_time"] = serde_json::json!(real_start + 1);
     std::fs::write(&record, serde_json::to_vec(&v).unwrap()).unwrap();
 
-    let out = env.taba(&a, &["stop", "s/web"]);
+    let out = env.taba(&a, &["stop", "s/web", "--scope", "s"]);
     assert!(out.status.success(), "{}", text(&out));
     assert!(String::from_utf8_lossy(&out.stdout).contains("not running"));
     thread::sleep(Duration::from_millis(500));
@@ -420,7 +434,7 @@ fn stop_ignores_process_with_mismatched_identity() {
     // Restore the record so cleanup can stop it.
     v["start_time"] = serde_json::json!(real_start);
     std::fs::write(&record, serde_json::to_vec(&v).unwrap()).unwrap();
-    let out = env.taba(&a, &["stop", "s/web"]);
+    let out = env.taba(&a, &["stop", "s/web", "--scope", "s"]);
     assert!(out.status.success(), "{}", text(&out));
     wait_until("server to stop", || !http_ok(port));
 }
@@ -469,8 +483,8 @@ fn rm_removes_only_exited_services_in_the_given_scope() {
         let out = env.taba(&a, &run_plain(scope, name, &cmd));
         assert!(out.status.success(), "{}", text(&out));
     }
-    for t in ["s/done", "other/done"] {
-        let out = env.taba(&a, &["stop", t]);
+    for (s, t) in [("s", "s/done"), ("other", "other/done")] {
+        let out = env.taba(&a, &["stop", t, "--scope", s]);
         assert!(out.status.success(), "{}", text(&out));
     }
     let home = env.home();
@@ -486,7 +500,7 @@ fn rm_removes_only_exited_services_in_the_given_scope() {
     assert_eq!(rows[0]["service"], "s/live");
 
     // A running service is refused, and nothing is deleted.
-    let out = env.taba(&a, &["rm", "s/live"]);
+    let out = env.taba(&a, &["rm", "s/live", "--scope", "s"]);
     assert!(!out.status.success(), "{}", text(&out));
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("stop it first"),
@@ -532,7 +546,7 @@ fn rm_never_deletes_outside_taba_home() {
     let cmd = sleeper();
     let out = env.taba(&a, &run_plain("s", "x", &cmd));
     assert!(out.status.success(), "{}", text(&out));
-    let out = env.taba(&a, &["stop", "s/x"]);
+    let out = env.taba(&a, &["stop", "s/x", "--scope", "s"]);
     assert!(out.status.success(), "{}", text(&out));
 
     let record = env.home().join("services/s/x.json");
@@ -541,7 +555,7 @@ fn rm_never_deletes_outside_taba_home() {
     v["log_path"] = serde_json::json!(outside);
     std::fs::write(&record, serde_json::to_vec(&v).unwrap()).unwrap();
 
-    let out = env.taba(&a, &["rm", "s/x"]);
+    let out = env.taba(&a, &["rm", "s/x", "--scope", "s"]);
     assert!(out.status.success(), "{}", text(&out));
     assert!(!record.exists());
     assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep me");
@@ -561,6 +575,8 @@ fn human_output_abbreviates_home() {
             .env("HOME", &env.root)
             .env("TABA_HOME", env.home())
             .env_remove("TABA_SCOPE")
+            .env_remove("TABA_AGENT")
+            .env_remove("TABA_OUTPUT")
             .output()
             .unwrap()
     };
@@ -602,6 +618,6 @@ fn human_output_abbreviates_home() {
         "{first}"
     );
 
-    let out = taba(&["stop", "s/web"]);
+    let out = taba(&["stop", "s/web", "--scope", "s"]);
     assert!(String::from_utf8_lossy(&out.stdout).contains("~/proj"));
 }

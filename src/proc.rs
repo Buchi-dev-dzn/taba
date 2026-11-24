@@ -181,3 +181,15 @@ pub fn stop_group(pgid: i32, timeout: Duration) -> io::Result<StopResult> {
     }
     Ok(StopResult::Killed)
 }
+
+/// Whether process `pid` exists, is not a zombie, and started at
+/// `start_time` (so the pid was not reused).
+pub fn is_alive(pid: i32, start_time: u64) -> bool {
+    matches!(info(pid), Some(p) if !p.zombie && p.start_time == start_time)
+}
+
+/// The current process's pid and start time.
+pub fn self_identity() -> (i32, u64) {
+    let pid = std::process::id() as i32;
+    (pid, info(pid).map_or(0, |p| p.start_time))
+}
