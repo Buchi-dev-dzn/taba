@@ -1,6 +1,7 @@
 //! taba: start, list, inspect and stop local processes, grouped by work scope.
 
 mod error;
+mod listing;
 mod ports;
 mod proc;
 mod ready;
@@ -80,11 +81,15 @@ enum Cmd {
     /// List services
     Ps {
         /// Only show this scope
-        #[arg(long)]
+        #[arg(long, conflicts_with = "all")]
         scope: Option<String>,
         /// Only show running services (exited ones are listed by default)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "all")]
         running: bool,
+        /// List every listening TCP port of this user, managed by taba or not
+        /// (read-only)
+        #[arg(long)]
+        all: bool,
         /// Print JSON instead of a table (paths are absolute; also: TABA_OUTPUT=json)
         #[arg(long)]
         json: bool,
@@ -94,8 +99,11 @@ enum Cmd {
         /// SCOPE/NAME, or NAME with $TABA_SCOPE or the git worktree's scope
         target: String,
         /// Keep printing new output until the service exits
-        #[arg(short, long)]
+        #[arg(short, long, conflicts_with = "json")]
         follow: bool,
+        /// Print one JSON document with the log text (also: TABA_OUTPUT=json)
+        #[arg(long)]
+        json: bool,
     },
     /// Stop a service (SCOPE/NAME) or every service in a scope (--scope)
     Stop {
@@ -137,6 +145,9 @@ enum Cmd {
         /// Why --force is needed (recorded in events.jsonl)
         #[arg(long, requires = "force")]
         reason: Option<String>,
+        /// Print one JSON document (also: TABA_OUTPUT=json)
+        #[arg(long)]
+        json: bool,
     },
     /// Internal (Windows): send Ctrl+Break to console process group PGID,
     /// attaching to the console of process ATTACH
@@ -219,12 +230,26 @@ fn main() -> ExitCode {
         Cmd::Ps {
             scope,
             running,
+            all,
             json,
         } => {
             let json = json || env_json();
-            (json, cmd_ps(scope, running, json).map(|_| None))
+            let res = if all {
+                listing::cmd_ps_all()
+            } else {
+                cmd_ps(scope, running)
+            };
+            (json, res.map(Some))
         }
-        Cmd::Logs { target, follow } => (false, cmd_logs(&target, follow).map(|_| None)),
+        Cmd::Logs {
+            target,
+            follow,
+            json,
+        } => {
+            // `-f` streams raw text; TABA_OUTPUT=json does not apply to it.
+            let json = json || (env_json() && !follow);
+            (json, cmd_logs(&target, follow, json))
+        }
         Cmd::Stop {
             target,
             scope,
@@ -243,7 +268,11 @@ fn main() -> ExitCode {
             agent,
             force,
             reason,
-        } => (false, cmd_rm(target, scope, agent, force, reason).map(Some)),
+            json,
+        } => (
+            json || env_json(),
+            cmd_rm(target, scope, agent, force, reason).map(Some),
+        ),
     };
     let code = match res {
         Ok(None) => 0,
@@ -752,7 +781,7 @@ fn status_of(store: &Store, s: &Service) -> &'static str {
     }
 }
 
-fn cmd_ps(scope: Option<String>, running_only: bool, json: bool) -> Result<()> {
+fn cmd_ps(scope: Option<String>, running_only: bool) -> Result<Output> {
     if let Some(s) = &scope {
         check_ident("scope", s)?;
     }
@@ -763,67 +792,51 @@ fn cmd_ps(scope: Option<String>, running_only: bool, json: bool) -> Result<()> {
     }
     let statuses: Vec<&str> = services.iter().map(|s| status_of(&store, s)).collect();
 
-    if json {
-        let rows: Vec<Value> = services
-            .iter()
-            .zip(&statuses)
-            .map(|(s, status)| {
-                json!({
-                    "service": s.id(),
-                    "scope": s.scope,
-                    "name": s.name,
-                    "status": status,
-                    "url": s.url(),
-                    "port": s.port,
-                    "directory": s.cwd,
-                    "command": s.command,
-                    "pid": s.pid,
-                    "pgid": s.pgid,
-                    "start_time": s.start_time,
-                    "log_path": s.log_path,
-                    "instance": s.instance(),
-                })
+    let rows: Vec<Value> = services
+        .iter()
+        .zip(&statuses)
+        .map(|(s, status)| {
+            json!({
+                "service": s.id(),
+                "scope": s.scope,
+                "name": s.name,
+                "status": status,
+                "url": s.url(),
+                "port": s.port,
+                "directory": s.cwd,
+                "command": s.command,
+                "pid": s.pid,
+                "pgid": s.pgid,
+                "start_time": s.start_time,
+                "log_path": s.log_path,
+                "instance": s.instance(),
             })
-            .collect();
-        error::print_json(&Value::Array(rows));
-        return Ok(());
-    }
+        })
+        .collect();
 
-    let mut rows = vec![[
+    let mut table = vec![[
         "SERVICE".to_string(),
         "STATUS".to_string(),
         "URL".to_string(),
         "DIRECTORY".to_string(),
     ]];
     for (s, status) in services.iter().zip(&statuses) {
-        rows.push([
+        table.push([
             s.id(),
             status.to_string(),
             s.url().unwrap_or_else(|| "-".into()),
             tilde(&s.cwd),
         ]);
     }
-    let widths: Vec<usize> = (0..3)
-        .map(|i| rows.iter().map(|r| r[i].len()).max().unwrap_or(0))
-        .collect();
-    for r in rows {
-        println!(
-            "{:<w0$}  {:<w1$}  {:<w2$}  {}",
-            r[0],
-            r[1],
-            r[2],
-            r[3],
-            w0 = widths[0],
-            w1 = widths[1],
-            w2 = widths[2]
-        );
-    }
-    Ok(())
+    Ok(Output::new(
+        json!({ "services": rows }),
+        util::render_table(&table),
+    ))
 }
 
 // ---------------------------------------------------------------- logs
 
-fn cmd_logs(target: &str, follow: bool) -> Result<()> {
+fn cmd_logs(target: &str, follow: bool, json: bool) -> Result<Option<Output>> {
     let caller = scope::resolve(None, None)?;
     let (scope, name) = resolve_target(target, &caller)?;
     let store = Store::open()?;
@@ -832,13 +845,21 @@ fn cmd_logs(target: &str, follow: bool) -> Result<()> {
         .ok_or_else(|| not_found(&scope, &name))?;
     let mut file = File::open(&svc.log_path)
         .map_err(|e| TabaError::state(format!("cannot open {}: {e}", svc.log_path.display())))?;
-    let mut stdout = io::stdout().lock();
     let mut buf = Vec::new();
     file.read_to_end(&mut buf)?;
+    if json {
+        let body = json!({
+            "service": svc.id(),
+            "log_path": svc.log_path,
+            "log": String::from_utf8_lossy(&buf),
+        });
+        return Ok(Some(Output::new(body, String::new())));
+    }
+    let mut stdout = io::stdout().lock();
     stdout.write_all(&buf)?;
     stdout.flush()?;
     if !follow {
-        return Ok(());
+        return Ok(None);
     }
     let mut pos = file.stream_position()?;
     loop {
@@ -849,10 +870,10 @@ fn cmd_logs(target: &str, follow: bool) -> Result<()> {
         if !buf.is_empty() {
             pos += buf.len() as u64;
             if stdout.write_all(&buf).and_then(|_| stdout.flush()).is_err() {
-                return Ok(()); // reader went away (e.g. `| head`)
+                return Ok(None); // reader went away (e.g. `| head`)
             }
         } else if !running {
-            return Ok(());
+            return Ok(None);
         }
         thread::sleep(Duration::from_millis(250));
     }
@@ -937,6 +958,10 @@ fn cmd_stop(
         });
         if let Some(sig) = d.signal {
             r["signal"] = json!(sig);
+            r["platform_action"] = json!(match sig {
+                "KILL" => proc::KILL_ACTION,
+                _ => proc::GRACEFUL_ACTION,
+            });
         }
         if d.forced {
             r["forced"] = json!(true);
@@ -1103,6 +1128,7 @@ fn cmd_rm(
     let (targets, single) = targets(&store, target, scope_flag_given, &caller, "remove")?;
 
     let mut lines = Vec::new();
+    let mut results: Vec<Value> = Vec::new();
     let mut refusals: Vec<TabaError> = Vec::new();
     for (s, n) in &targets {
         let svc = store.get(s, n)?.ok_or_else(|| not_found(s, n))?;
@@ -1134,6 +1160,9 @@ fn cmd_rm(
             if single {
                 return Err(e);
             }
+            results.push(json!({
+                "service": svc.id(), "result": "refused", "error": e.to_json(),
+            }));
             refusals.push(e);
             continue;
         }
@@ -1143,6 +1172,7 @@ fn cmd_rm(
         }
         store.remove(&svc.scope, &svc.name)?;
         lines.push(format!("{}: removed (record and log)", svc.id()));
+        results.push(json!({ "service": svc.id(), "result": "removed" }));
     }
     if targets.is_empty() {
         lines.push(format!(
@@ -1150,7 +1180,7 @@ fn cmd_rm(
             caller.scope.clone().unwrap_or_default()
         ));
     }
-    let mut out = Output::new(json!({}), lines.join("\n"));
+    let mut out = Output::new(json!({ "results": results }), lines.join("\n"));
     if let Some(first) = refusals.first() {
         let detail: Vec<String> = refusals.iter().map(|e| e.message.clone()).collect();
         out.failure = Some(TabaError::new(
