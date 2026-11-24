@@ -1,3 +1,5 @@
+> Superseded by [design-v0.2.md](design-v0.2.md). Kept for history.
+
 # taba Proposal v0.1
 
 **Bundle what you start, by the work it belongs to.**
