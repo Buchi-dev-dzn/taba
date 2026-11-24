@@ -74,6 +74,7 @@ impl Env {
             .args(args)
             .current_dir(cwd)
             .env("TABA_HOME", self.home())
+            .env("PYTHONPATH", python_path())
             .env_remove("TABA_SCOPE")
             .env_remove("TABA_AGENT")
             .env_remove("TABA_OUTPUT")
@@ -181,34 +182,30 @@ fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
     panic!("timed out waiting for {what}");
 }
 
-/// A script that runs `python -m http.server ARGS...` without the reverse
-/// DNS lookup `HTTPServer.server_bind` does (`socket.getfqdn`), which takes
-/// over 30 s in detached processes on GitHub's macOS runners.
-fn serve_py() -> &'static str {
-    static PATH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR"));
-        std::fs::create_dir_all(dir).unwrap();
-        let path = dir.join("taba-serve.py");
-        let tmp = dir.join(format!("taba-serve.py.{}", std::process::id()));
+/// A directory for `PYTHONPATH` with a `sitecustomize.py` that skips the
+/// reverse DNS lookup `http.server` does on startup (`socket.getfqdn`),
+/// which takes over 30 s on GitHub's macOS runners.
+fn python_path() -> &'static str {
+    static DIR: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("taba-pythonpath");
+        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = dir.join(format!("sitecustomize.py.{}", std::process::id()));
         std::fs::write(
             &tmp,
-            "import runpy, socket, sys\n\
-             socket.getfqdn = lambda name='': name or 'localhost'\n\
-             sys.argv = ['http.server'] + sys.argv[1:]\n\
-             runpy.run_module('http.server', run_name='__main__', alter_sys=True)\n",
+            "import socket\nsocket.getfqdn = lambda name='': name or 'localhost'\n",
         )
         .unwrap();
-        std::fs::rename(&tmp, &path).unwrap();
-        path.to_str().unwrap().to_string()
+        std::fs::rename(&tmp, dir.join("sitecustomize.py")).unwrap();
+        dir.to_str().unwrap().to_string()
     });
-    &PATH
+    &DIR
 }
 
-/// `python3 -m http.server PORT --bind 127.0.0.1`, through `serve_py`.
 fn server_cmd(port: u16) -> Vec<String> {
     vec![
         PY.into(),
-        serve_py().into(),
+        "-m".into(),
+        "http.server".into(),
         port.to_string(),
         "--bind".into(),
         "127.0.0.1".into(),
@@ -235,14 +232,9 @@ struct Unmanaged(Child);
 impl Unmanaged {
     fn start(port: u16, cwd: &Path) -> Unmanaged {
         let child = Command::new(PY)
-            .args([
-                "-m",
-                "http.server",
-                &port.to_string(),
-                "--bind",
-                "127.0.0.1",
-            ])
+            .args(server_cmd(port).iter().skip(1))
             .current_dir(cwd)
+            .env("PYTHONPATH", python_path())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -282,6 +274,7 @@ fn close_terminal_after(
         .args(["-c", &script])
         .current_dir(cwd)
         .env("TABA_HOME", home)
+        .env("PYTHONPATH", python_path())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     unsafe {
@@ -350,6 +343,7 @@ fn close_terminal_after(
         .raw_arg(&script)
         .current_dir(cwd)
         .env("TABA_HOME", home)
+        .env("PYTHONPATH", python_path())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -495,8 +489,7 @@ fn survives_terminal_close_and_stop_is_targeted() {
     // everything it still owns with it.
     let run = |scope: &str, port: u16| {
         format!(
-            "{BIN} run --scope {scope} --name web --port {port} -- {PY} {} {port} --bind 127.0.0.1",
-            serve_py()
+            "{BIN} run --scope {scope} --name web --port {port} -- {PY} -m http.server {port} --bind 127.0.0.1"
         )
     };
     close_terminal_after(
@@ -602,6 +595,7 @@ fn scope_falls_back_to_env() {
         .args(run_noscope("x", &sleeper))
         .current_dir(&a)
         .env("TABA_HOME", env.home())
+        .env("PYTHONPATH", python_path())
         .env("TABA_SCOPE", "from-env")
         .output()
         .unwrap();
@@ -738,6 +732,7 @@ fn human_output_abbreviates_home() {
             .current_dir(&a)
             .env("HOME", &env.root)
             .env("TABA_HOME", env.home())
+            .env("PYTHONPATH", python_path())
             .env_remove("TABA_SCOPE")
             .env_remove("TABA_AGENT")
             .env_remove("TABA_OUTPUT")
