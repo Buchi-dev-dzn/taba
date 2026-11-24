@@ -30,6 +30,9 @@ then prints exactly one JSON document with `"ok"`, for success and failure.
    comes from (`scope_source`: `flag`, `env` or `git`) and the `services`
    that already exist in it. If `scope` is `null`, you are outside a git
    worktree: `cd` into the worktree you work in, or pass `--scope`.
+   If a live lease belongs to another agent, wait for it to end or ask the
+   coordinator. Do not use `--scope` or `--agent` to impersonate the holder.
+   On `W_TOOK_OVER`, reuse the services you inherited.
 2. **Reuse before you start.** If a service you need is listed, check it with
    `taba ps --scope <scope> --json` (rows are under `services`). If it has
    `"status": "running"`, use its `url` and don't start another. To see
@@ -128,4 +131,6 @@ By default, stop what you no longer need and clean up:
 taba stop --scope <scope> && taba rm --scope <scope>
 ```
 
-Leave a service running only when the human will use it, and say so.
+Leave a service running only when the human will use it, and say so. Use
+`taba keep --reason TEXT` when it must survive lease expiry. `taba lease end`
+marks your leases expired without stopping anything immediately.

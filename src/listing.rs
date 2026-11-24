@@ -78,11 +78,17 @@ pub fn cmd_ps_all() -> Result<Output> {
     let listeners: Vec<Value> = rows
         .iter()
         .map(|r| {
+            let holder = r
+                .service
+                .as_ref()
+                .map(|s| store.get_scope(&s.scope))
+                .transpose()?
+                .flatten();
             let git = r
                 .worktree
                 .as_ref()
                 .map(|w| json!({ "worktree": w, "branch": r.branch }));
-            json!({
+            Ok(json!({
                 "port": r.port,
                 "address": r.address,
                 "pid": r.pid,
@@ -93,9 +99,11 @@ pub fn cmd_ps_all() -> Result<Output> {
                 "managed": r.service.is_some(),
                 "service": r.service.as_ref().map(Service::id),
                 "scope": r.service.as_ref().map(|s| s.scope.clone()),
-            })
+                "holder": holder.as_ref().map(|h| &h.holder.agent),
+                "lease": holder.as_ref().map(|h| h.lease_json(crate::util::now_secs())),
+            }))
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
     let mut table = vec![[
         "PORT".to_string(),

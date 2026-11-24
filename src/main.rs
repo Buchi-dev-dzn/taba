@@ -1,6 +1,10 @@
 //! taba: start, list, inspect and stop local processes, grouped by work scope.
 
+mod claims;
+mod config;
 mod error;
+mod gc;
+mod lease;
 mod listing;
 mod ports;
 mod proc;
@@ -59,6 +63,10 @@ enum Cmd {
         #[arg(long, value_parser = ready::parse_ready_spec, requires = "wait",
               value_name = "tcp|http:PATH|log:REGEX")]
         ready: Option<ReadySpec>,
+        #[arg(long, value_parser = config::parse_ttl_flag)]
+        ttl: Option<config::Ttl>,
+        #[arg(long, value_parser = config::parse_service_ttl_flag)]
+        service_ttl: Option<u64>,
         /// Print one JSON document (also: TABA_OUTPUT=json)
         #[arg(long)]
         json: bool,
@@ -149,11 +157,92 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Renew the current scope's lease
+    Renew {
+        #[arg(long)]
+        scope: Option<String>,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long, value_parser = config::parse_ttl_flag)]
+        ttl: Option<config::Ttl>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Manage leases
+    Lease {
+        #[command(subcommand)]
+        command: LeaseCmd,
+    },
+    /// Keep the scope's services after its lease ends
+    Keep {
+        #[arg(long)]
+        scope: Option<String>,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        off: bool,
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Collect services past their lease or TTL
+    Gc {
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Queue for ownership of another scope's service
+    Claim {
+        target: String,
+        #[arg(long)]
+        scope: Option<String>,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        cancel: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Hand a service to its first live claimant
+    Disown {
+        target: Option<String>,
+        #[arg(long)]
+        scope: Option<String>,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Internal (Windows): send Ctrl+Break to console process group PGID,
     /// attaching to the console of process ATTACH
     #[cfg(windows)]
     #[command(name = "__ctrl-break", hide = true)]
     CtrlBreak { attach: u32, pgid: u32 },
+}
+
+#[derive(Subcommand)]
+enum LeaseCmd {
+    /// End leases without immediately stopping services
+    End {
+        #[arg(long, conflicts_with = "agent")]
+        scope: Option<String>,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+fn mutating_cmd(
+    f: impl FnOnce(&Store, &config::Config) -> Result<Output>,
+) -> Result<Option<Output>> {
+    let store = Store::open()?;
+    let cfg = config::Config::load(store.root())?;
+    f(&store, &cfg).map(Some)
 }
 
 fn env_json() -> bool {
@@ -209,6 +298,8 @@ fn main() -> ExitCode {
             port,
             wait,
             ready,
+            ttl,
+            service_ttl,
             json,
             command,
         } => (
@@ -220,10 +311,75 @@ fn main() -> ExitCode {
                 port,
                 wait,
                 ready,
+                ttl,
+                service_ttl,
                 command,
             })
             .map(Some),
         ),
+        Cmd::Renew {
+            scope,
+            agent,
+            ttl,
+            json,
+        } => (
+            json || env_json(),
+            mutating_cmd(|_, cfg| lease::cmd_renew(&scope::resolve(scope, agent)?, cfg, ttl)),
+        ),
+        Cmd::Lease {
+            command: LeaseCmd::End { scope, agent, json },
+        } => {
+            let bulk = scope.is_some();
+            (
+                json || env_json(),
+                scope::resolve(scope, agent)
+                    .and_then(|c| lease::cmd_lease_end(&c, bulk))
+                    .map(Some),
+            )
+        }
+        Cmd::Keep {
+            scope,
+            agent,
+            off,
+            force,
+            reason,
+            json,
+        } => (
+            json || env_json(),
+            mutating_cmd(|_, cfg| {
+                lease::cmd_keep(&scope::resolve(scope, agent)?, cfg, off, reason, force)
+            }),
+        ),
+        Cmd::Gc { dry_run, json } => (
+            json || env_json(),
+            mutating_cmd(|store, cfg| gc::collect(store, cfg, dry_run, usize::MAX, None)),
+        ),
+        Cmd::Claim {
+            target,
+            scope,
+            agent,
+            cancel,
+            json,
+        } => (
+            json || env_json(),
+            mutating_cmd(|store, cfg| {
+                claims::claim(store, cfg, &scope::resolve(scope, agent)?, &target, cancel)
+            }),
+        ),
+        Cmd::Disown {
+            target,
+            scope,
+            agent,
+            json,
+        } => {
+            let bulk = scope.is_some();
+            (
+                json || env_json(),
+                mutating_cmd(|store, cfg| {
+                    claims::disown(store, cfg, &scope::resolve(scope, agent)?, target, bulk)
+                }),
+            )
+        }
         Cmd::Whoami { scope, agent, json } => {
             (json || env_json(), cmd_whoami(scope, agent).map(Some))
         }
@@ -422,6 +578,8 @@ struct RunArgs {
     port: Option<PortSpec>,
     wait: Option<f64>,
     ready: Option<ReadySpec>,
+    ttl: Option<config::Ttl>,
+    service_ttl: Option<u64>,
     command: Vec<String>,
 }
 
@@ -465,8 +623,12 @@ fn cmd_run(a: RunArgs) -> Result<Output> {
     };
 
     let store = Store::open()?;
+    let cfg = config::Config::load(store.root())?;
+    cfg.resolve_ttl(a.ttl, caller.is_human())?;
+    gc::collect(&store, &cfg, false, 5, Some(&scope))?;
     let lock = store.lock()?;
     store.mark_version()?;
+    let touched = lease::touch(&store, &cfg, &caller, &scope, lease::Access::Create, a.ttl)?;
     let id = format!("{scope}/{name}");
     if let Some(op) = store.live_op(&scope, &name)? {
         return Err(busy(&id, &op));
@@ -481,8 +643,16 @@ fn cmd_run(a: RunArgs) -> Result<Output> {
             && ex.cwd == caller.cwd
             && ex.port_request() == port_request
         {
+            let mut ex = ex.clone();
+            if let Some(ttl) = a.service_ttl.or(ex.service_ttl_secs) {
+                ex.service_ttl_secs = Some(ttl);
+                ex.service_expires_at = Some(util::rfc3339(util::now_secs().saturating_add(ttl)));
+                store.put(&ex)?;
+            }
             drop(lock);
-            return finish_existing(ex.clone(), check, wait);
+            let mut out = finish_existing(ex, check, wait)?;
+            out.warnings.extend(touched.warnings);
+            return Ok(out);
         }
         return Err(TabaError::new(
             "E_CONFLICT",
@@ -518,7 +688,7 @@ fn cmd_run(a: RunArgs) -> Result<Output> {
             Some(ports::pick_auto(&store, *first, *last, &scope, &name)?)
         }
     };
-    let mut warnings = Vec::new();
+    let mut warnings = touched.warnings;
     if matches!(a.port, Some(PortSpec::Auto { .. }))
         && !template.iter().any(|x| x.contains("{port}"))
     {
@@ -597,6 +767,11 @@ fn cmd_run(a: RunArgs) -> Result<Output> {
         instance: Some(format!("{pid}-{}", spawned.start_time)),
         started_by: Some(caller.agent.clone()),
         ready: None,
+        service_ttl_secs: a.service_ttl,
+        service_expires_at: a
+            .service_ttl
+            .map(|t| util::rfc3339(util::now_secs().saturating_add(t))),
+        moves: Vec::new(),
     };
     store.put(&svc)?;
     let op = if replacing { "replace" } else { "start" };
@@ -734,6 +909,16 @@ fn run_result(
 fn cmd_whoami(scope: Option<String>, agent: Option<String>) -> Result<Output> {
     let caller = scope::resolve(scope, agent)?;
     let store = Store::open()?;
+    let cfg = config::Config::load(store.root())?;
+    let prospective = lease::prospective_lease(&cfg, &caller)?;
+    gc::collect(&store, &cfg, false, 5, caller.scope.as_deref())?;
+    let touched = if let Some(s) = &caller.scope {
+        let _lock = store.lock()?;
+        lease::touch(&store, &cfg, &caller, s, lease::Access::Observe, None)?
+    } else {
+        lease::Touched::default()
+    };
+    let rec = touched.record.as_ref();
     let services: Vec<String> = match &caller.scope {
         Some(s) => store.list(Some(s))?.iter().map(Service::id).collect(),
         None => Vec::new(),
@@ -747,6 +932,12 @@ fn cmd_whoami(scope: Option<String>, agent: Option<String>) -> Result<Output> {
         "human": caller.is_human(),
         "directory": caller.cwd,
         "services": services,
+        "holder": rec.map(|r| &r.holder.agent),
+        "holder_pid": rec.and_then(|r| r.holder.pid),
+        "you_hold_scope": touched.you_hold,
+        "lease": caller.scope.as_ref().map(|_| rec.map_or(prospective, |r| r.lease_json(util::now_secs()))),
+        "takeover": touched.takeover,
+        "next": if rec.is_some() && !touched.you_hold { vec![Next::just("wait for the live lease to end, or ask the coordinator or human").to_json()] } else { Vec::new() },
     });
     let mut text = match (&caller.scope, caller.source) {
         (Some(s), Some(src)) => format!("scope     {s} (from {})", src.as_str()),
@@ -767,7 +958,16 @@ fn cmd_whoami(scope: Option<String>, agent: Option<String>) -> Result<Output> {
         };
         text.push_str(&format!("\nservices  {list}"));
     }
-    Ok(Output::new(body, text))
+    if let Some(r) = rec {
+        text.push_str(&format!(
+            "\nholder    {} (TTL {})",
+            r.holder.agent,
+            r.ttl().display()
+        ));
+    }
+    let mut out = Output::new(body, text);
+    out.warnings = touched.warnings;
+    Ok(out)
 }
 
 // ---------------------------------------------------------------- ps
@@ -790,48 +990,85 @@ fn cmd_ps(scope: Option<String>, running_only: bool) -> Result<Output> {
     if running_only {
         services.retain(|s| s.is_running());
     }
+    let caller = scope::resolve(None, None)?;
+    let touched = peek_scope(&store, &caller)?;
     let statuses: Vec<&str> = services.iter().map(|s| status_of(&store, s)).collect();
 
-    let rows: Vec<Value> = services
-        .iter()
-        .zip(&statuses)
-        .map(|(s, status)| {
-            json!({
-                "service": s.id(),
-                "scope": s.scope,
-                "name": s.name,
-                "status": status,
-                "url": s.url(),
-                "port": s.port,
-                "directory": s.cwd,
-                "command": s.command,
-                "pid": s.pid,
-                "pgid": s.pgid,
-                "start_time": s.start_time,
-                "log_path": s.log_path,
-                "instance": s.instance(),
-            })
-        })
-        .collect();
+    let mut rows = Vec::new();
+    for (s, status) in services.iter().zip(&statuses) {
+        let now = util::now_secs();
+        let rec = store.get_scope(&s.scope)?;
+        let queue = store.get_claims(&s.scope, &s.name)?;
+        rows.push(json!({
+            "service": s.id(),
+            "scope": s.scope,
+            "name": s.name,
+            "status": status,
+            "url": s.url(),
+            "port": s.port,
+            "directory": s.cwd,
+            "command": s.command,
+            "pid": s.pid,
+            "pgid": s.pgid,
+            "start_time": s.start_time,
+            "log_path": s.log_path,
+            "instance": s.instance(),
+            "holder": rec.as_ref().map(|r| &r.holder.agent),
+            "lease": rec.as_ref().map(|r| r.lease_json(now)),
+            "keep": rec.as_ref().is_some_and(|r| r.keep),
+            "keep_reason": rec.as_ref().and_then(|r| r.keep_reason.as_deref()),
+            "claims": claims::rows(&store, &queue)?,
+        }));
+    }
 
     let mut table = vec![[
         "SERVICE".to_string(),
         "STATUS".to_string(),
         "URL".to_string(),
         "DIRECTORY".to_string(),
+        "OWNER".to_string(),
+        "NEXT".to_string(),
     ]];
-    for (s, status) in services.iter().zip(&statuses) {
+    for ((s, status), row) in services.iter().zip(&statuses).zip(&rows) {
         table.push([
             s.id(),
             status.to_string(),
             s.url().unwrap_or_else(|| "-".into()),
             tilde(&s.cwd),
+            row["holder"].as_str().map_or_else(
+                || "-".into(),
+                |a| {
+                    if row["lease"]["state"] == "expired" {
+                        format!("{a} (expired)")
+                    } else {
+                        a.into()
+                    }
+                },
+            ),
+            row["claims"]
+                .as_array()
+                .and_then(|q| q.iter().find(|e| e["alive"] == true))
+                .and_then(|e| e["scope"].as_str())
+                .unwrap_or("-")
+                .into(),
         ]);
     }
-    Ok(Output::new(
-        json!({ "services": rows }),
-        util::render_table(&table),
-    ))
+    let mut body = json!({ "services": rows });
+    if touched.takeover_available {
+        body["takeover"] = json!("available");
+    }
+    let mut out = Output::new(body, util::render_table(&table));
+    out.warnings = touched.warnings;
+    Ok(out)
+}
+
+fn peek_scope(store: &Store, caller: &Caller) -> Result<lease::Touched> {
+    let Some(scope) = &caller.scope else {
+        return Ok(lease::Touched::default());
+    };
+    let cfg = config::Config::load(store.root())?;
+    let _lock = store.lock()?;
+    lease::touch(store, &cfg, caller, scope, lease::Access::Peek, None)
 }
 
 // ---------------------------------------------------------------- logs
@@ -843,6 +1080,7 @@ fn cmd_logs(target: &str, follow: bool, json: bool) -> Result<Option<Output>> {
     let svc = store
         .get(&scope, &name)?
         .ok_or_else(|| not_found(&scope, &name))?;
+    let peek = peek_scope(&store, &caller)?;
     let mut file = File::open(&svc.log_path)
         .map_err(|e| TabaError::state(format!("cannot open {}: {e}", svc.log_path.display())))?;
     let mut buf = Vec::new();
@@ -853,7 +1091,9 @@ fn cmd_logs(target: &str, follow: bool, json: bool) -> Result<Option<Output>> {
             "log_path": svc.log_path,
             "log": String::from_utf8_lossy(&buf),
         });
-        return Ok(Some(Output::new(body, String::new())));
+        let mut out = Output::new(body, String::new());
+        out.warnings = peek.warnings;
+        return Ok(Some(out));
     }
     let mut stdout = io::stdout().lock();
     stdout.write_all(&buf)?;
@@ -1041,6 +1281,10 @@ fn stop_one(
             .get(scope, name)?
             .ok_or_else(|| not_found(scope, name))?;
         let owner = caller.scope.as_deref() == Some(svc.scope.as_str());
+        if owner && force_reason.is_none() {
+            let cfg = config::Config::load(store.root())?;
+            lease::touch(store, &cfg, caller, scope, lease::Access::Mutate, None)?;
+        }
         if !owner && force_reason.is_none() {
             return Err(not_owner(caller, &svc, "stop"));
         }
@@ -1074,6 +1318,9 @@ fn stop_one(
     };
     {
         let _lock = store.lock()?;
+        if res.is_ok() && !svc.is_running() {
+            claims::discard(store, &svc)?;
+        }
         store.release_op(scope, name)?;
     }
     let forced = force_reason.is_some();
@@ -1133,7 +1380,15 @@ fn cmd_rm(
     for (s, n) in &targets {
         let svc = store.get(s, n)?.ok_or_else(|| not_found(s, n))?;
         let owner = caller.scope.as_deref() == Some(svc.scope.as_str());
-        let refusal = if !owner && reason.is_none() {
+        let lease_refusal = if owner && reason.is_none() {
+            let cfg = config::Config::load(store.root())?;
+            lease::touch(&store, &cfg, &caller, s, lease::Access::Mutate, None).err()
+        } else {
+            None
+        };
+        let refusal = if let Some(e) = lease_refusal {
+            Some(e)
+        } else if !owner && reason.is_none() {
             Some(not_owner(&caller, &svc, "rm"))
         } else if let Some(op) = store.live_op(s, n)? {
             Some(busy(&svc.id(), &op))

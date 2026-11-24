@@ -291,7 +291,11 @@ fn m1_06_cross_scope_stop_is_refused_unless_forced() {
     );
     assert_eq!(exit(&out), 0, "{}", text(&out));
     wait_until("server to stop", || !http_ok(port));
-    let ev = f.events();
+    let ev: Vec<_> = f
+        .events()
+        .into_iter()
+        .filter(|e| e["event"] == "force_stop")
+        .collect();
     assert_eq!(ev.len(), 2);
     assert_eq!(ev[1]["event"], "force_stop");
     assert_eq!(ev[1]["agent"], "human");
