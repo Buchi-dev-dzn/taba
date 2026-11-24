@@ -1933,6 +1933,15 @@ second borrower).
    `E_CONFLICT`. The same move by `wt-c` while a1 is alive returns
    `E_NOT_OWNER`; after a1's pid is killed it succeeds without `--force`.
 
+#### M5 implementation notes
+
+- An explicit scope give initially binds the recipient by agent name. The
+  recipient's first renewal with `TABA_AGENT_PID` binds the process identity.
+- Service moves keep the live process, URL, original working directory and
+  log stream. Active borrows follow the instance except the recipient's,
+  which ends. Target name conflicts and in-flight service operations are
+  refused before moving.
+
 ### M6: hooks and skill
 
 1. Feeding recorded PreToolUse JSON to `taba hook claude-code pre-tool-use`:

@@ -394,6 +394,18 @@ prevent accidents; they are not credentials.
 - `run --service-ttl DURATION` sets an independent service timeout.
   `taba keep --reason TEXT` pins the scope; `taba keep --off` clears it.
 
+### Handing services over
+
+A successor in the same scope takes over after the old lease ends. For a
+planned hand-off, the holder can use `taba move --to AGENT`. The recipient
+should run `taba whoami` with its agent ID and PID to bind the new lease to
+its process. `taba move --take` takes an expired lease explicitly; taking
+one that is still live requires an audited `--force --reason TEXT`.
+
+Use `taba move S/N --to SCOPE` to transfer just one service to an existing
+scope. Its process, instance and URL stay the same. The receiving scope's
+borrow ends, and other borrows follow the same instance to its new name.
+
 ### Borrowing a service
 
 Use `taba borrow S/N` to record that your scope uses another scope's service.

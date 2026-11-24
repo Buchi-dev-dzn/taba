@@ -106,14 +106,19 @@ fn resolve_agent(flag: Option<String>) -> Result<String> {
         .or_else(|| std::env::var("TABA_AGENT").ok())
         .filter(|a| !a.is_empty())
         .unwrap_or_else(|| "human".to_string());
-    let ok = agent.len() <= 128 && agent.chars().all(|c| c.is_ascii_graphic());
+    validate_agent(&agent)?;
+    Ok(agent)
+}
+
+pub fn validate_agent(agent: &str) -> Result<()> {
+    let ok = !agent.is_empty() && agent.len() <= 128 && agent.chars().all(|c| c.is_ascii_graphic());
     if !ok {
         return Err(TabaError::new(
             "E_INVALID_IDENT",
             format!("invalid agent {agent:?}: use at most 128 printable characters, no spaces"),
         ));
     }
-    Ok(agent)
+    Ok(())
 }
 
 /// Nearest ancestor of `dir` (itself included) that contains a `.git` file

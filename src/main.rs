@@ -5,6 +5,7 @@ mod claims;
 mod config;
 mod error;
 mod gc;
+mod handoff;
 mod lease;
 mod listing;
 mod ports;
@@ -226,6 +227,24 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Transfer a scope lease or move a service without restarting it
+    Move {
+        target: Option<String>,
+        #[arg(long)]
+        scope: Option<String>,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long, conflicts_with = "take", required_unless_present = "take")]
+        to: Option<String>,
+        #[arg(long, conflicts_with = "target")]
+        take: bool,
+        #[arg(long)]
+        force: bool,
+        #[arg(long, requires = "force")]
+        reason: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Queue for ownership of another scope's service
     Claim {
         target: String,
@@ -426,6 +445,32 @@ fn main() -> ExitCode {
             json || env_json(),
             mutating_cmd(|store, _| {
                 borrows::release(store, &scope::resolve(scope, agent)?, &target)
+            }),
+        ),
+        Cmd::Move {
+            target,
+            scope,
+            agent,
+            to,
+            take,
+            force,
+            reason,
+            json,
+        } => (
+            json || env_json(),
+            mutating_cmd(|store, cfg| {
+                handoff::execute(
+                    store,
+                    cfg,
+                    &scope::resolve(scope, agent)?,
+                    handoff::Request {
+                        target,
+                        to,
+                        take,
+                        force,
+                        reason,
+                    },
+                )
             }),
         ),
         Cmd::Claim {
