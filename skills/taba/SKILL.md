@@ -60,8 +60,10 @@ then prints exactly one JSON document with `"ok"`, for success and failure.
    or a process taba didn't start. Start on another port with `--port auto`,
    or ask the human, who can stop it themselves.
 5. **Stay inside your own scope.** Never stop or `rm` another scope's
-   services. taba refuses it with `E_NOT_OWNER` (exit 3), and `--force` is
-   for the human only.
+   services. taba refuses it with `E_NOT_OWNER` (exit 3). Do not use raw
+   stop commands or `--force` to circumvent that refusal. Optional hooks
+   can reject unsafe shell actions. Claude Code asks the human before
+   a forced tool call; Codex denies it because that hook cannot ask.
 6. **Finish:** stop and clean up your scope, unless the human needs a server
    (see "Hand-off").
 
@@ -125,7 +127,9 @@ human may still want the logs.
 
 ## Hand-off
 
-A successor in the same scope can take over after your lease ends. If you
+A successor in the same scope can take over after your lease ends. Use
+`taba claim S/N` if you need a service after another scope's lease ends;
+check for `W_HANDED_OVER` rather than assuming the service transferred. If you
 know the next agent, give it the scope with `taba move --to AGENT`. Use
 `taba move S/N --to SCOPE` when transferring just one service. Neither
 command restarts the service.

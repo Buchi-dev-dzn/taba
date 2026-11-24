@@ -469,6 +469,13 @@ fn job_pids(job: &Handle) -> Vec<i32> {
 }
 
 /// Snapshot of all processes as (pid, parent pid).
+pub fn all_pids() -> Vec<i32> {
+    process_tree()
+        .into_iter()
+        .filter_map(|(pid, _)| same_user(pid).then_some(pid))
+        .collect()
+}
+
 fn process_tree() -> Vec<(i32, i32)> {
     let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
     if snap == INVALID_HANDLE_VALUE {

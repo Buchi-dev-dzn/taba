@@ -240,6 +240,35 @@ mkdir -p ~/.claude/skills && ln -s "$PWD/skills/taba" ~/.claude/skills/taba
 mkdir -p .claude/skills && cp -R /path/to/taba/skills/taba .claude/skills/
 ```
 
+### Optional tool hooks
+
+Add the following to Claude Code's project or user settings to set the
+session identity, guard common shell stop commands and mark the lease ended
+when the session ends:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{"hooks": [{"type": "command", "command": "taba hook claude-code session-start"}]}],
+    "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "taba hook claude-code pre-tool-use"}]}],
+    "SessionEnd": [{"hooks": [{"type": "command", "command": "taba hook claude-code session-end"}]}]
+  }
+}
+```
+
+For Codex CLI, configure the `Bash` PreToolUse matcher with
+`taba hook codex pre-tool-use`, then review and trust it in `/hooks`. Set
+`TABA_AGENT=codex:<session_id>` so CLI calls and the hook use the same
+identity. Claude Code asks for confirmation on `taba … --force` for every
+hooked agent; it cannot distinguish a coordinator from a worker. Codex
+[does not support that hook decision](https://developers.openai.com/codex/hooks#pretooluse),
+so taba denies the forced tool call and directs the agent to a human.
+
+These are best-effort checks for common Bash commands, not a security
+boundary. They do not execute the commands or intercept native PowerShell
+stop commands. A command the hook does not understand falls back to the
+harness's normal permissions.
+
 ### AGENTS.md / CLAUDE.md snippet
 
 If your agent doesn't load skills, paste this into `AGENTS.md` or `CLAUDE.md`:
