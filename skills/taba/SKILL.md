@@ -151,3 +151,10 @@ taba stop --scope <scope> && taba rm --scope <scope>
 Leave a service running only when the human will use it, and say so. Use
 `taba keep --reason TEXT` when it must survive lease expiry. `taba lease end`
 marks your leases expired without stopping anything immediately.
+
+## Updating taba
+
+`taba update --check --json` is read-only and reports whether a newer release
+exists. Run `taba update` only when the human asks: it can replace the `taba`
+binary itself (official standalone Linux and macOS installs; elsewhere it only
+reports how to upgrade). It never restarts or stops services.
