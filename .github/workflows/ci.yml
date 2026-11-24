@@ -30,6 +30,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # The first start of a fresh Python can take tens of seconds on macOS
+      # runners (first-launch checks, bytecode); do it before the tests time it.
+      - name: Warm up Python
+        shell: bash
+        run: |
+          python --version
+          python -c "import http.server, runpy, signal, socketserver, subprocess"
+          python3 -c "import http.server" || true
       - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --check
@@ -39,16 +47,3 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --locked
-      - name: Debug (temporary)
-        if: failure() && runner.os == 'macOS'
-        run: |
-          set -x
-          export TABA_HOME=$RUNNER_TEMP/dbg
-          which -a python3; python3 --version
-          ./target/debug/taba run --scope d --name web --port 18999 --wait=10 -- python3 -m http.server 18999 --bind 127.0.0.1 || true
-          sleep 2
-          ./target/debug/taba ps --json || true
-          cat $TABA_HOME/logs/d/web.log || true
-          curl -sv http://127.0.0.1:18999/ -o /dev/null || true
-          ps -axo pid,pgid,stat,command | grep -i "[h]ttp.server" || true
-          lsof -nP -iTCP:18999 || true
