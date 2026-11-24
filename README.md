@@ -188,41 +188,29 @@ If your agent doesn't load skills, paste this into `AGENTS.md` or `CLAUDE.md`:
   it running or stopped it.
 ```
 
-## taba vs Docker
+## How taba compares
 
-taba is for dev servers that don't need a container, so they don't get lost.
-It is not a Docker replacement. Measured on an Apple M1 with Docker Desktop
-4.97, `python -m http.server`, N = 15, medians. Method, machine and raw data
-are in [docs/benchmarks.md](docs/benchmarks.md).
+taba's peers are local process managers, not Docker. Tested 2026-11-24 on
+macOS. Method, sources and the full table are in
+[docs/comparison.md](docs/comparison.md).
 
-| | plain shell (`nohup … &`) | taba | Docker |
-| --- | ---: | ---: | ---: |
-| Start → first HTTP 200 | 216 ms | 226 ms | 537 ms |
-| Stop → port free | 3 ms | 66 ms | 3211 ms (161 ms with `--init`) |
-| Resident background process | none | none | Docker Desktop, ~2 GB |
-| Size on disk | – | 1.27 MB binary | 207 MB image |
+| | taba | pm2 | overmind / foreman | process-compose | mprocs (now dekit) |
+| --- | --- | --- | --- | --- | --- |
+| Background process it needs | none | a daemon | overmind + tmux with `-D`; foreman is foreground only | a server per project | a runner per project |
+| Start one command, no config file | yes | yes | no, needs a Procfile | no, needs a YAML file | yes (`dekit spawn`, inside a project) |
+| Same start command twice | reuses the running one | a copy or an error, depending on how you start it | error (overmind) | reports success, then fails on its API port | error |
+| Port already in use | refuses and names the holder | crash-loops | the process exits | the process exits | the process exits |
+| Restarts, TUI, Linux | none of these | all three | overmind: restarts and Linux; foreman: Linux | all three | all three (restarts only for tasks in `dekit.yaml`) |
 
-**Where taba helps**
+taba is the small option: no daemon and no config, and it is safe to run again,
+for dev servers spread over many tasks and checkouts on one Mac. If you need
+restarts, dependencies, a TUI or Linux, use process-compose, dekit or pm2.
 
-- Re-running the same command does not start a duplicate. It returns the
-  service that is already running.
-- On a port conflict, taba names the process holding the port and starts
-  nothing. Docker leaves a `Created` container behind.
-- `taba ps` shows the task and directory of each server.
-- It runs in place on your files. In our test, Docker bind-mount reads were
-  3–8× slower than native.
-- There is no daemon and no VM.
+## When to use Docker instead
 
-**Where Docker is the right tool**
-
-- Isolation and reproducible environments. taba gives neither: a service is an
-  ordinary host process using whatever `node` or `python3` is on your `PATH`.
-- taba is not faster than starting with plain `&` or `nohup`. It adds
-  bookkeeping, not speed.
-- `taba run` currently waits ~200 ms before it returns.
-
-Not measured: Docker engine cold start (Docker Desktop was already running)
-and Vite inside Docker.
+taba does not isolate processes or make environments reproducible. A service
+is an ordinary host process using whatever is on your `PATH`. Use Docker for
+that. Measurements against Docker are in [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Ownership model
 
