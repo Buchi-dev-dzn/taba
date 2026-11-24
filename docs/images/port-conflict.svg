@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1181" height="266" viewBox="0 0 1181 266" role="img" aria-label="taba — port-conflict">
+<rect x="0.5" y="0.5" width="1180" height="265" rx="8" fill="#0d1117" stroke="#30363d"/>
+<path d="M0.5 30 V8.5 A8 8 0 0 1 8.5 0.5 H1172.5 A8 8 0 0 1 1180.5 8.5 V30 Z" fill="#161b22"/>
+<line x1="0.5" y1="30.5" x2="1180.5" y2="30.5" stroke="#30363d"/>
+<circle cx="18" cy="15.5" r="5.5" fill="#ff5f57"/>
+<circle cx="36" cy="15.5" r="5.5" fill="#febc2e"/>
+<circle cx="54" cy="15.5" r="5.5" fill="#28c840"/>
+<text x="590.5" y="20" text-anchor="middle" fill="#8b949e" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="12">taba — port-conflict</text>
+<text font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="14" xml:space="preserve">
+<tspan x="22" y="62"><tspan fill="#3fb950" font-weight="bold">$ </tspan><tspan fill="#e6edf3" font-weight="bold">taba run --scope billing --name admin --port 8001 -- python3 -u -m http.server 8001</tspan></tspan>
+<tspan x="22" y="82"><tspan fill="#ff7b72">taba: port 8001 is already claimed by taba service login-fix/web (~/demo/shop-login-fix); nothing was started</tspan></tspan>
+<tspan x="22" y="102"><tspan fill="#c9d1d9">  next: start on a free port instead: taba run --scope billing --name admin --port auto --wait -- python3 -u -m http.server {port}</tspan></tspan>
+<tspan x="22" y="122"><tspan fill="#c9d1d9">  next: use the existing server read-only at http://localhost:8001; do not stop it</tspan></tspan>
+<tspan x="22" y="142"><tspan fill="#3fb950" font-weight="bold">$ </tspan><tspan fill="#e6edf3" font-weight="bold">taba run --scope billing --name admin --port 9000 -- python3 -u -m http.server 9000</tspan></tspan>
+<tspan x="22" y="162"><tspan fill="#ff7b72">taba: port 9000 is in use by pid 72314, which is not managed by taba:</tspan></tspan>
+<tspan x="22" y="182"><tspan fill="#c9d1d9">  Python -m http.server 9000</tspan></tspan>
+<tspan x="22" y="202"><tspan fill="#c9d1d9">nothing was started</tspan></tspan>
+<tspan x="22" y="222"><tspan fill="#c9d1d9">  next: start on a free port instead: taba run --scope billing --name admin --port auto --wait -- python3 -u -m http.server {port}</tspan></tspan>
+<tspan x="22" y="242"><tspan fill="#c9d1d9">  next: ask the human: taba did not start that process and will not stop it; they can stop it themselves</tspan></tspan>
+</text>
+</svg>

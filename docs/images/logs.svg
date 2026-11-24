@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1181" height="146" viewBox="0 0 1181 146" role="img" aria-label="taba — logs">
+<rect x="0.5" y="0.5" width="1180" height="145" rx="8" fill="#0d1117" stroke="#30363d"/>
+<path d="M0.5 30 V8.5 A8 8 0 0 1 8.5 0.5 H1172.5 A8 8 0 0 1 1180.5 8.5 V30 Z" fill="#161b22"/>
+<line x1="0.5" y1="30.5" x2="1180.5" y2="30.5" stroke="#30363d"/>
+<circle cx="18" cy="15.5" r="5.5" fill="#ff5f57"/>
+<circle cx="36" cy="15.5" r="5.5" fill="#febc2e"/>
+<circle cx="54" cy="15.5" r="5.5" fill="#28c840"/>
+<text x="590.5" y="20" text-anchor="middle" fill="#8b949e" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="12">taba — logs</text>
+<text font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="14" xml:space="preserve">
+<tspan x="22" y="62"><tspan fill="#3fb950" font-weight="bold">$ </tspan><tspan fill="#e6edf3" font-weight="bold">taba logs billing/web</tspan></tspan>
+<tspan x="22" y="82"><tspan fill="#c9d1d9">--- taba: 2026-11-24 15:33:31 +0900 starting [&quot;python3&quot;, &quot;-u&quot;, &quot;-m&quot;, &quot;http.server&quot;, &quot;8002&quot;] in /Users/Shared/demo/shop-billing ---</tspan></tspan>
+<tspan x="22" y="102"><tspan fill="#c9d1d9">Serving HTTP on :: port 8002 (http://[::]:8002/) ...</tspan></tspan>
+<tspan x="22" y="122"><tspan fill="#c9d1d9">::1 - - [24/Nov/2026 15:33:33] &quot;GET / HTTP/1.1&quot; 200 -</tspan></tspan>
+</text>
+</svg>

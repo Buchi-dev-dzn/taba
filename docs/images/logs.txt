@@ -1,0 +1,4 @@
+$ taba logs billing/web
+--- taba: 2026-11-24 15:33:31 +0900 starting ["python3", "-u", "-m", "http.server", "8002"] in /Users/Shared/demo/shop-billing ---
+Serving HTTP on :: port 8002 (http://[::]:8002/) ...
+::1 - - [24/Nov/2026 15:33:33] "GET / HTTP/1.1" 200 -

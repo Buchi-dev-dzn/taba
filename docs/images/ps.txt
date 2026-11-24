@@ -1,0 +1,5 @@
+$ taba ps
+SERVICE        STATUS   URL                    DIRECTORY
+billing/api    running  http://localhost:8003  ~/demo/shop-billing
+billing/web    running  http://localhost:8002  ~/demo/shop-billing
+login-fix/web  running  http://localhost:8001  ~/demo/shop-login-fix

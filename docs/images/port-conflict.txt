@@ -1,0 +1,10 @@
+$ taba run --scope billing --name admin --port 8001 -- python3 -u -m http.server 8001
+taba: port 8001 is already claimed by taba service login-fix/web (~/demo/shop-login-fix); nothing was started
+  next: start on a free port instead: taba run --scope billing --name admin --port auto --wait -- python3 -u -m http.server {port}
+  next: use the existing server read-only at http://localhost:8001; do not stop it
+$ taba run --scope billing --name admin --port 9000 -- python3 -u -m http.server 9000
+taba: port 9000 is in use by pid 72314, which is not managed by taba:
+  Python -m http.server 9000
+nothing was started
+  next: start on a free port instead: taba run --scope billing --name admin --port auto --wait -- python3 -u -m http.server {port}
+  next: ask the human: taba did not start that process and will not stop it; they can stop it themselves

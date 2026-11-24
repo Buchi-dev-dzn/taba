@@ -1,14 +1,16 @@
-# taba（束）企画書 v0.1
+> Superseded by [design-v0.2.md](design-v0.2.md). Kept for history.
 
-**起動したものを、作業ごとに束ねる。**
+# taba Proposal v0.1
 
-`taba` は、開発サーバーなどのローカルプロセスを、作業（スコープ）ごとに起動・確認・停止できるCLI。Docker の `run / ps / logs / stop` 相当の操作だけを、コンテナなしで提供する。Orca や特定の AI ツールに依存せず、普通のターミナルから使う。
+**Bundle what you start, by the work it belongs to.**
 
-## 解決したいこと
+`taba` is a CLI for starting, inspecting and stopping local processes such as development servers, grouped by work item ("scope"). It provides only the Docker-style `run / ps / logs / stop` operations, without containers. It does not depend on Orca or any particular AI tool and is used from an ordinary terminal.
 
-AI と並行して開発すると、複数のターミナルやチェックアウトでサーバーが起動し、`localhost:5173` が「どの作業の、どのディレクトリで動いているのか、止めてよいのか」が分からなくなる。`taba` は起動時に所有者（作業）を記録し、後から誰でも作業名で確認・停止できるようにする。
+## Problem
 
-## 使い方
+When developing in parallel with AI agents, servers get started from many terminals and checkouts, and it becomes unclear for `localhost:5173` "which work item it belongs to, which directory it runs from, and whether it is safe to stop". `taba` records the owner (the work item) at start time so that anyone can later inspect and stop it by work name.
+
+## Usage
 
 ```sh
 taba run --scope login-fix --name web --port 5173 -- npm run dev -- --port 5173 --strictPort
@@ -19,25 +21,25 @@ taba stop login-fix/web
 taba stop --scope login-fix
 ```
 
-- `--scope` 省略時は環境変数 `TABA_SCOPE` を使う。どちらもなければエラー。
-- `--port` は追跡するポートの申告。アプリへの設定は起動コマンドに任せる。使用中ならわかる範囲で使用者を表示し、何も起動・停止しない。
+- If `--scope` is omitted, the `TABA_SCOPE` environment variable is used. If neither is present, it is an error.
+- `--port` declares the port to track. Configuring the app is left to the start command. If the port is in use, show its user as far as can be determined, and start or stop nothing.
 
 ## Ownership
 
-- 持ち主は名前付きの作業スコープ。起動した AI やターミナルではない。ターミナルを閉じても残る。
-- 同じスコープ・名前・コマンド・ディレクトリでの再 `run` は二重起動せず既存を返す。同じ名前で条件が違えばエラー。
-- `stop --scope` はそのスコープの管理対象だけを止める。プロセスを止めるだけで、ファイルは消さない。
-- 同一性（PID と起動時刻など）を確認できないプロセスは止めない。管理外のプロセスには触らない。
+- The owner is a named work scope, not the AI or terminal that started it. It persists after the terminal is closed.
+- Re-running `run` with the same scope, name, command and directory does not start a second instance; it returns the existing one. The same name with different conditions is an error.
+- `stop --scope` stops only the managed processes of that scope. It only stops processes and does not delete files.
+- Processes whose identity (PID, start time, etc.) cannot be confirmed are not stopped. Unmanaged processes are never touched.
 
-## MVP の範囲
+## MVP scope
 
-- macOS、単体バイナリ、ユーザー権限のみ。Docker・設定ファイル・管理者権限は不要。
-- 起動したプロセスをプロセスグループとして管理し、stdout/stderr をログファイルへ保存。
-- 範囲外：コンテナ、隔離、自動ポート割り当て、プロキシ、借用中の停止拒否、AI セッション終了の検知。
+- macOS, single binary, user privileges only. No Docker, configuration file or administrator privileges required.
+- Manage started processes as process groups and save stdout/stderr to log files.
+- Out of scope: containers, isolation, automatic port allocation, proxy, refusing to stop while borrowed, detecting the end of an AI session.
 
-## 合格条件
+## Acceptance criteria
 
-1. 同じプロジェクトの二つのチェックアウトから、別ポートでサーバーを起動できる。
-2. 三つ目のターミナルの `taba ps` で、どの URL がどのディレクトリのものか分かる。
-3. 同じ起動を再実行してもサーバーが増えない。
-4. 起動元ターミナルを閉じてもログを確認でき、片方を止めてももう片方と管理外のサーバーは動き続ける。
+1. Servers can be started on different ports from two checkouts of the same project.
+2. `taba ps` in a third terminal shows which URL belongs to which directory.
+3. Re-running the same start does not add a server.
+4. Logs can still be read after the launching terminal is closed, and stopping one server leaves the other and unmanaged servers running.
