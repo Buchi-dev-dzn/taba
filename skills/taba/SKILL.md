@@ -11,10 +11,12 @@ processes. Everything below uses only these commands:
 
 ```sh
 taba run [--scope S] --name N [--port P] -- CMD...
-taba ps [--scope S] [--json]
+taba ps [--scope S] [--running] [--json]
 taba logs [-f] S/N
 taba stop S/N
 taba stop --scope S [--timeout SECS]
+taba rm S/N
+taba rm --scope S
 ```
 
 ## Rules
@@ -25,10 +27,10 @@ taba stop --scope S [--timeout SECS]
 2. **Reuse before you start.** Run `taba ps --scope <scope> --json` first. If a
    service you need has `"status": "running"`, use its `url` and don't start
    another. Re-running the exact same `taba run` (same scope, name, command,
-   directory and port) is safe: it prints `already running: ...` and starts
-   nothing.
-3. **Stay inside your own scope.** Never stop another scope's services, and
-   never `kill` a process taba reports as not managed by taba.
+   directory and port) is safe: it prints
+   `already running <scope>/<name> ...` and starts nothing.
+3. **Stay inside your own scope.** Never stop or `rm` another scope's
+   services, and never `kill` a process taba reports as not managed by taba.
 
 ## Choosing a scope
 
@@ -54,8 +56,8 @@ taba run --scope login-fix --name api --port 8000 -- uvicorn app:app --port 8000
 `--port` only tells taba what to track. taba doesn't configure the app.
 
 If `run` fails with `port N is already claimed by taba service ...` or
-`port N is in use by pid ... which is not managed by taba`, **do not kill
-that process.** Pick another free port, or ask the human if it has to be that
+`port N is in use by pid ..., which is not managed by taba` (followed by that
+process's command line), **do not kill that process.** Pick another free port, or ask the human if it has to be that
 port. Nothing was started.
 
 ## Logs
@@ -78,7 +80,19 @@ taba stop --scope login-fix    # everything in your scope
 
 taba only signals process groups it started and can still verify. It sends
 SIGTERM, then SIGKILL after `--timeout` seconds (default 5). Stopping never
-deletes logs or records.
+deletes logs or records: stopped services stay in `taba ps` (status
+`exited`) so their logs can still be read.
+
+## Cleaning up
+
+```sh
+taba rm --scope login-fix      # delete records + logs of your stopped services
+taba rm login-fix/web          # one stopped service
+```
+
+`rm` refuses running services (`still running; stop it first`), so run
+`taba stop` first. Only remove your own scope, and only once nobody needs the
+logs any more.
 
 ## Hand-off
 
@@ -87,7 +101,14 @@ example:
 
 - `login-fix/web`, http://localhost:5173, **left running** (needed for
   review), or **stopped**
-- how to stop it: `taba stop --scope login-fix`
+- how to stop and clean it up: `taba stop --scope login-fix && taba rm --scope login-fix`
 
-By default, stop what you no longer need with `taba stop --scope <scope>`.
-Leave a service running only when the human will use it, and say so.
+By default, stop what you no longer need and clean up its records and logs:
+
+```sh
+taba stop --scope <scope> && taba rm --scope <scope>
+```
+
+Leave a service running only when the human will use it, and say so (then
+leave its records alone too). Skip the `rm` if the human may still want to
+read the logs.

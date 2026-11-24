@@ -1,8 +1,8 @@
 $ taba stop --scope billing
-billing/api: stopped
-billing/web: stopped
+billing/api: stopped  ~/demo/shop-billing
+billing/web: stopped  ~/demo/shop-billing
 $ taba ps
 SERVICE        STATUS   URL                    DIRECTORY
-billing/api    exited   http://localhost:8003  /Users/Shared/demo/shop-billing
-billing/web    exited   http://localhost:8002  /Users/Shared/demo/shop-billing
-login-fix/web  running  http://localhost:8001  /Users/Shared/demo/shop-login-fix
+billing/api    exited   http://localhost:8003  ~/demo/shop-billing
+billing/web    exited   http://localhost:8002  ~/demo/shop-billing
+login-fix/web  running  http://localhost:8001  ~/demo/shop-login-fix

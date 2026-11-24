@@ -1,0 +1,6 @@
+$ taba rm --scope billing
+billing/api: removed (record and log)
+billing/web: removed (record and log)
+$ taba ps
+SERVICE        STATUS   URL                    DIRECTORY
+login-fix/web  running  http://localhost:8001  ~/demo/shop-login-fix

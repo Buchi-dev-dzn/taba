@@ -7,7 +7,7 @@
 ![status: prototype](https://img.shields.io/badge/status-prototype-yellow)
 
 `taba` starts, lists and stops local processes such as dev servers, grouped by
-the task they belong to. It gives you Docker-style `run / ps / logs / stop`
+the task they belong to. It gives you Docker-style `run / ps / logs / stop / rm`
 without containers. It's one binary, with no daemon and no config file.
 
 ![taba ps showing three services in two scopes, login-fix and billing](docs/images/ps.svg)
@@ -50,13 +50,15 @@ taba run --scope login-fix --name web --port 5173 -- npm run dev -- --port 5173 
 **See what is running**, across every scope or for a single one:
 
 ```sh
-taba ps                     # SERVICE / STATUS / URL / DIRECTORY
+taba ps                     # SERVICE / STATUS / URL / DIRECTORY (running and exited)
+taba ps --running           # running services only
 taba ps --scope billing     # one scope only
-taba ps --json              # every field, for scripts and agents
+taba ps --json              # every field with absolute paths, for scripts and agents
 ```
 
 **Port conflicts are reported before anything starts.** If the port is in use,
-taba names the owner and starts nothing:
+taba names the owner (with its command line, for a process taba didn't start)
+and starts nothing:
 
 ![taba run refusing ports held by another taba service and by an unmanaged process](docs/images/port-conflict.svg)
 
@@ -78,6 +80,17 @@ taba stop --scope billing
 ```
 
 ![taba stop --scope billing stops two services and leaves login-fix running](docs/images/stop-scope.svg)
+
+**Clean up when the task is done.** Stopped services stay in `ps` so you can
+still read their logs. `rm` deletes their records and logs, and refuses
+services that are still running:
+
+```sh
+taba rm billing/web
+taba rm --scope billing
+```
+
+![taba rm --scope billing removes the stopped billing services](docs/images/rm.svg)
 
 The screenshots show real output from `scripts/readme-screenshots.sh`, which
 runs `python3 -m http.server` sample services under a throwaway `TABA_HOME`.
@@ -106,12 +119,12 @@ taba is meant for AI coding agents as much as for people:
       "directory": "/Users/Shared/demo/shop-login-fix",
       "log_path": "/Users/Shared/demo/taba-home/logs/login-fix/web.log",
       "name": "web",
-      "pgid": 20081,
-      "pid": 20081,
+      "pgid": 29031,
+      "pid": 29031,
       "port": 8001,
       "scope": "login-fix",
       "service": "login-fix/web",
-      "start_time": 1795501198411910,
+      "start_time": 1795502011043765,
       "status": "running",
       "url": "http://localhost:8001"
     }
@@ -149,8 +162,9 @@ If your agent doesn't load skills, paste this into `AGENTS.md` or `CLAUDE.md`:
   is already running.
 - If a port is taken, do not kill the other process. Pick another port or ask.
 - Read output with `taba logs <task>/<name>`.
-- Stop only your own scope: `taba stop --scope <task>`. Never stop other
-  scopes or processes taba didn't start.
+- Stop only your own scope: `taba stop --scope <task>`, then clean up with
+  `taba rm --scope <task>`. Never stop or remove other scopes, or touch
+  processes taba didn't start.
 - At hand-off, report each service's name and URL, and say whether you left
   it running or stopped it.
 ```
@@ -166,8 +180,9 @@ If your agent doesn't load skills, paste this into `AGENTS.md` or `CLAUDE.md`:
   group, then SIGKILL after `--timeout` seconds (default 5).
 - **Unmanaged processes are never touched.** A process taba didn't start, or
   one it can no longer verify, is reported, never signalled.
-- **taba never deletes files.** Stopping a service leaves its record and log in
-  place.
+- **Stopping never deletes files.** A stopped service keeps its record and log
+  until you run `taba rm`. `rm` deletes only stopped services' records and
+  logs, and only inside `$TABA_HOME`.
 - **`run` is idempotent.** The same scope, name, command, directory and port
   returns the service that is already running. The same name with different
   settings is an error while the old service runs.
@@ -179,11 +194,13 @@ If your agent doesn't load skills, paste this into `AGENTS.md` or `CLAUDE.md`:
 | Command | What it does |
 | --- | --- |
 | `taba run [--scope S] --name N [--port P] -- CMD...` | Start `CMD` detached as service `S/N`, in its own process group, with output appended to its log. |
-| `taba ps [--scope S] [--json]` | List services with status `running` or `exited`, plus URL and directory. |
+| `taba ps [--scope S] [--running] [--json]` | List services with status `running` or `exited`, plus URL and directory (`~` for your home; absolute in `--json`). `--running` hides exited ones. |
 | `taba logs [-f] S/N` (or `N` with `$TABA_SCOPE`) | Print the log. Add `-f` to follow it until the service exits. |
 | `taba stop S/N` (or `N` with `--scope` / `$TABA_SCOPE`) | Stop one service. |
 | `taba stop --scope S` | Stop every service in scope `S`. |
 | `taba stop ... --timeout SECS` | Seconds to wait between SIGTERM and SIGKILL (default 5). |
+| `taba rm S/N` (or `N` with `--scope` / `$TABA_SCOPE`) | Delete a stopped service's record and log. Refuses a running service. |
+| `taba rm --scope S` | Delete the records and logs of every stopped service in scope `S`; running ones are kept and reported. |
 
 Run `taba <command> --help` to see all flags.
 
@@ -216,11 +233,11 @@ taba is an early prototype:
   scope/name overwrites the record of an exited service. The log is appended.
 - **Some children are not tracked.** Children that move into a different
   process group or session are not tracked, and `stop` won't reach them.
-- **No prune command.** Nothing removes exited records or rotates logs yet.
+- **No log rotation.** Logs grow across runs until you `taba rm` the service.
 
 ## Roadmap
 
-- `prune` for exited records and old logs
+- Log rotation
 - Linux support
 - Better port detection (non-loopback binds)
 - Prebuilt binaries and a Homebrew formula

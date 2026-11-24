@@ -11,12 +11,12 @@ $ taba ps --scope login-fix --json
     "directory": "/Users/Shared/demo/shop-login-fix",
     "log_path": "/Users/Shared/demo/taba-home/logs/login-fix/web.log",
     "name": "web",
-    "pgid": 20081,
-    "pid": 20081,
+    "pgid": 29031,
+    "pid": 29031,
     "port": 8001,
     "scope": "login-fix",
     "service": "login-fix/web",
-    "start_time": 1795501198411910,
+    "start_time": 1795502011043765,
     "status": "running",
     "url": "http://localhost:8001"
   }

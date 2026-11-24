@@ -24,6 +24,9 @@ fi
 cargo build --release --manifest-path "$REPO/Cargo.toml" >/dev/null
 export PATH="$REPO/target/release:$PATH"
 export TABA_HOME="$DEMO_ROOT/taba-home"
+# Treat the demo's parent as $HOME so screenshots show `~/...` paths without
+# revealing the real home directory.
+export HOME=$(dirname "$DEMO_ROOT")
 unset TABA_SCOPE
 mkdir -p "$DEMO_ROOT/shop-login-fix" "$DEMO_ROOT/shop-billing" "$CAP" "$OUT"
 
@@ -74,10 +77,14 @@ step logs.txt taba logs billing/web
 step stop-scope.txt taba stop --scope billing
 step stop-scope.txt taba ps
 
-# 6. JSON for agents (kept as text only, quoted in the README).
+# 6. rm: clean up the stopped scope's records and logs.
+step rm.txt taba rm --scope billing
+step rm.txt taba ps
+
+# 7. JSON for agents (kept as text only, quoted in the README).
 step ps-json.txt taba ps --scope login-fix --json
 
-for name in run ps port-conflict logs stop-scope; do
+for name in run ps port-conflict logs stop-scope rm; do
   python3 "$REPO/scripts/term2svg.py" "$CAP/$name.txt" "$OUT/$name.svg" --title "taba — $name"
   cp "$CAP/$name.txt" "$OUT/$name.txt"
 done
