@@ -98,7 +98,8 @@ taba rm --scope <scope>              # delete records + logs of stopped services
 ```
 
 taba only signals process groups it started and can still verify. It sends
-SIGTERM, then SIGKILL after `--timeout` seconds (default 5). Stopping never
+SIGTERM, then SIGKILL after `--timeout` seconds (default 5); on Windows,
+Ctrl+Break, then it terminates the service's job. Stopping never
 deletes logs or records: stopped services stay in `taba ps` (status
 `exited`). `rm` refuses running services, so stop first, and skip `rm` if the
 human may still want the logs.

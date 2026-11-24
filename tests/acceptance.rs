@@ -74,9 +74,6 @@ impl Env {
             .args(args)
             .current_dir(cwd)
             .env("TABA_HOME", self.home())
-            // Not an ancestor of the test directories (on Windows the temp
-            // directory is inside the user profile), so paths print in full.
-            .env("HOME", self.root.join("no-such-home"))
             .env_remove("TABA_SCOPE")
             .env_remove("TABA_AGENT")
             .env_remove("TABA_OUTPUT")
@@ -122,6 +119,19 @@ impl CanonOrCreate for PathBuf {
     fn canonicalize_or_create(self) -> PathBuf {
         std::fs::create_dir_all(&self).unwrap();
         canon(&self)
+    }
+}
+
+/// `p` as taba prints it for humans: with the home directory as `~` (on
+/// Windows the temp directory is inside the user profile).
+fn shown(p: &Path) -> String {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|h| !h.is_empty())
+        .map(|h| canon(Path::new(&h)));
+    match home.as_deref().and_then(|h| p.strip_prefix(h).ok()) {
+        Some(rest) => format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display()),
+        None => p.display().to_string(),
     }
 }
 
@@ -361,7 +371,8 @@ fn two_checkouts_on_different_ports_are_listed_by_directory() {
     }
     let line_a = table.lines().find(|l| l.starts_with("feat-a/web")).unwrap();
     assert!(
-        line_a.contains(&format!("http://localhost:{pa}")) && line_a.contains(a.to_str().unwrap())
+        line_a.contains(&format!("http://localhost:{pa}")) && line_a.contains(&shown(&a)),
+        "{table}"
     );
 
     // --scope filter.

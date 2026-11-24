@@ -16,19 +16,57 @@ pub struct RawInfo {
 }
 
 /// Boot time (seconds since the epoch) and clock ticks per second.
+///
+/// The kernel derives `btime` from the current wall clock, so it moves when
+/// the clock is stepped (NTP, or WSL catching up after the host slept), and
+/// start times computed from it would no longer match recorded ones. The
+/// first value read in a boot is therefore kept in a per-user file keyed by
+/// the boot id, and every later taba process of that boot uses it.
 fn clock() -> Option<(u64, u64)> {
     static CLOCK: OnceLock<Option<(u64, u64)>> = OnceLock::new();
     *CLOCK.get_or_init(|| {
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        if hz <= 0 {
+            return None;
+        }
+        Some((boot_time()?, hz as u64))
+    })
+}
+
+fn boot_time() -> Option<u64> {
+    let read_btime = || -> Option<u64> {
         let stat = fs::read_to_string("/proc/stat").ok()?;
-        let btime = stat
-            .lines()
+        stat.lines()
             .find_map(|l| l.strip_prefix("btime "))?
             .trim()
             .parse()
-            .ok()?;
-        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-        (hz > 0).then_some((btime, hz as u64))
-    })
+            .ok()
+    };
+    let Some(boot_id) = fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-'))
+    else {
+        return read_btime();
+    };
+    let uid = unsafe { libc::getuid() };
+    let path = std::env::temp_dir().join(format!("taba-btime-{uid}-{boot_id}"));
+    let cached = || fs::read_to_string(&path).ok()?.trim().parse::<u64>().ok();
+    if let Some(b) = cached() {
+        return Some(b);
+    }
+    let btime = read_btime()?;
+    // First writer wins; everyone else reads its value.
+    let mut f = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(f) => f,
+        Err(_) => return cached().or(Some(btime)),
+    };
+    let _ = std::io::Write::write_all(&mut f, format!("{btime}\n").as_bytes());
+    Some(btime)
 }
 
 /// Reads `/proc/PID/stat`. Returns `None` if no such process is visible.
