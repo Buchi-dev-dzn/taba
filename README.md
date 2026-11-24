@@ -1,4 +1,10 @@
-# taba
+<h1>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/logo/taba-logo-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="docs/logo/taba-logo.svg">
+    <img alt="taba" src="docs/logo/taba-logo.svg" width="272">
+  </picture>
+</h1>
 
 **Bundle what you start, per task.**
 
