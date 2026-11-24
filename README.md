@@ -88,23 +88,33 @@ alone.
   (the names in the table above) must be listed exactly once in that
   release's `SHA256SUMS` and match it. It must contain exactly `taba`,
   `LICENSE` and `README.md` as regular files with plain names, and `taba` must
-  be an ELF executable for the expected CPU. The downloaded binary is never
-  run.
-- **When it replaces the binary (Linux x86_64 and arm64 only):** the running
+  be an executable for the expected OS and CPU (ELF on Linux, a single-arch
+  Mach-O on macOS). The downloaded binary is not run before it passes these
+  checks.
+- **When it replaces the binary (Linux and macOS, x86_64 and arm64):** the running
   `taba` must be byte-identical to the `taba` in the official archive of the
   running version, verified the same way. It and its directory must be owned by
   you (taba must not run as root). The binary must have no other hard links,
-  neither may be group- or world-writable, and it must not live under a package manager, Cargo (`~/.cargo/bin`), Homebrew, Nix, Snap,
-  a version manager or a `target/` build directory. The new file is written
+  neither may be group- or world-writable, and it must not live under a package manager, Cargo (`~/.cargo/bin`), Homebrew, MacPorts, Nix, Snap,
+  a version manager, a macOS system or application folder (`/System`,
+  `/Library`, `/Applications`) or a `target/` build directory. On macOS a
+  symlinked `taba` is resolved first, so the real file is checked and replaced. The new file is written
   next to the old one, synced, and renamed over it atomically. Until that
   rename succeeds the old binary is untouched, and a concurrent
   `taba update` is refused. Running services keep running; the next `taba`
   command uses the new version. If the rename succeeds, there is no copy of
   the old version to roll back to: download it again from GitHub Releases.
+- **macOS extras:** the new file is a fresh file, never an in-place
+  overwrite, so its code signature is checked as new. Any
+  `com.apple.quarantine` attribute is removed from the new, verified binary
+  only. After the rename, taba runs the new binary with `--version` and
+  requires `taba <new version>`. If it fails, for example because macOS kills
+  it for an invalid code signature, the old file is renamed back and
+  `taba update` fails with `E_UPDATE_FAILED`.
 - **Everywhere else, `taba update` only reports the new version** and points
   you to a manual upgrade (status `manual_update`). That covers Cargo and
-  source builds (`cargo install ...` again), package-manager installs, and
-  macOS, where self-replacement has not been tested. On Windows, `taba update`
+  source builds (`cargo install ...` again) and package-manager installs
+  (Homebrew included). On Windows, `taba update`
   is check-only: taba does not replace its own running `.exe`. To upgrade on
   Windows, wait for running `taba` commands to finish, then replace `taba.exe`
   with the one from the verified archive. Running services do not use
@@ -440,7 +450,7 @@ that. Measurements against Docker are in [docs/benchmarks.md](docs/benchmarks.md
 | `taba rm S/N` (or `N` in your scope) | Delete a stopped service's record and log. Refuses a running service, and another scope's service without `--force --reason`. |
 | `taba rm --scope S` | Delete the records and logs of every stopped service in scope `S`; running ones are kept and reported. |
 | `taba update --check [--json]` | Report whether a newer stable release exists on official GitHub Releases. Read-only. |
-| `taba update [--json]` | Check, then replace an eligible official standalone Linux install. Otherwise, report the manual upgrade path. See [Updating](#updating). |
+| `taba update [--json]` | Check, then replace an eligible official standalone Linux or macOS install. Otherwise, report the manual upgrade path. See [Updating](#updating). |
 
 `--ready` is `tcp` (default when there is a port), `http:PATH` or
 `log:REGEX`, and needs `--wait`. `--agent NAME` on `run`, `stop`, `rm` and
@@ -621,7 +631,7 @@ taba is an early prototype:
   cooperating agents, not deliberate misuse. Agent leases, which tell a live
   holder of a scope from its successor, come in a later milestone.
 - **Self-update is limited.** `taba update` replaces the binary only for
-  official standalone Linux installs. It is check-only on Windows and macOS,
+  official standalone Linux and macOS installs. It is check-only on Windows,
   and release checksums are not independent signatures; see
   [Updating](#updating).
 

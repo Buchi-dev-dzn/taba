@@ -1116,7 +1116,11 @@ fn macos_end_to_end() {
         ("bad-signature", false),
     ] {
         let candidate = root.join("candidates").join(case);
-        if !candidate.exists() {
+        if !candidate
+            .join("v0.2.1")
+            .join(target.asset("v0.2.1"))
+            .exists()
+        {
             eprintln!("{triple} {case}: skipped (no candidate)");
             continue;
         }
@@ -1178,6 +1182,11 @@ fn macos_end_to_end() {
             },
             after
         );
+        // The process started from the replaced file finished normally (no signal).
+        assert!(
+            std::os::unix::process::ExitStatusExt::signal(&still_running).is_none(),
+            "{still_running}"
+        );
         if expect_updated {
             assert_eq!(result.unwrap().body["status"], "updated");
             assert_eq!(after.1, "taba 0.2.1");
@@ -1199,6 +1208,28 @@ fn macos_end_to_end() {
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
     }
+}
+
+/// Read-only, live: download and verify the real official v0.2.0 archive for this build
+/// target from GitHub (API, redirect host and `SHA256SUMS`), in memory only.
+/// `cargo test -- --ignored live_github_v0_2_0_archive_verifies`
+#[test]
+#[ignore = "network: reads the official v0.2.0 release from GitHub"]
+fn live_github_v0_2_0_archive_verifies() {
+    let github = GitHub::new().unwrap();
+    let bytes = github
+        .get(Download::Api, api_tag("v0.2.0"), METADATA_LIMIT)
+        .unwrap();
+    let release: Release = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(release.stable_version(), Some(v("0.2.0")));
+    let target = target(env!("TABA_BUILD_TARGET")).unwrap();
+    let binary = verified_binary(&github, &release, target).unwrap();
+    eprintln!(
+        "{}: verified {} bytes, sha256 {}",
+        target.asset("v0.2.0"),
+        binary.len(),
+        sha(&binary)
+    );
 }
 
 #[test]
