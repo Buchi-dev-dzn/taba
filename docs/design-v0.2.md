@@ -2,7 +2,9 @@
 
 Status: design only, not implemented. Date: 2026-11-24. Supersedes
 [plan.md](plan.md) (v0.1). Describes the code on `feat/taba-prototype` as of
-commit `ee809eb` wherever it says "today" or "v0.1".
+commit `ee809eb` wherever it says "today" or "v0.1". The owner's decisions
+of 2026-11-24 are recorded in [section 9](#9-decisions-2026-11-24) and are
+applied throughout.
 
 **One sentence.** taba is the traffic rules for several AI coding agents
 (Claude Code, Codex, Orca workers in separate worktrees, sub-agents) that
@@ -26,7 +28,7 @@ Contents:
 6. [Out of scope](#6-out-of-scope)
 7. [Overlap with agent harnesses](#7-overlap-with-agent-harnesses)
 8. [Prototype plan](#8-prototype-plan)
-9. [Open decisions](#9-open-decisions)
+9. [Decisions (2026-11-24)](#9-decisions-2026-11-24)
 
 ---
 
@@ -79,9 +81,11 @@ coordinator dispatches Codex worker B into the same worktree. B doesn't know
 those servers exist, so it starts new ones on other ports or fails on the
 ports. Later A comes back and stops "its" servers while B is testing against
 them. *Bug class: use-after-free and double free. v0.2: same worktree, same
-derived scope; B sees the scope's services with `taba whoami` / `ps`, and
-takes them over with `taba move --take`. A's later `stop` is refused because
-A no longer holds the scope.*
+derived scope. A's agent process is gone, so B's first taba call
+(`taba whoami`) takes the scope over automatically, with both services and
+their running instances, and records the hand-off (decision 6). A's later
+`stop` is refused because A no longer holds the scope. If A's process is
+still alive, B gets `E_SCOPE_HELD` naming A instead.*
 
 **S2. Two workers start servers in parallel worktrees.** Workers in
 `wt/login-fix` and `wt/billing` both run `npm run dev` on the default
@@ -94,25 +98,29 @@ returns the URL that is actually ready.*
 **S3. Several worktrees share one database.** One Postgres on `:5432` serves
 three worktrees. Worker C runs `db:reset` and restarts Postgres with a new
 config while workers D and E are running integration tests against it. *Bug
-class: data race. v0.2: the database lives in its own scope (for example
-`shared`). Readers take shared borrows, and the reset takes an exclusive
-borrow (`borrow --mut -- CMD`) that refuses while another exclusive borrow is
-held and tells the readers afterwards that the instance changed.*
+class: data race. v0.2: the database is an ordinary service, owned by the
+folder scope that started it. The other worktrees borrow it: shared borrows
+(`&`) to use its URL, and an exclusive borrow (`borrow --mut -- CMD`) for the
+reset, one at a time. The owner cannot stop or drop the database while it is
+borrowed. When the owner's work ends first, ownership of that one service
+moves to a borrower (`taba move S/db --to <scope>`, decision 2).*
 
 **S4. An agent "fixes" a port conflict by killing the holder.** `run` fails
 with `port 5173 is in use by taba service billing/web`. The agent runs
 `lsof -ti:5173 | xargs kill -9` and continues. Billing's worker loses its
 server mid-test. *Bug class: writing someone else's memory. v0.2: taba
 refuses cross-scope `stop` (`E_NOT_OWNER`), and the optional PreToolUse hook
-blocks the raw `kill` before it runs, with an explanation and the next step
-(`--port auto`).*
+denies the raw `kill` before it runs, with an explanation and the next step
+(`--port auto`). The hook denies it just the same when the holder is an
+unmanaged process (decision 5).*
 
 **S5. An agent finishes without cleaning up.** A worker reports
 `worker_done` and its session ends. Three servers and a watcher keep running
 for days and hold ports that later workers trip over. *Bug class: leak. v0.2:
 each scope has a lease. When the holder ends (SessionEnd hook, dead agent
-pid, or TTL expiry), `taba gc` stops and removes what the scope owns, unless
-a human pinned it.*
+pid, or TTL expiry, with the TTL configurable, decision 2) and no other agent
+takes the scope over, `taba gc` stops and removes what the scope owns, unless
+a human pinned it or another scope still borrows it.*
 
 **S6. Sub-agents of one session restart the same server.** Two sub-agents in
 one worktree both decide the API needs a restart. Both run `taba stop` then
@@ -128,20 +136,22 @@ replacing `run` take a per-service operation lock. The second one gets
 
 | Rust bug class | Agent failure | Rule that prevents it | Where taba enforces it |
 | --- | --- | --- | --- |
-| **Leak** (owned value never dropped) | A server keeps running after the agent or task that started it has ended (S5). | **Drop**: when the owner ends, what it owns is stopped. Owner end is detected by a lease (TTL, agent pid, SessionEnd hook), and `gc` drops expired owners. | `gc`, run lazily by `run` and explicitly. |
+| **Leak** (owned value never dropped) | A server keeps running after the agent or task that started it has ended (S5). | **Drop**: when the owner ends, what it owns is stopped. Owner end is detected by a lease (configurable TTL, agent pid, SessionEnd hook), and `gc` drops expired owners whose services nobody borrows. | `gc`, run lazily by `run` and explicitly. |
 | **Double free** (two frees of one allocation) | Two agents stop or restart the same server: the second stop hits a replacement the first one started, or both start a replacement (S1, S6). | **Ownership**: only the owner scope (or an exclusive borrower) may stop or replace a service. **Operation lock**: one mutation per service at a time. | `stop`, `rm`, replacing `run` refuse non-owners (`E_NOT_OWNER`) and concurrent mutations (`E_BUSY`). |
-| **Use-after-free** (dangling pointer) | An agent keeps calling `http://localhost:5173` after that server was stopped, or after a different server took the port (S1, S2). | **Lifetimes**: a borrow is tied to one service *instance*, and cannot outlive it. Stopping a borrowed service warns or refuses. Checking a borrow whose instance is gone returns `E_DANGLING`. | `borrow` records the instance; `stop` reports live borrows; `borrow --check` / `release` detect stale ones. |
+| **Use-after-free** (dangling pointer) | An agent keeps calling `http://localhost:5173` after that server was stopped, or after a different server took the port (S1, S2). | **Lifetimes**: a borrow is tied to one service *instance*, and cannot outlive it. The owner cannot stop or drop a borrowed service (`E_BORROWED`); only `--force --reason` can, and it leaves the borrows dangling. Checking a borrow whose instance is gone returns `E_DANGLING`. | `borrow` records the instance; `stop` and `gc` refuse while borrowed; `borrow --check` / `release` detect stale ones. |
 | **Data race** (unsynchronised writes to shared memory) | Two agents restart, reconfigure, migrate or reset the same server or shared database at once (S3, S6). | **Exclusive borrow (`&mut`)**: at most one mutator at a time, through a lock with an expiry. **Shared borrow (`&`)**: many readers at once. | `borrow --mut`, the per-service operation lock. |
-| **Writing someone else's memory** (out-of-bounds or wild write) | `kill`, `pkill` or `lsof -ti:PORT \| xargs kill` on a process another task owns (S4). | **Borrow checker**: taba refuses cross-scope mutations, and the hook refuses raw kills of processes owned by another scope. **`unsafe`**: a human can override with `--force`, and every override is recorded. | taba CLI; PreToolUse hook (Claude Code, Codex). |
+| **Writing someone else's memory** (out-of-bounds or wild write) | `kill`, `pkill` or `lsof -ti:PORT \| xargs kill` on a process another task owns, or on an unmanaged server (S4). | **Borrow checker**: taba refuses cross-scope mutations, and the hook denies raw kills of processes owned by another scope and of unmanaged servers. **`unsafe`**: `--force --reason` is the only override, for humans too, and every override is recorded. | taba CLI; PreToolUse hook (Claude Code, Codex). |
 
 ### The rules
 
-1. **Ownership.** Every service has exactly one owner: a **scope**. A scope is
-   bound to a worktree (derived from the git worktree root) or named
-   explicitly. One **agent** holds the scope at a time, under a lease. The
-   scope outlives individual agents and terminals; the agent is
-   replaceable. This is v0.1's rule ("the owner is the work item, not the
-   terminal") plus an explicit holder.
+1. **Ownership.** Every service has exactly one owner: a **scope**. By
+   default the scope is the folder: the git worktree root the agent works in
+   (decision 1). A scope can also be named explicitly. One scope owns any
+   number of named services (`web`, `api`, `worker`, `db`, ...), and they
+   are listed, stopped and handed off together. One **agent** holds the
+   scope at a time, under a lease. The scope outlives individual agents and
+   terminals; the agent is replaceable. This is v0.1's rule ("the owner is
+   the work item, not the terminal") plus an explicit holder.
 
 2. **Shared borrow (`&`).** Any agent in any scope may *use* a service: read
    its URL, read its logs, send it traffic. `ps` and `logs` stay free and
@@ -159,35 +169,60 @@ replacing `run` take a per-service operation lock. The second one gets
    Readers are notified instead: their borrow becomes `E_DANGLING` once the
    instance changes.
 
-4. **Move.** A scope can be handed from one agent to another with
-   `taba move`. After a move, the old agent is no longer the holder, and its
-   mutations in that scope are refused like any other non-owner's. A move is
-   free when the old lease has expired. Taking a live lease needs `--force`
-   (a human, or the coordinator acting for one).
+4. **Move.** Ownership changes hands in two ways (decisions 2 and 6):
+   - *A scope moves to another agent.* This is mostly automatic: when the
+     holder's lease has ended (its agent process is gone, it ran
+     `lease end`, or its TTL passed), the next agent that calls taba in that
+     scope becomes the holder, with every service and running instance, and
+     the hand-off is recorded. While the holder is alive, others get
+     `E_SCOPE_HELD`. `taba move --to AGENT` and `taba move --take` stay as
+     explicit tools for coordinators and humans; taking a live lease needs
+     `--force --reason`.
+   - *One service moves to another scope* (`taba move S/N --to SCOPE`). This
+     is how a borrowed service such as a database outlives the work that
+     started it: its ownership moves to one of its borrowers.
 
-5. **Drop.** When the holder's lease ends, the scope is dropped: `gc` stops
-   its services and removes their records. Logs are kept for a grace period
-   (decision 2). A human can mark a scope `--keep` to opt out, which is
-   "leaking on purpose" (`std::mem::forget`) and is shown in `ps`.
+   After a move, the old holder or scope is no longer the owner, and its
+   mutations are refused like any other non-owner's. A move never restarts
+   anything: instances, URLs and borrows stay valid.
 
-6. **Lifetimes.** A borrow cannot outlive the instance it borrows. Every
-   borrow records the instance id (`pid` + `start_time`, which v0.1 already
-   stores). When the owner stops a service that other scopes have borrowed,
-   `stop` lists the borrowers and refuses unless `--break-borrows` is given
-   (decision 3). After any stop or restart, those borrows check as
-   `E_DANGLING` with the new URL, if there is one.
+5. **Drop.** When the holder's lease ends and no agent takes the scope over
+   within the grace period (`gc_grace`, decision 2), the scope is dropped:
+   `gc` stops its services and removes their records. Logs are kept for
+   `log_retention`. A service that another scope still borrows is not
+   dropped (rule 6); `gc` keeps it, and the scope with it, and tells the
+   borrowers to move it. A human can mark a scope `--keep` to opt out, which
+   is "leaking on purpose" (`std::mem::forget`) and is shown in `ps`.
+
+6. **Lifetimes.** A borrow cannot outlive the instance it borrows, so the
+   owner cannot end the instance while it is borrowed. Every borrow records
+   the instance id (`pid` + `start_time`, which v0.1 already stores). When
+   the owner stops a service that other scopes have borrowed, `stop` lists
+   the borrowers and refuses with `E_BORROWED`; `gc` skips it the same way
+   (decision 3). `--force --reason` overrides, and is recorded. After a
+   forced stop, or a restart under an exclusive borrow, those borrows check
+   as `E_DANGLING` with the new URL, if there is one. The one exception to
+   the refusal is the holder of an exclusive borrow (rule 3), whose restart
+   is exactly what shared borrowers are notified about. A borrow ends when the
+   borrower releases it, when it expires, or when the borrower's own lease
+   ends, so a dead borrower never pins a service forever.
 
 7. **Borrow checker.** taba checks every mutation against rules 1 to 6 and
    refuses with a structured error that says why and what to do next. The
    optional agent hook extends the check to raw `kill`, `pkill`, `killall`,
-   `fuser -k` and `lsof … | xargs kill` before the agent's shell runs them.
+   `fuser -k` and `lsof … | xargs kill` before the agent's shell runs them,
+   and denies them for other scopes' services and for unmanaged servers
+   alike (decision 5).
 
-8. **`unsafe`.** `--force --reason TEXT` overrides ownership checks. It is
-   meant for humans. Every use is appended to `events.jsonl` with the
-   caller's agent, scope, directory and reason, and shows in `ps` as a
-   warning on the affected scope. The hook denies `--force` from agent tool
-   calls, so in practice only a human terminal can use it. This is not
-   foolproof (section "Limits").
+8. **`unsafe`.** `--force --reason TEXT` is the **only** override of the
+   ownership, lease and borrow checks (decision 4). It applies to humans
+   too: a human without a scope, or in another scope, who stops a service
+   gets `E_NOT_OWNER` like an agent and needs `--force --reason`. Every use
+   is appended to `events.jsonl` with the caller's agent, scope, directory
+   and reason, and shows in `ps` as a warning on the affected scope. The
+   hook denies `--force` from agent tool calls, so in practice only a human
+   terminal (or an orchestrator process outside the agent's shell) can use
+   it. This is not foolproof (section "Limits").
 
 ### Limits
 
@@ -246,6 +281,76 @@ Two worktrees of the same repository always get different scopes, because
 their root paths differ. Successive agents in one worktree get the *same*
 scope. That is what makes S1 work.
 
+### One scope, many services
+
+A scope is a folder, not a service. It holds any number of named services,
+and the names are only unique inside the scope:
+
+```text
+login-fix-3f9a              (holder claude-code:5c1e9d, lease live)
+├── web     :4113  npm run dev
+├── api     :4114  cargo run -p api
+├── worker  —      npm run worker
+└── db      :5433  postgres -D .pg -p 5433
+```
+
+Everything that acts on the scope acts on all of its services together:
+`taba ps --scope S` lists them, `taba stop --scope S` and `rm --scope S`
+stop and remove them, an automatic or explicit hand-off moves all of them to
+the new holder, and `gc` drops all of them (except those still borrowed).
+Acting on one service uses `S/N` (or a bare `N` inside the scope).
+
+### A database shared by several worktrees: borrowing
+
+The folder scope does not answer one case on its own: one database used by
+several worktrees (S3). Whichever worktree starts it owns it, like any other
+service. The others borrow it, as in Rust:
+
+- **Shared borrow (`&`)** to use its URL. Any number at once.
+- **Exclusive borrow (`&mut`)** to reset or migrate it. One at a time.
+- **Lifetimes.** A borrow cannot outlive the owner, so the owner cannot stop
+  the database, and `gc` cannot drop it, while it is borrowed
+  (`E_BORROWED`). `--force --reason` overrides, and the borrowers' next
+  `borrow --check` returns `E_DANGLING`.
+- **Move.** When the owner's work ends but others still borrow the
+  database, ownership of that one service moves explicitly to a borrower:
+  `taba move S/db --to <scope>`. Nothing restarts.
+
+Example. `wt/login-fix` (scope `login-fix-3f9a`) starts Postgres;
+`wt/billing` (scope `billing-91c0`) and `wt/search` (scope `search-0d4e`)
+use it.
+
+```sh
+# wt/login-fix, agent A: start the database as an ordinary service
+taba run --name db --port 5433 --wait -- postgres -D .pg -p {port}
+
+# wt/billing and wt/search: borrow it and use the returned URL
+taba borrow login-fix-3f9a/db          # -> url, instance, borrow id
+
+# wt/billing: reset it while nobody else mutates it
+taba borrow --mut login-fix-3f9a/db -- npm run db:reset
+
+# wt/login-fix, agent A finishes its task and tries to clean up
+taba stop --scope login-fix-3f9a       # web, api stop; db: E_BORROWED (billing-91c0, search-0d4e)
+
+# A hands the database to a borrower (once A's lease has ended, any borrower
+# or a human can run the same command without --force)
+taba move login-fix-3f9a/db --to billing-91c0
+# billing-91c0 now owns `db` with the same instance and URL; its own borrow
+# ends, search-0d4e's borrow stays valid and now points at billing-91c0/db
+```
+
+If A's agent is gone before anyone moves the database, A's scope expires but
+`gc` keeps `db` (and the scope record) because it is borrowed, and every
+borrower gets `W_OWNER_GONE` with the `taba move` command to run. Moving a
+service out of an expired scope needs no `--force` (Drop would have been
+allowed anyway). Once the last borrow ends without a move, `gc` drops it.
+
+Not in v0.2: Rc/Arc-style shared ownership, where a service belongs to all
+its borrowers and is dropped when the last one releases it. It is a possible
+later extension; v0.2 keeps exactly one owner and makes the transfer
+explicit.
+
 ### Agent identity
 
 `TABA_AGENT` names the agent session that is acting, for example
@@ -258,7 +363,13 @@ process is gone.
 
 If `TABA_AGENT` is unset, the caller is `human` (decision 2). In v0.1 every
 caller is effectively `human`, so this keeps v0.1 behaviour for people who
-never set it.
+never set it, except that `human` is now subject to the ownership checks
+like everyone else (decision 4).
+
+`TABA_AGENT_PID` matters most for hand-off: it is what lets the next agent
+take a scope over as soon as the previous agent's process is gone
+(decision 6). Without it, a scope is only released by `lease end` or by its
+TTL.
 
 ### Records
 
@@ -274,6 +385,7 @@ $TABA_HOME (default ~/.taba)
 ├── borrows/<scope>/<name>/<id>.json  # new: one file per live borrow
 ├── ops/<scope>/<name>.json           # new: in-flight mutation (operation lock)
 ├── events.jsonl                      # new: append-only audit log
+├── config.toml                       # new, optional: lease_ttl, gc_grace, log_retention
 ├── version                           # new: state schema version ("2")
 └── lock                              # unchanged: global flock
 ```
@@ -296,7 +408,7 @@ $TABA_HOME (default ~/.taba)
   "port_request": "auto",
   "instance": "41230-1795502011043765",
   "started_by": "claude-code:5c1e9d",
-  "ttl_secs": null,
+  "service_ttl_secs": null,
   "ready": { "check": "tcp", "ready_at": 1795502013200000 }
 }
 ```
@@ -305,8 +417,10 @@ $TABA_HOME (default ~/.taba)
   has both values; v0.2 only names their combination.
 - `command_template` is what idempotence compares when `--port auto` was
   used, because the substituted port differs between runs.
-- `ttl_secs` is an optional per-service limit (`run --ttl`), independent of
-  the scope lease.
+- `service_ttl_secs` is an optional per-service limit
+  (`run --service-ttl`), independent of the scope lease.
+- `moves` (not shown) lists `service_moved` hand-offs of this one service
+  between scopes, as the scope record does for agents.
 
 **Scope record:**
 
@@ -321,7 +435,12 @@ $TABA_HOME (default ~/.taba)
     "pid": 38811,
     "pid_start_time": 1795501000000000
   },
-  "lease": { "ttl_secs": 14400, "renewed_at": "2026-11-24T10:02:11Z", "expires_at": "2026-11-24T14:02:11Z" },
+  "lease": {
+    "ttl_secs": 14400,
+    "ttl_source": "config",
+    "renewed_at": "2026-11-24T10:02:11Z",
+    "expires_at": "2026-11-24T14:02:11Z"
+  },
   "keep": false,
   "created_at": "2026-11-24T09:58:40Z",
   "moves": [
@@ -330,7 +449,13 @@ $TABA_HOME (default ~/.taba)
 }
 ```
 
-A scope record is created by the first `run` in that scope. It is removed by
+`ttl_secs` is `null` and `expires_at` is `null` when the effective TTL is
+`none`. `ttl_source` is `flag`, `env`, `config` or `default` (see "Lease TTL
+configuration"). `moves[].how` is `created`, `give`, `auto_take`,
+`take_expired` or `take_forced`.
+
+A scope record is created by the first `run` or `borrow` in that scope (a
+borrower needs a lease, because its borrows end with it). It is removed by
 `gc` (or by `rm --scope`) once the scope has no services and no borrows.
 
 **Borrow record:**
@@ -339,9 +464,9 @@ A scope record is created by the first `run` in that scope. It is removed by
 {
   "id": "b-7k2q",
   "kind": "shared",
-  "service": "shared/db",
+  "service": "login-fix-3f9a/db",
   "instance": "40110-1795500000000000",
-  "url": "http://localhost:5432",
+  "url": "http://localhost:5433",
   "borrower": { "agent": "codex:019a3e", "scope": "billing-91c0" },
   "taken_at": "2026-11-24T10:05:00Z",
   "expires_at": "2026-11-24T14:05:00Z",
@@ -351,7 +476,10 @@ A scope record is created by the first `run` in that scope. It is removed by
 
 `kind` is `shared` or `exclusive`. An exclusive borrow taken with
 `-- CMD` records taba's own pid and start time as `holder_pid`, and the
-borrow ends when that process ends.
+borrow ends when that process ends. A borrow also ends when the borrower's
+scope lease ends. When the service moves to another scope, `service` is
+rewritten; a borrow held by the receiving scope itself is ended, because
+the borrower is now the owner.
 
 **Event** (one JSON object per line in `events.jsonl`):
 
@@ -359,8 +487,10 @@ borrow ends when that process ends.
 {"at":"2026-11-24T11:40:02Z","event":"force_stop","agent":"human","caller_scope":null,"cwd":"/Users/me","target":"billing-91c0/web","reason":"stuck worker","instance":"41888-1795503300000000"}
 ```
 
-Events: `created, moved, force_*, gc_drop, borrow_broken, lease_ended,
-hook_denied` (when the hook reports back), `keep_set`. taba never rewrites
+Events: `created, moved` (with `how`: `give`, `auto_take`, `take_expired`,
+`take_forced`, and the previous holder), `service_moved, force_*, gc_drop,
+gc_kept_borrowed, borrow_broken, lease_ended, hook_denied` (when the hook
+reports back), `hook_unchecked, keep_set`. taba never rewrites
 or truncates the file. Rotation is out of scope, like log rotation in v0.1.
 
 ### Leases: TTL renewed on use (recommended) vs heartbeat
@@ -371,19 +501,59 @@ or truncates the file. Rotation is out of scope, like log rotation in v0.1.
 | Needs | A resident process or a loop in every agent. | Nothing resident. |
 | Fits taba's "no daemon" property | no | yes |
 | Crash detection | fast (N seconds) | slow by TTL alone, but fast with `TABA_AGENT_PID` (dead pid = expired lease) and with the SessionEnd hook |
-| Failure mode | A busy agent that misses beats loses its servers. | A long-silent agent can lose its lease. Mitigated by a generous default TTL (4 h, decision 2) and by `gc` checking the holder pid first. |
+| Failure mode | A busy agent that misses beats loses its servers. | A long-silent agent can lose its lease. Mitigated by a generous, configurable TTL (default 4 h, `none` allowed, decision 2), by `gc` checking the holder pid first, and by the grace period before a drop. |
 
 So a lease is **expired** when any of these is true:
 
 1. The holder's `TABA_AGENT_PID` was recorded and that process (pid with its
    start time) no longer exists.
 2. The holder ran `taba lease end` (the SessionEnd hook does this).
-3. `now > expires_at`.
+3. `now > expires_at` (never, when the effective TTL is `none`).
 
 Renewal: `run`, `stop`, `rm`, `borrow`, `renew` and `whoami` by the holder
 renew the lease. `ps` and `logs` renew too, but only when the lease is more
 than 60 s old, so read-heavy agents don't write on every call. A `human`
-holder with no TTL never expires.
+holder has no pid and, by default, TTL `none`, so its lease ends only with
+`lease end` (or an explicit TTL).
+
+An expired lease is not dropped at once. For `gc_grace` (default 10 min)
+the scope waits for a new holder: the next agent that calls taba in it
+takes it over (decision 6, "Hand-off" below). After that, `gc` may drop it.
+
+### Lease TTL configuration
+
+The lease TTL is user-configurable; 4 h is only the built-in default
+(decision 2). The effective TTL comes from the first of these that is set:
+
+| Order | Source | Example | `ttl_source` |
+| --- | --- | --- | --- |
+| 1 | `--ttl DURATION` on `run` (or `renew --ttl`) | `--ttl 8h` | `flag` |
+| 2 | `$TABA_TTL` | `TABA_TTL=1h` | `env` |
+| 3 | `$TABA_HOME/config.toml`, key `lease_ttl` | `lease_ttl = "4h"` | `config` |
+| 4 | built-in default | 4 h for agents, `none` for `human` | `default` |
+
+`DURATION` is an integer with a unit (`90s`, `30m`, `4h`, `2d`) or `none`
+(no expiry by time; the lease still ends when the holder's process is gone
+or on `lease end`). The TTL is resolved when a lease is created or taken
+over and whenever `--ttl` is given, and is stored on the scope record with
+its source. Later renewals keep the stored TTL. `taba whoami` and
+`ps --json` show the effective TTL and where it came from.
+
+The config file is optional, and taba works with zero configuration. All
+keys are optional:
+
+```toml
+# $TABA_HOME/config.toml
+lease_ttl     = "4h"    # default lease TTL; "none" = no expiry by time
+gc_grace      = "10m"   # how long an expired scope waits for a new holder before gc may drop it
+log_retention = "24h"   # how long logs of dropped services are kept
+```
+
+`gc_grace` and `log_retention` come only from the config file or the
+built-in default (no flag or environment variable in v0.2). An invalid
+value, in the file or in `$TABA_TTL`, fails the command with `E_CONFIG`
+naming the source and key; taba does not fall back silently. An invalid
+`--ttl` is `E_USAGE`.
 
 ### Borrows and locks
 
@@ -412,27 +582,65 @@ Shared borrows take no lock. They are records that the owner's `stop` and
 
 ### Hand-off (move)
 
+Hand-off is mostly automatic (decision 6). An agent that hits its usage
+limit is stopped abruptly, so it can rarely run `taba move --to` before it
+goes. taba therefore does not depend on the old agent doing anything.
+
 ```text
-          run (first)          move --to B / move --take          lease end / TTL / pid gone
- (none) ─────────────▶ held(A) ─────────────────────────▶ held(B) ───────────────────────────▶ expired
-                          │                                                                    │
-                          └──────────── lease end / TTL / pid gone ──────────▶ expired ◀──────┘
-                                                                                  │ move --take (free)
-                                                                                  │ or gc (Drop)
+          run (first)            holder alive: others get E_SCOPE_HELD
+ (none) ─────────────▶ held(A) ─────────────────────────────────────────┐
+                          │                                             │
+                          │ A's process gone / lease end / TTL          │ move --to B (by A)
+                          ▼                                             │ move --take --force --reason
+                      expired(A) ── next taba call by B in the scope ──▶ held(B)
+                          │          (auto_take, no command needed)
+                          │ nobody within gc_grace
+                          ▼
+                      gc: Drop (borrowed services are kept)
 ```
 
-- **Give:** the holder runs `taba move --to AGENT`. This is used when a worker
-  knows it is about to stop. A usage-limit warning is the usual trigger.
-- **Take:** the next agent runs `taba move --take`. This succeeds without
-  force if the lease has expired. Otherwise it fails with `E_LEASE_LIVE`,
-  naming the holder, when it last renewed, and when the lease expires.
-  `--force --reason` overrides (human or coordinator).
-- A move transfers the scope, with all its services and their leases, and
-  keeps every running instance. Borrows by other scopes stay valid, because
-  the instance did not change.
-- The coordinator case: an orchestrator that dispatches worker B into worker
-  A's worktree runs `taba move --scope S --to B --force --reason "A hit usage
-  limit"` before starting B. Then B never sees a refusal.
+- **Automatic take-over.** When the holder's lease has ended (its
+  `TABA_AGENT_PID` process is gone, it ran `lease end`, or its TTL passed),
+  the next agent whose call resolves to that scope becomes the holder. This
+  happens on any command that would renew a lease (`whoami`, `run`, `stop`,
+  `rm`, `borrow`, `renew`, `keep`); read-only `ps` and `logs` only report
+  `"takeover": "available"`. The scope keeps every service and running
+  instance, the caller gets `W_TOOK_OVER` (previous holder, why the lease
+  ended, the services and their URLs), and a `moved` event with
+  `how: auto_take` is recorded. Agents call `taba whoami` first, so this
+  normally happens before they do anything else.
+- **Holder still alive.** If the lease is live, a mutation in that scope by
+  another agent fails with `E_SCOPE_HELD`, naming the holder, its pid, when
+  it last renewed and when the lease expires. A holder without
+  `TABA_AGENT_PID` counts as alive until `lease end` or its TTL; with TTL
+  `none`, only an explicit move releases it.
+- **Explicit give:** the holder runs `taba move --to AGENT`. Useful for a
+  planned hand-off, rarely possible for an agent that is being cut off.
+- **Explicit take:** `taba move --take` succeeds without force if the lease
+  has ended (`how: take_expired`; the same as automatic take-over, for
+  callers that want it explicit). If the lease is live it fails with
+  `E_LEASE_LIVE`, and `--force --reason` overrides (`how: take_forced`).
+  This is the tool for coordinators and humans.
+- A scope move transfers the scope with all its services, and keeps every
+  running instance. Borrows by other scopes stay valid, because the instance
+  did not change.
+- **Moving one service** to another scope: `taba move S/N --to SCOPE`. The
+  caller must hold `S`, or `S`'s lease must have ended; otherwise
+  `--force --reason`. The receiving scope must exist (it has a scope record,
+  which a `run` or `borrow` there creates) and must not already have a
+  service named `N` (`E_CONFLICT`). The record moves to
+  `services/<SCOPE>/<N>.json` and the log file is renamed alongside it (the
+  running process keeps its open file descriptor, so logging continues). The
+  instance, pid and URL do not change. The child's environment still says
+  `TABA_SCOPE=S`; taba never relies on that value. A `service_moved` event
+  is recorded.
+- The coordinator case: an orchestrator that dispatches worker B into
+  worker A's worktree normally does nothing: if A's process has ended, B's
+  first `taba whoami` takes the scope over. If A is still alive (for
+  example, stuck at a usage-limit prompt), the coordinator or a human runs
+  `taba move --scope S --to B --force --reason "A hit usage limit"`. A
+  coordinator that is itself a hooked agent cannot run `--force` (decision
+  4); see section 9, "Still open".
 
 ### Concurrency safety of taba's own state
 
@@ -468,6 +676,8 @@ Shared borrows take no lock. They are records that the owner's `stop` and
   to parse stderr. The skill tells agents to set `TABA_OUTPUT=json`.
 - **Identity flags.** Every command accepts `--scope` and `--agent`. They
   override `$TABA_SCOPE` and `$TABA_AGENT`.
+- **Durations.** `--ttl`, `--service-ttl`, `$TABA_TTL` and the config file
+  take `90s`, `30m`, `4h`, `2d` or (for lease TTLs) `none`.
 - **Success envelope:** `{"ok": true, ...command fields..., "warnings": [...]}`
 - **Error envelope:**
 
@@ -487,10 +697,12 @@ Shared borrows take no lock. They are records that the owner's `stop` and
   ```
 
   `next` lists actions that are allowed for this caller, in order of
-  preference. It never suggests `kill` or `--force`. When only a human can
-  resolve the error, the list ends with `{"do": "ask the human", ...}`.
+  preference. It never suggests `kill` or `--force` to an agent. When only a
+  human can resolve the error, the list ends with `{"do": "ask the human",
+  ...}`, and the message says what the human can do (for example stop the
+  process themselves, or use `--force --reason`).
 
-- **Exit codes.** `0` ok. `1` runtime or state error. `2` usage (clap already
+- **Exit codes.** `0` ok. `1` runtime, state or config error. `2` usage (clap already
   uses 2). `3` refused by the ownership rules or by the state of the service
   (`E_NOT_OWNER`, `E_SCOPE_HELD`, `E_LEASE_LIVE`, `E_LOCKED`, `E_BUSY`,
   `E_BORROWED`, `E_CONFLICT`, `E_STILL_RUNNING`). `4` the
@@ -507,28 +719,33 @@ Shared borrows take no lock. They are records that the owner's `stop` and
 | `E_INVALID_IDENT` | 2 | Scope or name fails `validate_ident`. | — |
 | `E_NOT_FOUND` | 5 | No such service, scope or borrow. | `taba ps --json` |
 | `E_CONFLICT` | 3 | `run` with the same name but a different command, directory or port while the old one runs (v0.1's "already running with a different command"). | `taba stop S/N` then re-run, or use another `--name` |
-| `E_PORT_IN_USE` | 4 | Port held by a taba service or an unmanaged process (details say which). | `--port auto`; `taba borrow` if it is the server you wanted |
+| `E_PORT_IN_USE` | 4 | Port held by a taba service or an unmanaged process (details say which). taba never offers to kill the holder, managed or not (decision 5). | `--port auto`; `taba borrow` if it is a taba server you wanted; for an unmanaged holder, ask the human, who can stop it themselves |
 | `E_PORT_CLAIMED` | 4 | Port reserved by another taba service that is starting or running. | `--port auto` |
 | `E_NO_FREE_PORT` | 4 | `--port auto` found nothing in its range. | `--port auto:<other start>`; `taba gc` |
 | `E_START_FAILED` | 4 | The process exited before it was ready. `details.log_tail` has the last 20 log lines. | `taba logs S/N` |
 | `E_NOT_READY` | 4 | `--wait` timed out. The process is still running (and is reported). | `taba logs S/N`; `taba stop S/N` |
-| `E_NOT_OWNER` | 3 | Mutation of a service in a scope the caller does not hold. | `taba borrow S/N`; ask the holder; ask the human |
-| `E_SCOPE_HELD` | 3 | `run` in a scope that another agent holds under a live lease. | `taba move --take` after expiry; ask the human |
-| `E_LEASE_LIVE` | 3 | `move --take` while the lease is live. | wait until `expires_at`; ask the human |
+| `E_NOT_OWNER` | 3 | Mutation of a service in another scope than the caller's, by an agent or a human (decision 4). | `taba borrow S/N`; ask the holder; ask the human (who can use `--force --reason`) |
+| `E_SCOPE_HELD` | 3 | Mutation in the caller's own scope while another agent holds it under a live lease (holder process alive). Names the holder, its pid, last renewal and expiry. | wait: the scope passes automatically once the holder's process ends; ask the coordinator or the human |
+| `E_LEASE_LIVE` | 3 | `move --take` while the lease is live. | wait until the holder ends or `expires_at`; ask the human |
 | `E_LOCKED` | 3 | Another agent holds an exclusive borrow. | retry after `expires_at`, or `--wait-lock SECS` |
 | `E_BUSY` | 3 | Another `stop` or replacing `run` is in flight. | retry; `taba ps S/N` |
-| `E_BORROWED` | 3 | `stop` or `rm` of a service with live borrows from other scopes. | tell the borrowers; `--break-borrows` |
+| `E_BORROWED` | 3 | `stop` or `rm` of a service with live borrows from other scopes (decision 3). Details list the borrowers. | `taba move S/N --to <borrower scope>`; tell the borrowers; ask the human (`--force --reason`) |
 | `E_DANGLING` | 5 | Borrow's instance is gone (stopped, replaced, or the port now belongs to something else). | `taba borrow S/N` again (new URL in details) |
 | `E_STILL_RUNNING` | 3 | `rm` of a running service (v0.1 behaviour). | `taba stop S/N` |
 | `E_UNVERIFIABLE` | 1 | The recorded pid is alive but is no longer the process taba started (start time differs). v0.1 reports this case as `exited` and never signals it; v0.2 keeps the no-signal rule and names the case. | `taba ps --all` |
 | `E_SIGNAL_FAILED` | 1 | `kill` on the process group failed. | — |
 | `E_FORCE_NEEDS_REASON` | 2 | `--force` without `--reason`. | — |
+| `E_CONFIG` | 1 | `$TABA_HOME/config.toml` or `$TABA_TTL` is unreadable or has an invalid value. Details name the source and key. | fix or remove the value |
 | `E_STATE` | 1 | State directory unreadable, or the schema is too new. | — |
 
 Warnings (`warnings[]`, never fatal): `W_BRANCH_CHANGED`,
-`W_LEASE_RENEWED`, `W_BORROW_BROKEN` (a borrower's instance was replaced),
-`W_FORCED` (a `--force` override happened in this scope), `W_UNMANAGED_PORT`
-(an unmanaged process listens on a port in this worktree).
+`W_LEASE_RENEWED`, `W_TOOK_OVER` (this call took over a scope whose holder
+had ended; lists the previous holder and the services), `W_BORROW_BROKEN`
+(a borrower's instance was replaced or force-stopped), `W_OWNER_GONE` (the
+owner of a service this scope borrows has ended; includes the
+`taba move S/N --to <this scope>` command), `W_FORCED` (a `--force`
+override happened in this scope), `W_UNMANAGED_PORT` (an unmanaged process
+listens on a port in this worktree).
 
 ### `taba whoami` (new)
 
@@ -536,8 +753,11 @@ Warnings (`warnings[]`, never fatal): `W_BRANCH_CHANGED`,
 taba whoami [--json]
 ```
 
-Prints the resolved scope, its source, the agent and the lease. Agents call it
-first. It renews the lease if the caller is the holder.
+Prints the resolved scope, its source, the agent, the lease (with the
+effective TTL and where it came from) and the scope's services. Agents call
+it first. It renews the lease if the caller is the holder, and takes the
+scope over if the holder has ended (decision 6). Example: the holder is
+still alive.
 
 ```json
 {
@@ -549,13 +769,28 @@ first. It renews the lease if the caller is the holder.
   "agent": "codex:019a3e",
   "holder": "claude-code:5c1e9d",
   "you_hold_scope": false,
-  "lease": { "state": "live", "expires_at": "2026-11-24T14:02:11Z" },
+  "holder_pid": 38811,
+  "lease": {
+    "state": "live",
+    "ttl": "4h",
+    "ttl_source": "config",
+    "config_path": "/Users/me/.taba/config.toml",
+    "expires_at": "2026-11-24T14:02:11Z"
+  },
+  "takeover": null,
   "services": ["login-fix-3f9a/web", "login-fix-3f9a/db"],
-  "next": [{ "do": "take over this scope when the lease expires, or ask the human", "command": "taba move --take" }]
+  "next": [{ "do": "the scope passes to you automatically when the holder's process ends; until then ask the coordinator or the human" }]
 }
 ```
 
-Errors: `E_STATE`. Without a scope it still succeeds, with `"scope": null`.
+When the call takes the scope over, `holder` is the caller,
+`you_hold_scope` is `true`, `takeover` is
+`{ "from": "claude-code:5c1e9d", "why": "holder_pid_gone" }` (or
+`lease_ended`, `ttl_expired`), and `warnings` has `W_TOOK_OVER`. `ttl` is
+`"none"` and `expires_at` is `null` for a lease without expiry.
+
+Errors: `E_CONFIG, E_STATE`. Without a scope it still succeeds, with
+`"scope": null`.
 
 ### `taba run` (extended)
 
@@ -563,7 +798,7 @@ Errors: `E_STATE`. Without a scope it still succeeds, with `"scope": null`.
 taba run [--scope S] --name N
          [--port P | --port auto | --port auto:START]
          [--wait[=SECS]] [--ready tcp | http:PATH | log:REGEX]
-         [--ttl DURATION] [--json] -- CMD...
+         [--ttl DURATION] [--service-ttl DURATION] [--json] -- CMD...
 ```
 
 Unchanged from v0.1: detach in a new session and process group, append
@@ -590,13 +825,17 @@ New:
   `E_START_FAILED` with the end of the log. If the timeout passes, the result
   is `E_NOT_READY` and the process keeps running (decided: stopping it would
   lose the evidence the agent needs; the lease still bounds its life).
-- **`--ttl DURATION`** (`30m`, `2h`) stops the service at the next `gc` after
-  that long without a renewal, even if the scope's lease is live. Use it for
-  one-off previews.
+- **`--ttl DURATION`** sets the scope's **lease** TTL (`8h`, `none`), and
+  overrides `$TABA_TTL`, the config file and the default (decision 2). It
+  is recorded with `ttl_source: "flag"` and applies to the whole scope.
+- **`--service-ttl DURATION`** (`30m`, `2h`) stops this one service at the
+  next `gc` after that long without a renewal, even if the scope's lease is
+  live. Use it for one-off previews. (Called `--ttl` in earlier drafts.)
 - **Ownership:** `run` in a scope held by another agent under a live lease
-  fails with `E_SCOPE_HELD`. The first `run` in a scope creates the scope
-  record with the caller as holder. A replacing `run` (exited record, or
-  `E_CONFLICT` resolved by stop) takes the operation lock.
+  fails with `E_SCOPE_HELD`. If the holder's lease has ended, `run` takes
+  the scope over first (decision 6). The first `run` in a scope creates the
+  scope record with the caller as holder. A replacing `run` (exited record,
+  or `E_CONFLICT` resolved by stop) takes the operation lock.
 - **Idempotence with `--port auto`:** a re-run compares `command_template`
   and `port_request` instead of the substituted command, so the same
   `--port auto` invocation returns the running instance and its port.
@@ -627,7 +866,7 @@ before it returns.
 
 Errors: `E_NO_SCOPE, E_INVALID_IDENT, E_CONFLICT, E_SCOPE_HELD, E_BUSY,
 E_PORT_IN_USE, E_PORT_CLAIMED, E_NO_FREE_PORT, E_START_FAILED, E_NOT_READY,
-E_STATE`.
+E_CONFIG, E_STATE`.
 
 ### `taba ps` (extended) and `taba ps --all` (new)
 
@@ -638,8 +877,11 @@ taba ps --all [--json]
 
 `ps` keeps every v0.1 JSON field (`service, scope, name, status, url, port,
 directory, command, pid, pgid, start_time, log_path`) and adds `instance`,
-`holder`, `lease` (`live` / `expired` / `none`), `keep`, `borrows` (count by
-kind) and `locked_by`. `status` gains `starting` and `stopping`, which
+`holder`, `lease`, `keep`, `borrows` (count by kind) and `locked_by`.
+`lease` is an object with `state` (`live` / `expired` / `none`), `ttl`,
+`ttl_source` and `expires_at`, the same fields `whoami` shows, so the
+effective TTL and its source are visible per scope. When the caller could
+take the scope over, the output also has `"takeover": "available"`. `status` gains `starting` and `stopping`, which
 appear while an operation lock is held. The text table gains an `OWNER`
 column (`holder` with a mark when the lease has expired).
 
@@ -663,7 +905,8 @@ anything. It does not renew leases.
       "directory": "/Users/me/wt/login-fix",
       "git": { "worktree": "/Users/me/wt/login-fix", "branch": "feat/login-fix" },
       "managed": true,
-      "service": "login-fix-3f9a/web", "scope": "login-fix-3f9a", "holder": "claude-code:5c1e9d", "lease": "live"
+      "service": "login-fix-3f9a/web", "scope": "login-fix-3f9a", "holder": "claude-code:5c1e9d",
+      "lease": { "state": "live", "ttl": "4h", "ttl_source": "default", "expires_at": "2026-11-24T14:02:11Z" }
     },
     {
       "port": 5173, "address": "*", "pid": 39001, "pgid": 38990,
@@ -700,30 +943,40 @@ scope), `E_STATE`.
 
 ```sh
 taba stop S/N | N | --scope S
-          [--timeout SECS] [--break-borrows]
-          [--force --reason TEXT] [--json]
+          [--timeout SECS] [--force --reason TEXT] [--json]
 ```
 
 v0.1 rules stay: verify identity before signalling, SIGTERM then SIGKILL
-after `--timeout`, never signal unmanaged processes, never delete files.
+after `--timeout`, never signal unmanaged processes (not even with
+`--force`: taba has no command that kills a process it did not start,
+decision 5), never delete files.
 `stop` with no target still needs an explicit `--scope`, even when the scope
 could be derived.
 
 New:
 
 - **Cross-scope refusal.** The caller must hold the service's scope (or hold
-  an exclusive borrow on that service). Otherwise: `E_NOT_OWNER`. A `human`
-  caller with no resolvable scope is decision 4.
-- **Expired lease.** If the target scope's lease has expired, any caller in
-  any scope may stop it without `--force`. That is Drop, done early, and it
-  is recorded as `gc_drop`.
+  an exclusive borrow on that service). Otherwise: `E_NOT_OWNER` for a
+  service in another scope, `E_SCOPE_HELD` in the caller's own scope while
+  another agent holds it. This applies to `human` callers too, including a
+  human with no resolvable scope (decision 4).
+- **Expired lease.** If the target scope's lease has expired, a caller in
+  that same scope takes it over first (decision 6) and then stops as the
+  holder. A caller in another scope may stop it without `--force`: that is
+  Drop, done early, and it is recorded as `gc_drop`.
 - **Lifetimes.** If other scopes hold live borrows: `E_BORROWED` with the
-  borrowers, unless `--break-borrows` is given. Then the borrows are marked
-  broken, and the borrowers get `W_BORROW_BROKEN` on their next taba call.
+  borrowers and a `next` that suggests `taba move S/N --to <borrower
+  scope>`. This also applies to expired-lease stops. Only `--force --reason`
+  stops a borrowed service; the borrows are then marked broken, and the
+  borrowers get `W_BORROW_BROKEN` on their next taba call and `E_DANGLING`
+  from `borrow --check`. A caller that holds the exclusive borrow on the
+  service is not refused for shared borrows (rule 3); those borrowers see
+  `E_DANGLING` with the new instance.
 - **Operation lock:** concurrent stops or replaces of one service give
   `E_BUSY` instead of double signalling.
-- **`--force --reason`** skips the ownership and borrow checks, never the
-  identity check. It is recorded.
+- **`--force --reason`** is the only override (decision 4). It skips the
+  ownership, lease and borrow checks, never the identity check. It is
+  recorded.
 
 ```json
 {
@@ -739,8 +992,8 @@ New:
 `refused`. Per-service refusals appear in `results` with their error object.
 The command exits 3 if any service was refused.
 
-Errors: `E_NOT_FOUND, E_NO_SCOPE, E_NOT_OWNER, E_BORROWED, E_BUSY, E_LOCKED,
-E_UNVERIFIABLE, E_SIGNAL_FAILED, E_FORCE_NEEDS_REASON`.
+Errors: `E_NOT_FOUND, E_NO_SCOPE, E_NOT_OWNER, E_SCOPE_HELD, E_BORROWED,
+E_BUSY, E_LOCKED, E_UNVERIFIABLE, E_SIGNAL_FAILED, E_FORCE_NEEDS_REASON`.
 
 ### `taba rm` (extended)
 
@@ -748,7 +1001,8 @@ Same syntax as v0.1 plus `--force --reason`. Same ownership rule as `stop`.
 `E_STILL_RUNNING` stays as v0.1's refusal. `rm --scope S` also deletes the
 scope record when nothing is left.
 
-Errors: `E_NOT_FOUND, E_NOT_OWNER, E_STILL_RUNNING, E_BUSY, E_STATE`.
+Errors: `E_NOT_FOUND, E_NOT_OWNER, E_SCOPE_HELD, E_STILL_RUNNING, E_BUSY,
+E_STATE`.
 
 ### `taba borrow` and `taba release` (new)
 
@@ -761,11 +1015,13 @@ taba release BORROW_ID | S/N [--json]
 ```
 
 A shared borrow returns the URL and instance, and registers the borrower so
-that the owner sees it. The default TTL is the borrower's scope lease. An
-exclusive borrow takes the per-service lock. Holding it lets the borrower
-`stop` and re-`run` that one service even though the borrower does not own
-its scope: it is the sanctioned way for worker C to restart the shared
-database in S3. The `-- CMD` form runs `CMD` in the foreground while holding
+that the owner sees it and cannot stop the service while it lasts. The
+default TTL is the borrower's scope lease, and the borrow ends with that
+lease. An exclusive borrow takes the per-service lock. Holding it lets the
+borrower `stop` and re-`run` that one service even though the borrower does
+not own its scope: it is the sanctioned way for worker C to reset or
+restart the database another worktree owns in S3. Other shared borrowers
+then see `E_DANGLING` with the new instance. The `-- CMD` form runs `CMD` in the foreground while holding
 the lock, sets `TABA_BORROWED_URL` in its environment, and releases the lock
 when `CMD` exits, also on Ctrl-C.
 
@@ -774,9 +1030,9 @@ when `CMD` exits, also on Ctrl-C.
   "ok": true,
   "borrow": "b-7k2q",
   "kind": "shared",
-  "service": "shared/db",
-  "url": "http://localhost:5432",
-  "port": 5432,
+  "service": "login-fix-3f9a/db",
+  "url": "http://localhost:5433",
+  "port": 5433,
   "instance": "40110-1795500000000000",
   "expires_at": "2026-11-24T14:05:00Z",
   "other_borrows": { "shared": 2, "exclusive": null }
@@ -785,7 +1041,9 @@ when `CMD` exits, also on Ctrl-C.
 
 `--check` returns the same shape if the instance is still running, otherwise
 `E_DANGLING` with `details.current` (the new instance and URL, if the service
-was restarted).
+was restarted). If the service moved to another scope, `service` shows the
+new `S/N` and the borrow stays valid. If the owner's lease has ended, the
+result carries `W_OWNER_GONE`.
 
 Errors: `E_NOT_FOUND, E_LOCKED` (exclusive held elsewhere, with holder and
 expiry), `E_BUSY, E_DANGLING, E_NO_SCOPE` (a borrower needs a scope).
@@ -793,9 +1051,14 @@ expiry), `E_BUSY, E_DANGLING, E_NO_SCOPE` (a borrower needs a scope).
 ### `taba move` (new)
 
 ```sh
-taba move [--scope S] --to AGENT [--json]                 # give: caller must hold S
-taba move [--scope S] --take [--force --reason TEXT] [--json]   # take: lease must be expired, or force
+taba move [--scope S] --to AGENT [--json]                 # give the scope: caller must hold S
+taba move [--scope S] --take [--force --reason TEXT] [--json]   # take the scope: lease must have ended, or force
+taba move S/N --to SCOPE [--force --reason TEXT] [--json] # move one service to another scope
 ```
+
+Taking a scope over normally needs no command: it happens on the next taba
+call after the holder ends (section 3, "Hand-off"). `move` is the explicit
+tool for coordinators and humans, and for a planned hand-off.
 
 ```json
 {
@@ -812,8 +1075,28 @@ taba move [--scope S] --take [--force --reason TEXT] [--json]   # take: lease mu
 }
 ```
 
-`how` is `give`, `take_expired` or `take_forced`. Errors: `E_NO_SCOPE,
-E_NOT_FOUND, E_NOT_OWNER` (give by a non-holder), `E_LEASE_LIVE`,
+`how` is `give`, `take_expired` or `take_forced`.
+
+Moving one service (`S/N --to SCOPE`) is allowed for the holder of `S`, or
+for anyone once `S`'s lease has ended; otherwise it needs `--force --reason`.
+It returns the service's old and new name, its unchanged instance and URL,
+and the borrows that were rewritten or ended:
+
+```json
+{
+  "ok": true,
+  "service": "billing-91c0/db",
+  "from": "login-fix-3f9a/db",
+  "how": "give",
+  "instance": "40110-1795500000000000",
+  "url": "http://localhost:5433",
+  "borrows": { "rewritten": ["b-2c8d"], "ended": ["b-7k2q"] }
+}
+```
+
+Errors: `E_NO_SCOPE, E_NOT_FOUND` (service, or receiving scope with no
+record), `E_NOT_OWNER` (give by a non-holder), `E_LEASE_LIVE`, `E_CONFLICT`
+(the receiving scope already has a service with that name), `E_BUSY`,
 `E_FORCE_NEEDS_REASON`.
 
 ### `taba renew`, `taba lease end`, `taba keep` (new)
@@ -824,14 +1107,16 @@ taba lease end [--scope S | --agent A] [--json]     # used by the SessionEnd hoo
 taba keep [--scope S] [--off] [--force --reason TEXT] [--json]
 ```
 
-`renew` returns the new lease. `lease end` marks every lease held by the
+`renew` returns the new lease. `renew --ttl` changes the scope's lease TTL
+(`ttl_source: "flag"`), like `run --ttl`. `lease end` marks every lease held by the
 agent as expired right away, and does nothing else (it must fit the
 SessionEnd hook's 1.5 s budget, section 5). `keep` pins a scope so `gc` never
 drops it. Agents may keep their own scope only with `--reason`, which is
 recorded and shown in `ps`, so a human can see why something was left
 running.
 
-Errors: `E_NO_SCOPE, E_NOT_OWNER, E_FORCE_NEEDS_REASON`.
+Errors: `E_NO_SCOPE, E_NOT_OWNER, E_SCOPE_HELD, E_FORCE_NEEDS_REASON,
+E_CONFIG`.
 
 ### `taba gc` (new)
 
@@ -839,15 +1124,21 @@ Errors: `E_NO_SCOPE, E_NOT_OWNER, E_FORCE_NEEDS_REASON`.
 taba gc [--dry-run] [--json]
 ```
 
-For every scope whose lease has expired and which is not `keep`: stop its
-services (with the identity check and `--break-borrows`), delete their records,
-end their borrows, and remove the scope record. Also: drop services past
-their own `--ttl`, delete borrow and operation records whose holder process
-is gone, and delete logs of dropped services after the grace period
-(decision 2). Every drop is an event.
+For every scope whose lease ended more than `gc_grace` ago (default 10 min,
+decision 2) and which is not `keep`: stop its services (with the identity
+check), delete their records, end the borrows the scope itself holds, and
+remove the scope record. A service that another live scope still borrows is
+**not** stopped (decision 3): it is listed under `kept` with reason
+`borrowed`, recorded as `gc_kept_borrowed`, and its borrowers get
+`W_OWNER_GONE`. The scope record stays until its last service is dropped or
+moved. Also: end borrows whose borrower lease has ended, drop services past
+their own `--service-ttl`, delete borrow and operation records whose holder
+process is gone, and delete logs of dropped services after `log_retention`
+(default 24 h). Every drop is an event.
 
-`run` performs a **bounded lazy gc**: scopes expired more than 10 minutes ago
-are dropped before port selection, and at most 5 services per call. That
+`run` performs a **bounded lazy gc**: scopes whose lease ended more than
+`gc_grace` ago are dropped before port selection, and at most 5 services
+per call. That
 releases ports leaked by crashed agents without any daemon. No launchd job
 in v0.2.
 
@@ -856,9 +1147,12 @@ in v0.2.
   "ok": true,
   "dry_run": false,
   "dropped": [
-    { "scope": "old-task-77aa", "reason": "holder_pid_gone", "services": ["old-task-77aa/web"], "broken_borrows": ["b-1x9m"] }
+    { "scope": "old-task-77aa", "reason": "holder_pid_gone", "services": ["old-task-77aa/web"], "ended_borrows": ["b-1x9m"] }
   ],
-  "kept": [{ "scope": "demo-0c21", "reason": "keep: human review tomorrow" }]
+  "kept": [
+    { "scope": "demo-0c21", "reason": "keep: human review tomorrow" },
+    { "scope": "login-fix-3f9a", "service": "login-fix-3f9a/db", "reason": "borrowed", "borrowers": ["billing-91c0", "search-0d4e"] }
+  ]
 }
 ```
 
@@ -889,34 +1183,41 @@ taba hook codex pre-tool-use
 
 Explicit `--scope` or `TABA_SCOPE` beats derivation everywhere. This is how a
 coordinator puts two workers into one scope on purpose, or names scopes after
-tasks.
+tasks. It is not needed for shared infrastructure: a database used by
+several worktrees stays in the scope that started it and is borrowed
+(section 3).
 
 ### Skill changes (`skills/taba/SKILL.md`)
 
 Rewrite the skill around a short procedure, keep the v0.1 rules, and add:
 
-1. **First call:** `TABA_OUTPUT=json taba whoami`. If `you_hold_scope` is
-   false and services exist, follow `next` (take over after expiry, or ask).
-   Don't start duplicates.
+1. **First call:** `TABA_OUTPUT=json taba whoami`. If the previous agent in
+   this worktree has ended, this call takes its services over (`takeover`,
+   `W_TOOK_OVER`): use them, don't start duplicates. If `you_hold_scope` is
+   false because the holder is still alive, follow `next` (wait or ask).
 2. **Start:** `taba run --name web --port auto --wait -- <cmd with {port}>`,
    and read `url` from the JSON. Never invent a port. Never pass the port
    only to taba.
 3. **Errors:** read `error.code` and do the first item of `error.next`. Never
-   respond to `E_PORT_IN_USE`, `E_NOT_OWNER` or `E_LOCKED` with `kill`,
-   `pkill`, `lsof | xargs kill` or `--force`.
+   respond to `E_PORT_IN_USE`, `E_NOT_OWNER`, `E_SCOPE_HELD`, `E_BORROWED`
+   or `E_LOCKED` with `kill`, `pkill`, `lsof | xargs kill` or `--force`,
+   whether the holder is a taba service or an unmanaged process. Pick another
+   port with `--port auto`, or ask the human, who can stop it themselves.
 4. **Using someone else's server:** `taba borrow S/N` and use the returned
    URL. Before a long test run against it, `taba borrow --check ID`.
-5. **Restarting or resetting a shared server or DB:**
+5. **Restarting or resetting a server or DB another worktree owns:**
    `taba borrow --mut S/N -- <migration or reset command>`.
-6. **Hand-off and usage limits:** if you are about to stop working, run
-   `taba move --to <next agent>` if you know it. In any case report each
-   service's name, URL and status. If you take over a worktree, run
-   `taba move --take`.
+6. **Hand-off and usage limits:** taking over is automatic (step 1), so you
+   don't need to do anything to be replaced. In status reports, list each
+   service's name, URL and status. Run `taba move --to <next agent>` only if
+   you know the next agent and still have time.
 7. **Finish:** `taba stop --scope <scope>` and `taba rm --scope <scope>`,
    unless the human needs a server. In that case use
-   `taba keep --reason "<why>"` and say so in the hand-off.
-8. **Remove** the v0.1 advice to choose scope names by hand, except for
-   shared infrastructure (`shared`).
+   `taba keep --reason "<why>"` and say so in the hand-off. If `stop`
+   returns `E_BORROWED` for a service, move it to a borrower
+   (`taba move S/N --to <scope>` from `error.next`) instead of forcing it.
+8. **Remove** the v0.1 advice to choose scope names by hand. The folder is
+   the scope; shared databases are borrowed, not put in a separate scope.
 
 The AGENTS.md / CLAUDE.md snippet in the README gets the same changes when
 the README is updated (not in this task).
@@ -965,12 +1266,13 @@ one `lsof` at most.
 
    | Target | Decision |
    | --- | --- |
-   | taba service in the caller's own scope | **allow** (the skill already says to prefer `taba stop`) |
+   | taba service in a scope the caller holds, not borrowed by another scope | **allow** (the skill already says to prefer `taba stop`) |
+   | taba service in a scope the caller holds, borrowed by another scope | **deny**, with `next`: `taba stop S/N` (which explains `E_BORROWED` and the move) |
    | taba service in another scope, lease live | **deny** |
-   | taba service in another scope, lease expired | **deny**, with `next`: `taba stop S/N` (which is allowed for expired leases) |
-   | unmanaged process listening on a TCP port, or whose cwd is in another git worktree | **ask** (decision 5): the human sees the explanation and decides |
+   | taba service in another scope, lease expired | **deny**, with `next`: `taba stop S/N` (which is allowed for expired leases that nobody borrows) |
+   | unmanaged process listening on a TCP port, or whose cwd is in another git worktree | **deny** (decision 5), with `next`: `--port auto`, or ask the human, who can stop it themselves |
    | any other unmanaged process | **allow** |
-   | `taba … --force` | **deny**: `--force` is for humans |
+   | `taba … --force` | **deny**: agents never override; the human runs it in their own terminal |
    | command not parseable (variables, `eval`, scripts, `sh -c "$X"`) | **allow**, and record `hook_unchecked` in `events.jsonl` |
 
 5. Explain. A deny uses `hookSpecificOutput.permissionDecision: "deny"` and
@@ -985,6 +1287,24 @@ one `lsof` at most.
    Instead: taba run --name web --port auto --wait -- npm run dev -- --port {port} --strictPort
    If you really need that server stopped, ask the human.
    ```
+
+   For an unmanaged holder the reason says so and gives the same two ways
+   forward:
+
+   ```text
+   taba: blocked `kill 39001`.
+   Process 39001 (node …/vite, cwd ~/wt/billing, branch feat/billing) listens
+   on port 5173. taba did not start it, so it can't tell whose work it is, and
+   killing it might break another task.
+   Instead: taba run --name web --port auto --wait -- npm run dev -- --port {port} --strictPort
+   If it really has to go, ask the human; they can stop it themselves.
+   ```
+
+   This also denies an unmanaged server that the agent started itself
+   (`npm run dev &`), because taba can't tell who started it. The skill
+   says to start servers through taba; a harness's own background tasks
+   are stopped with the harness's tool (Claude Code's `/tasks`), which the
+   Bash matcher does not see.
 
 6. **Fail open.** If the hook itself fails (taba missing, state unreadable,
    timeout), the tool call proceeds, because Claude Code's default for a
@@ -1161,19 +1481,27 @@ operation lock for `stop`.
 3. Re-running test 1 verbatim returns `status: already_running` with the same
    port and instance.
 4. `--port auto:8001` while 8001 is held by an unmanaged process picks 8002
-   (or the next free port) and starts.
+   (or the next free port) and starts. `--port 8001` returns
+   `E_PORT_IN_USE` naming the unmanaged pid, and its `next` contains
+   `--port auto` and "ask the human" and no `kill`.
 5. `--wait=2 -- sh -c 'sleep 5; exec python3 -m http.server {port}'` returns
    `E_NOT_READY` with exit 4, and the process is still in `ps`. `-- false`
    returns `E_START_FAILED` with `details.log_tail`.
 6. In `wt-b`, `taba stop <wt-a scope>/web` returns `E_NOT_OWNER` with exit 3,
    and the server still answers. With `--force --reason test` it stops, and
-   `events.jsonl` has a `force_stop` line.
+   `events.jsonl` has a `force_stop` line. The same holds for a human: with
+   `TABA_AGENT` unset and the current directory outside any repo,
+   `taba stop <wt-a scope>/web` returns `E_NOT_OWNER`, and only
+   `--force --reason` stops it.
 7. Two simultaneous `taba stop` calls on one service in `wt-a`: one gets
    `stopped`, the other `E_BUSY` or `not_running`, and SIGTERM is sent once.
 8. With `TABA_SCOPE` and `--scope` unset outside any git repo, `run` returns
    `E_NO_SCOPE`. With `TABA_SCOPE=x` set, v0.1 behaviour is unchanged.
 9. A v0.1 state directory (records without new fields) still lists, stops
    and removes correctly.
+10. One scope, many services: in `wt-a`, `web`, `api` and `worker` (no
+    port) all run under the derived scope; `ps --scope` lists all three, and
+    `stop --scope` stops all three.
 
 ### M2: JSON everywhere and `ps --all`
 
@@ -1187,32 +1515,74 @@ operation lock for `stop`.
 
 ### M3: agents, leases and gc
 
-1. `TABA_AGENT=a1` starts a service. `TABA_AGENT=a2` in the same worktree
-   gets `E_SCOPE_HELD` on `run`.
-2. With `TABA_AGENT_PID` set to a `sleep` process that is then killed, `ps`
-   shows the lease as `expired`, and the next `run` anywhere (lazy gc, after
-   the grace period, set to 0 in tests) stops the service and frees its port.
-3. `--ttl 2s`: after 3 s, `taba gc` drops the service. `keep` survives `gc`.
+1. `TABA_AGENT=a1` with `TABA_AGENT_PID` set to a live `sleep` starts a
+   service. `TABA_AGENT=a2` in the same worktree gets `E_SCOPE_HELD` on
+   `run` and `stop`, naming a1 and its pid.
+2. With a1's `TABA_AGENT_PID` process then killed, `ps` shows the lease as
+   `expired`, and the next `run` in `wt-b` (lazy gc, with `gc_grace = "0s"`
+   in a test `config.toml`) stops the service and frees its port.
+3. `--service-ttl 2s`: after 3 s, `taba gc` drops the service. `keep`
+   survives `gc`.
 4. `taba lease end --agent a1` followed by `gc --dry-run` lists a1's scopes
    and stops nothing.
+5. TTL precedence: with `lease_ttl = "1h"` in `config.toml`, `whoami --json`
+   shows `ttl: "1h", ttl_source: "config"`; with `TABA_TTL=2h` also set,
+   `2h` / `env`; with `run --ttl 30m` as well, `30m` / `flag`. With no
+   config file and no `TABA_TTL`, an agent gets `4h` / `default` and a
+   `human` gets `none` / `default`. `ps --json` shows the same `lease`
+   fields.
+6. `--ttl none`: `expires_at` is `null`, and the service survives
+   `gc` long after any TTL would have passed, until the holder's pid is
+   killed.
+7. Zero config: with no `config.toml` every command works. An invalid
+   `lease_ttl = "soon"` or `TABA_TTL=soon` gives `E_CONFIG` naming the
+   source; `--ttl soon` gives `E_USAGE`.
 
 ### M4: borrows and lifetimes
 
-1. `wt-b` takes `borrow shared/db`. The owner's `stop` returns `E_BORROWED`
-   naming `wt-b`. `--break-borrows` stops it, and then `borrow --check`
-   from `wt-b` returns `E_DANGLING`.
-2. While `wt-b` holds `borrow --mut shared/db -- sleep 5`, `borrow --mut`
-   from `wt-a` returns `E_LOCKED` with an expiry, and with
+Setup: `wt-a` runs `db` (a third throwaway worktree, `wt-c`, is used as a
+second borrower).
+
+1. `wt-b` takes `borrow <wt-a scope>/db` and gets its URL. The owner's
+   `stop` returns `E_BORROWED` naming `wt-b`, with a `taba move` suggestion
+   in `next`, and the server still answers. `stop --force --reason test`
+   stops it, records `force_stop`, and then `borrow --check` from `wt-b`
+   returns `E_DANGLING`.
+2. While `wt-b` holds `borrow --mut <wt-a scope>/db -- sleep 5`,
+   `borrow --mut` from `wt-c` returns `E_LOCKED` with an expiry, and with
    `--wait-lock 10` succeeds after the first one ends.
 3. Killing the taba process of a `-- CMD` borrow frees the lock on the next
    call.
+4. Lifetimes under gc: `wt-b` borrows `db`; `wt-a`'s holder pid is killed
+   and `gc_grace` is 0. `gc` stops `wt-a`'s other services but keeps `db`
+   (`kept`, reason `borrowed`), the server still answers, and `wt-b`'s next
+   `borrow --check` has `W_OWNER_GONE`. After `wt-b` releases its borrow
+   (or its own lease ends), the next `gc` drops `db`.
 
 ### M5: move
 
-1. Holder a1 runs `move --to a2`. a2 can now stop the services, a1 gets
-   `E_NOT_OWNER`, and the services keep their instance and URL throughout.
-2. `move --take` by a2 while a1's lease is live returns `E_LEASE_LIVE`. After
-   expiry it succeeds with `how: take_expired`.
+1. Automatic take-over: a1 (with `TABA_AGENT_PID` set to a `sleep`) runs
+   `web` and `api` in `wt-a`. The `sleep` is killed. a2's first
+   `taba whoami` in `wt-a` returns `you_hold_scope: true`, a `takeover`
+   naming a1 and `holder_pid_gone`, and `W_TOOK_OVER`; `events.jsonl` has a
+   `moved` event with `how: auto_take`. Both services keep their instance
+   and URL, and a2 can stop them. a1 (back with a new live pid) gets
+   `E_SCOPE_HELD` naming a2.
+2. Take-over beats Drop: with `gc_grace = "1h"`, a2's take-over in test 1
+   happens after a1's lease ended and nothing was stopped in between.
+3. Holder a1 runs `move --to a2`. a2 can now stop the services, a1 gets
+   `E_SCOPE_HELD`, and the services keep their instance and URL throughout.
+4. `move --take` by a2 while a1's process is alive returns `E_LEASE_LIVE`.
+   With `--force --reason test` it succeeds with `how: take_forced` and is
+   recorded; without `--reason` it returns `E_FORCE_NEEDS_REASON`.
+5. Moving one service: `wt-b` and `wt-c` borrow `<wt-a scope>/db`. a1 runs
+   `taba move <wt-a scope>/db --to <wt-b scope>`. `ps` shows
+   `<wt-b scope>/db` with the same instance and URL, `wt-b`'s borrow has
+   ended, `wt-c`'s `borrow --check` succeeds and names the new service,
+   `wt-a`'s `stop --scope` no longer touches `db`, and logs still grow in
+   the moved log file. Moving into a scope that already has a `db` returns
+   `E_CONFLICT`. The same move by `wt-c` while a1 is alive returns
+   `E_NOT_OWNER`; after a1's pid is killed it succeeds without `--force`.
 
 ### M6: hooks and skill
 
@@ -1220,7 +1590,10 @@ operation lock for `stop`.
    `lsof -ti:<other scope's port> | xargs kill` is denied with a reason that
    contains the owner scope and a `taba run --port auto` suggestion. `kill
    <own pid>` is allowed. `pkill -f http.server` is denied if any match
-   belongs to another scope. `taba stop x --force` is denied.
+   belongs to another scope. `taba stop x --force` is denied. `kill <pid>`
+   of an unmanaged `python3 -m http.server` started with `nohup` is
+   **denied** (not ask), and the reason contains `--port auto` and "ask
+   the human".
 2. Unparseable commands are allowed and logged.
 3. In a real Claude Code session: the SessionStart hook sets `TABA_AGENT`,
    visible in `taba whoami`. Ending the session marks the lease expired.
@@ -1231,35 +1604,83 @@ operation lock for `stop`.
 
 ---
 
-## 9. Open decisions
+## 9. Decisions (2026-11-24)
 
-Each has a recommended default that the design above already assumes.
+Decided by the owner on 2026-11-24. They replace the open decisions of the
+first v0.2 draft, and the sections above already follow them. The numbers
+are kept so that "decision N" references above stay valid.
 
-1. **Derived scope: worktree path only, or path plus branch?**
-   *Recommended: path only* (`<dirname>-<hash4>`), with the branch recorded
-   and a warning when it changes. Including the branch would orphan running
-   services whenever an agent switches branch.
+1. **Scope = the folder.** By default the scope is derived from the git
+   worktree root path only (`<dirname>-<hash4>`), with the branch recorded
+   and `W_BRANCH_CHANGED` when it changes. One scope holds any number of
+   named services (`web`, `api`, `worker`, `db`, ...), which are listed,
+   stopped and handed off together. `--scope` / `$TABA_SCOPE` stay for
+   orchestrators that want task-named scopes. (Section 3.)
 
-2. **Default lease TTL, log grace period, and callers without `TABA_AGENT`.**
-   *Recommended:* TTL 4 h renewed on use; the lazy gc in `run` waits 10 min
-   after expiry; logs of dropped services kept 24 h; a caller without
-   `TABA_AGENT` is `human` with no TTL. That keeps v0.1 behaviour for
-   people, at the cost that an agent without identity behaves like v0.1 and
-   can leak.
+2. **Lease TTL is user-configurable, and a database shared by several
+   worktrees is borrowed, not given its own scope.**
+   - TTL precedence: `--ttl` on `run` (or `renew`) > `$TABA_TTL` >
+     `$TABA_HOME/config.toml` (`lease_ttl`) > built-in default (4 h for
+     agents, `none` for `human`). `none` means no expiry by time. The
+     config file is optional and also holds `gc_grace` (default 10 min)
+     and `log_retention` (default 24 h); taba works with zero
+     configuration. `whoami` and `ps --json` show the effective TTL and its
+     source. Consequence: the per-service limit that was `run --ttl` is
+     renamed `--service-ttl`.
+   - Shared database: owned by the folder scope that started it, like any
+     service. Other worktrees take shared borrows (`&`) for its URL and an
+     exclusive borrow (`&mut`) to reset or migrate it, one at a time. A
+     borrow cannot outlive the owner, so the owner cannot stop it and `gc`
+     cannot drop it while borrowed. When the owner's work ends first,
+     ownership of that one service moves to a borrower
+     (`taba move S/N --to SCOPE`). The earlier recommendation of a
+     separate `shared` scope is withdrawn. Rc/Arc-style shared ownership
+     (dropped when the last holder releases) is a possible later
+     extension, not v0.2. (Section 3, "A database shared by several
+     worktrees" and "Hand-off".)
+   - A caller without `TABA_AGENT` is `human`.
 
-3. **`stop` of a service that other scopes have borrowed: refuse or warn?**
-   *Recommended: refuse* with `E_BORROWED` and require `--break-borrows`.
-   Agents act on errors more reliably than on warnings. Expired-lease drops
-   and `gc` break borrows without asking.
+3. **Stopping a borrowed service is refused** with `E_BORROWED`, by `stop`,
+   `rm`, expired-lease stops and `gc` alike. `--force --reason` overrides
+   and leaves the borrowers dangling (`W_BORROW_BROKEN`, `E_DANGLING` on
+   `borrow --check`). The separate `--break-borrows` flag of the first
+   draft is removed. Borrows by dead borrowers end with the borrower's
+   lease, so they never pin a service forever.
 
-4. **Mutations by an unscoped human** (no `TABA_AGENT`, no `--scope`, not in
-   a worktree, for example `taba stop login-fix/web` from `~`).
-   *Recommended: allow without `--force`, but record an event.* Agents
-   always run inside a worktree, so they always have a scope. Requiring
-   `--force` here would only add friction for people.
+4. **`--force --reason` is the only override, for humans too.** A human
+   (no `TABA_AGENT`) mutating a service in another scope, or with no scope
+   at all, gets `E_NOT_OWNER` / `E_SCOPE_HELD` like an agent and needs
+   `--force --reason`, which is recorded. This replaces the draft's
+   recommendation to allow unscoped humans without `--force`. The hook
+   denies `--force` in agent tool calls.
 
-5. **Hook decision for unmanaged processes on a port or in another
-   worktree: `ask` or `deny`?**
-   *Recommended: `ask`.* taba can't know whether an unmanaged process
-   matters, but a human can. `deny` stays reserved for processes taba knows
-   belong to another task.
+5. **Unmanaged processes: deny, not ask.** The hook denies killing an
+   unmanaged process that listens on a TCP port or runs in another git
+   worktree, and the CLI has no way to kill a process taba did not start.
+   The deny message explains how to proceed: pick another port with
+   `--port auto`, or ask the human, who can stop it themselves.
+
+6. **Hand-off is mostly automatic.** If the current holder's agent process
+   is gone (`TABA_AGENT_PID` liveness), or its lease ended otherwise, the
+   next agent in the same scope takes over on its next taba call, with no
+   command, and a `moved` event with `how: auto_take` is recorded. If the
+   holder is still alive, the call fails with `E_SCOPE_HELD` naming the
+   holder. `taba move --to` / `--take` stay as explicit tools for
+   coordinators and humans; a forced take needs `--force --reason`.
+   `move --to` by the departing agent itself is rarely possible, because
+   usage limits stop agents abruptly. (Section 3, "Hand-off".)
+
+### Still open
+
+- **Does a usage-limited agent's process exit?** Automatic take-over
+  depends on the holder's `TABA_AGENT_PID` disappearing. If Claude Code or
+  Codex stays alive at a usage-limit prompt, the next agent gets
+  `E_SCOPE_HELD` until the TTL passes or someone forces a take. To verify
+  in M6 for each harness.
+- **Coordinators that are agents.** A forced `move` by a coordinator that
+  is itself a hooked Claude Code or Codex session is denied by the hook
+  (decision 4). It has to ask the human, or the orchestrator program (for
+  example Orca, outside any agent's Bash tool) runs it. Whether Orca can
+  run taba commands itself at dispatch time is **unknown** (section 7).
+- **Agent identity for Codex and Orca** (section 5): unchanged, still
+  unknown.
