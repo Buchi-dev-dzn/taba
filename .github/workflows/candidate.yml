@@ -1,0 +1,104 @@
+name: Release candidate
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/candidate.yml
+      - scripts/package-release.py
+      - Cargo.toml
+      - Cargo.lock
+      - 'src/**'
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      expected_commit:
+        description: Full SHA of the dispatched ref (checked before building)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  package:
+    name: Package ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: macos-15, target: aarch64-apple-darwin}
+          - {os: macos-15-intel, target: x86_64-apple-darwin}
+          - {os: windows-latest, target: x86_64-pc-windows-msvc}
+          - {os: ubuntu-22.04, target: x86_64-unknown-linux-gnu}
+          - {os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check source commit and native toolchain
+        shell: bash
+        env:
+          EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          if test "$GITHUB_EVENT_NAME" = workflow_dispatch; then
+            test "$EXPECTED_COMMIT" = "$GITHUB_SHA"
+          fi
+          rustc -vV | grep -Fx "host: $TARGET"
+      - name: Build, test and package
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          cargo test --locked --release --target "$TARGET"
+          cargo build --locked --release --target "$TARGET"
+          python scripts/package-release.py package "$TARGET" dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.target }}-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+  assemble:
+    name: Verify all archives and checksums
+    needs: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: package-*-${{ github.sha }}
+          path: input
+          merge-multiple: true
+      - name: Verify and assemble release candidate
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python scripts/package-release.py assemble input candidate "$GITHUB_SHA"
+          (cd candidate && sha256sum --check SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: taba-candidate-${{ github.sha }}
+          path: candidate/*
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0

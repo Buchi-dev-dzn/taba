@@ -30,13 +30,36 @@ belongs to which task, and only that task can stop its processes.
 
 ## Install
 
-`taba` is built from source with Rust and runs on macOS, Linux and Windows
-(see [Platforms](#platforms)). It has no Homebrew formula or crates.io
-release yet.
+Download an archive and `SHA256SUMS` from [GitHub Releases](https://github.com/Buchi-dev-dzn/taba/releases). Pick the archive for your OS and CPU:
+
+| Platform | v0.2.0 archive |
+| --- | --- |
+| macOS Apple Silicon | `taba-v0.2.0-aarch64-apple-darwin.tar.gz` |
+| macOS Intel | `taba-v0.2.0-x86_64-apple-darwin.tar.gz` |
+| Windows x86_64 | `taba-v0.2.0-x86_64-pc-windows-msvc.zip` |
+| Linux x86_64 (GNU/glibc) | `taba-v0.2.0-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux arm64 (GNU/glibc) | `taba-v0.2.0-aarch64-unknown-linux-gnu.tar.gz` |
+
+Compare the archive's SHA-256 with the matching line in `SHA256SUMS`: use
+`shasum -a 256 FILE` on macOS, `sha256sum FILE` on Linux, or
+`Get-FileHash FILE -Algorithm SHA256` in PowerShell. Extract the archive, put
+`taba` (`taba.exe` on Windows) somewhere on `PATH`, and run `taba --version`.
+Linux binaries are built on Ubuntu 22.04 (x86_64) and 24.04 (arm64); use a
+source build if your system has an older glibc or uses musl.
+
+To build the released version from Git with Rust and Cargo:
 
 ```sh
-git clone <this repo> taba && cd taba
-cargo install --path .        # installs `taba` into ~/.cargo/bin
+cargo install --locked --git https://github.com/Buchi-dev-dzn/taba.git --tag v0.2.0 taba
+```
+
+The pinned command requires the published `v0.2.0` tag. To build a local
+checkout instead:
+
+```sh
+git clone https://github.com/Buchi-dev-dzn/taba.git
+cd taba
+cargo install --locked --path .
 ```
 
 ## Quick start
@@ -541,12 +564,9 @@ taba is an early prototype:
 
 ## Roadmap
 
-- The rest of [design v0.2](docs/design-v0.2.md): JSON for every command and
-  `ps --all` (M2), agent leases and `gc` (M3), borrows of another scope's
-  service (M4), hand-over with `move` (M5), agent hooks (M6)
+- Real-session validation of optional agent hooks; see the [release notes](docs/releases/v0.2.0.md).
 - Log rotation
 - Better port detection (non-loopback binds)
-- Prebuilt binaries and a Homebrew formula
 
 See [docs/design-v0.2.md](docs/design-v0.2.md) for the current design and
 [docs/plan.md](docs/plan.md) for v0.1.
