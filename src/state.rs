@@ -126,6 +126,26 @@ impl Store {
         fs::rename(tmp, path)
     }
 
+    /// Deletes the record and log of `scope/name`. Both paths are derived
+    /// from validated identifiers under the state root, never from the
+    /// record's contents, so nothing outside `$TABA_HOME` can be touched.
+    /// Empty per-scope directories are removed too.
+    pub fn remove(&self, scope: &str, name: &str) -> io::Result<()> {
+        validate_ident("scope", scope).map_err(io::Error::other)?;
+        validate_ident("name", name).map_err(io::Error::other)?;
+        for path in [self.record_path(scope, name), self.log_path(scope, name)] {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+            if let Some(dir) = path.parent() {
+                let _ = fs::remove_dir(dir); // only succeeds when empty
+            }
+        }
+        Ok(())
+    }
+
     /// All records, optionally limited to one scope, sorted by scope/name.
     pub fn list(&self, scope: Option<&str>) -> io::Result<Vec<Service>> {
         let services_dir = self.root.join("services");

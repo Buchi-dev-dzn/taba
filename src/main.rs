@@ -9,6 +9,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -46,7 +47,10 @@ enum Cmd {
         /// Only show this scope
         #[arg(long)]
         scope: Option<String>,
-        /// Print JSON instead of a table
+        /// Only show running services (exited ones are listed by default)
+        #[arg(long)]
+        running: bool,
+        /// Print JSON instead of a table (paths are absolute)
         #[arg(long)]
         json: bool,
     },
@@ -69,6 +73,14 @@ enum Cmd {
         #[arg(long, default_value_t = 5.0)]
         timeout: f64,
     },
+    /// Remove stopped services' records and logs (SCOPE/NAME, or --scope)
+    Rm {
+        /// SCOPE/NAME, or NAME with --scope / $TABA_SCOPE
+        target: Option<String>,
+        /// Scope to clean up (all its stopped services when no target is given)
+        #[arg(long)]
+        scope: Option<String>,
+    },
 }
 
 type Result<T> = std::result::Result<T, String>;
@@ -82,13 +94,18 @@ fn main() -> ExitCode {
             port,
             command,
         } => cmd_run(scope, name, port, command),
-        Cmd::Ps { scope, json } => cmd_ps(scope, json),
+        Cmd::Ps {
+            scope,
+            running,
+            json,
+        } => cmd_ps(scope, running, json),
         Cmd::Logs { target, follow } => cmd_logs(&target, follow),
         Cmd::Stop {
             target,
             scope,
             timeout,
         } => cmd_stop(target, scope, timeout),
+        Cmd::Rm { target, scope } => cmd_rm(target, scope),
     };
     match res {
         Ok(()) => ExitCode::SUCCESS,
@@ -126,12 +143,69 @@ fn resolve_target(target: &str, scope_flag: Option<String>) -> Result<(String, S
     Ok((scope, name))
 }
 
-fn describe(svc: &Service) -> String {
-    let mut s = format!("{}  pid {}  dir {}", svc.id(), svc.pid, svc.cwd.display());
-    if let Some(url) = svc.url() {
-        s.push_str(&format!("  url {url}"));
+/// `path` with the home directory shown as `~`, for human-readable output.
+fn tilde(path: &Path) -> String {
+    if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+        let home = PathBuf::from(home);
+        let canon = home.canonicalize().ok();
+        for h in std::iter::once(&home).chain(canon.as_ref()) {
+            if h.as_os_str() == "/" {
+                continue;
+            }
+            if let Ok(rest) = path.strip_prefix(h) {
+                return if rest.as_os_str().is_empty() {
+                    "~".to_string()
+                } else {
+                    format!("~/{}", rest.display())
+                };
+            }
+        }
     }
-    s
+    path.display().to_string()
+}
+
+/// Short multi-line summary printed by `run`, e.g.
+///
+/// ```text
+/// started login-fix/web → http://localhost:5173
+///   dir  ~/dev/app-login
+///   logs taba logs login-fix/web
+/// ```
+fn describe(verb: &str, svc: &Service) -> String {
+    let head = match svc.url() {
+        Some(url) => format!("{verb} {} → {url}", svc.id()),
+        None => format!("{verb} {}", svc.id()),
+    };
+    format!(
+        "{head}\n  dir  {}\n  logs taba logs {}",
+        tilde(&svc.cwd),
+        svc.id()
+    )
+}
+
+/// Current local time as `YYYY-MM-DD HH:MM:SS +HHMM`.
+fn local_timestamp() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as libc::time_t)
+        .unwrap_or(0);
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&now, &mut tm) }.is_null() {
+        return format!("unix time {now}");
+    }
+    let off = tm.tm_gmtoff / 60;
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02} {}{:02}{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec,
+        if off < 0 { '-' } else { '+' },
+        off.abs() / 60,
+        off.abs() % 60
+    )
 }
 
 // ---------------------------------------------------------------- run
@@ -155,7 +229,7 @@ fn cmd_run(
         && existing.is_running()
     {
         if existing.command == command && existing.cwd == cwd && existing.port == port {
-            println!("already running: {}", describe(&existing));
+            println!("{}", describe("already running", &existing));
             return Ok(());
         }
         return Err(format!(
@@ -163,7 +237,7 @@ fn cmd_run(
                  (command {:?}, dir {}, port {}); stop it first",
             existing.id(),
             existing.command,
-            existing.cwd.display(),
+            tilde(&existing.cwd),
             existing.port.map_or("-".to_string(), |p| p.to_string()),
         ));
     }
@@ -180,13 +254,10 @@ fn cmd_run(
         .append(true)
         .open(&log_path)
         .map_err(|e| format!("cannot open log {}: {e}", log_path.display()))?;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
     writeln!(
         log,
-        "--- taba: starting {:?} in {} (unix time {now}) ---",
+        "--- taba: {} starting {:?} in {} ---",
+        local_timestamp(),
         command,
         cwd.display()
     )
@@ -220,10 +291,7 @@ fn cmd_run(
     drop(child);
 
     let info = proc::info(pid).ok_or_else(|| {
-        format!(
-            "{scope}/{name} exited immediately; see {}",
-            log_path.display()
-        )
+        format!("{scope}/{name} exited immediately; see taba logs {scope}/{name}")
     })?;
     let svc = Service {
         scope,
@@ -240,14 +308,13 @@ fn cmd_run(
 
     thread::sleep(Duration::from_millis(200));
     if svc.is_running() {
-        println!("started: {}", describe(&svc));
-        println!("logs:    {}", svc.log_path.display());
+        println!("{}", describe("started", &svc));
         Ok(())
     } else {
         Err(format!(
-            "{} exited right after starting; see {}",
+            "{} exited right after starting; see taba logs {}",
             svc.id(),
-            svc.log_path.display()
+            svc.id()
         ))
     }
 }
@@ -287,6 +354,34 @@ fn listeners(port: u16) -> Vec<(i32, String)> {
     res
 }
 
+/// Command line of `pid` for messages: the program's file name plus its
+/// arguments, shortened in the middle so both ends stay readable.
+fn command_line(pid: i32) -> Option<String> {
+    const MAX: usize = 100;
+    let mut args = proc::argv(pid)?;
+    if let Some(base) = Path::new(&args[0]).file_name() {
+        args[0] = base.to_string_lossy().into_owned();
+    }
+    let line = args
+        .iter()
+        .map(|a| {
+            if a.is_empty() || a.contains(char::is_whitespace) {
+                format!("'{a}'")
+            } else {
+                a.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let chars: Vec<char> = line.chars().collect();
+    if chars.len() <= MAX {
+        return Some(line);
+    }
+    let head: String = chars[..MAX / 2].iter().collect();
+    let tail: String = chars[chars.len() - (MAX / 2 - 3)..].iter().collect();
+    Some(format!("{head} … {tail}"))
+}
+
 fn check_port_free(store: &Store, port: u16, scope: &str, name: &str) -> Result<()> {
     let running: Vec<Service> = store
         .list(None)
@@ -301,7 +396,7 @@ fn check_port_free(store: &Store, port: u16, scope: &str, name: &str) -> Result<
         return Err(format!(
             "port {port} is already claimed by taba service {} ({})",
             owner.id(),
-            owner.cwd.display()
+            tilde(&owner.cwd)
         ));
     }
     if !port_in_use(port) {
@@ -315,13 +410,15 @@ fn check_port_free(store: &Store, port: u16, scope: &str, name: &str) -> Result<
             return Err(format!(
                 "port {port} is in use by taba service {} (pid {pid} {comm}, {})",
                 owner.id(),
-                owner.cwd.display()
+                tilde(&owner.cwd)
             ));
         }
     }
     match holders.first() {
         Some((pid, comm)) => Err(format!(
-            "port {port} is in use by pid {pid} ({comm}), which is not managed by taba"
+            "port {port} is in use by pid {pid}, which is not managed by taba:\n  {}\n\
+             nothing was started",
+            command_line(*pid).unwrap_or_else(|| comm.clone())
         )),
         None => Err(format!(
             "port {port} is in use by a process taba cannot identify"
@@ -331,12 +428,15 @@ fn check_port_free(store: &Store, port: u16, scope: &str, name: &str) -> Result<
 
 // ---------------------------------------------------------------- ps
 
-fn cmd_ps(scope: Option<String>, json: bool) -> Result<()> {
+fn cmd_ps(scope: Option<String>, running_only: bool, json: bool) -> Result<()> {
     if let Some(s) = &scope {
         validate_ident("scope", s)?;
     }
     let store = Store::open().map_err(io_err)?;
-    let services = store.list(scope.as_deref()).map_err(io_err)?;
+    let mut services = store.list(scope.as_deref()).map_err(io_err)?;
+    if running_only {
+        services.retain(|s| s.is_running());
+    }
 
     if json {
         let rows: Vec<serde_json::Value> = services
@@ -374,7 +474,7 @@ fn cmd_ps(scope: Option<String>, json: bool) -> Result<()> {
             s.id(),
             if s.is_running() { "running" } else { "exited" }.to_string(),
             s.url().unwrap_or_else(|| "-".into()),
-            s.cwd.display().to_string(),
+            tilde(&s.cwd),
         ]);
     }
     let widths: Vec<usize> = (0..3)
@@ -469,14 +569,18 @@ fn cmd_stop(target: Option<String>, scope: Option<String>, timeout: f64) -> Resu
     let mut failures = 0;
     for svc in services {
         if !svc.is_running() {
-            println!("{}: not running (exited)", svc.id());
+            println!("{}: not running (exited)  {}", svc.id(), tilde(&svc.cwd));
             continue;
         }
         match proc::stop_group(svc.pgid, timeout) {
-            Ok(proc::StopResult::Terminated) => println!("{}: stopped", svc.id()),
-            Ok(proc::StopResult::Killed) => {
-                println!("{}: stopped (SIGKILL after timeout)", svc.id())
+            Ok(proc::StopResult::Terminated) => {
+                println!("{}: stopped  {}", svc.id(), tilde(&svc.cwd))
             }
+            Ok(proc::StopResult::Killed) => println!(
+                "{}: stopped (SIGKILL after timeout)  {}",
+                svc.id(),
+                tilde(&svc.cwd)
+            ),
             Err(e) => {
                 eprintln!(
                     "taba: {}: cannot signal process group {}: {e}",
@@ -489,6 +593,55 @@ fn cmd_stop(target: Option<String>, scope: Option<String>, timeout: f64) -> Resu
     }
     if failures > 0 {
         Err(format!("{failures} service(s) could not be stopped"))
+    } else {
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------- rm
+
+fn cmd_rm(target: Option<String>, scope: Option<String>) -> Result<()> {
+    let store = Store::open().map_err(io_err)?;
+    let _lock = store.lock().map_err(io_err)?;
+    let services: Vec<Service> = match target {
+        Some(t) => {
+            let (s, n) = resolve_target(&t, scope)?;
+            vec![
+                store
+                    .get(&s, &n)
+                    .map_err(io_err)?
+                    .ok_or_else(|| format!("no such service: {s}/{n}"))?,
+            ]
+        }
+        None => {
+            if scope.is_none() {
+                return Err("nothing to remove: give SCOPE/NAME or --scope SCOPE".into());
+            }
+            let s = resolve_scope(scope)?;
+            let list = store.list(Some(&s)).map_err(io_err)?;
+            if list.is_empty() {
+                println!("no services in scope {s}");
+            }
+            list
+        }
+    };
+
+    let mut refused = 0;
+    for svc in services {
+        if svc.is_running() {
+            eprintln!(
+                "taba: {}: still running; stop it first: taba stop {}",
+                svc.id(),
+                svc.id()
+            );
+            refused += 1;
+            continue;
+        }
+        store.remove(&svc.scope, &svc.name).map_err(io_err)?;
+        println!("{}: removed (record and log)", svc.id());
+    }
+    if refused > 0 {
+        Err(format!("{refused} running service(s) were not removed"))
     } else {
         Ok(())
     }

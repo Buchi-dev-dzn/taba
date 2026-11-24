@@ -290,6 +290,13 @@ fn rerun_is_idempotent_and_conflicts_are_rejected() {
         "{}",
         text(&out)
     );
+    // ...and it names the owner's full command line, not just "Python".
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains(&format!("-m http.server {up} --bind 127.0.0.1")),
+        "{}",
+        text(&out)
+    );
 
     let rows = env.ps_json(&a);
     assert_eq!(rows.len(), 1, "{rows:?}");
@@ -439,4 +446,162 @@ fn scope_falls_back_to_env() {
     let rows = env.ps_json(&a);
     assert_eq!(find(&rows, "from-env/x")["status"], "running");
     assert!(rows[0]["url"].is_null());
+}
+
+fn sleeper() -> Vec<String> {
+    vec!["sleep".into(), "300".into()]
+}
+
+fn run_plain<'a>(scope: &'a str, name: &'a str, cmd: &'a [String]) -> Vec<&'a str> {
+    let mut v = vec!["run", "--scope", scope, "--name", name, "--"];
+    v.extend(cmd.iter().map(|s| s.as_str()));
+    v
+}
+
+/// `rm` removes only exited services' records and logs, refuses running
+/// ones, and never touches other scopes; `ps --running` hides exited ones.
+#[test]
+fn rm_removes_only_exited_services_in_the_given_scope() {
+    let mut env = Env::new("rm");
+    let a = env.dir("a");
+    let cmd = sleeper();
+    for (scope, name) in [("s", "live"), ("s", "done"), ("other", "done")] {
+        let out = env.taba(&a, &run_plain(scope, name, &cmd));
+        assert!(out.status.success(), "{}", text(&out));
+    }
+    for t in ["s/done", "other/done"] {
+        let out = env.taba(&a, &["stop", t]);
+        assert!(out.status.success(), "{}", text(&out));
+    }
+    let home = env.home();
+    let record = |s: &str, n: &str| home.join(format!("services/{s}/{n}.json"));
+    let log = |s: &str, n: &str| home.join(format!("logs/{s}/{n}.log"));
+
+    // ps keeps exited services by default; --running hides them.
+    assert_eq!(env.ps_json(&a).len(), 3);
+    let out = env.taba(&a, &["ps", "--running", "--json"]);
+    let rows: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["service"], "s/live");
+
+    // A running service is refused, and nothing is deleted.
+    let out = env.taba(&a, &["rm", "s/live"]);
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("stop it first"),
+        "{}",
+        text(&out)
+    );
+    assert!(record("s", "live").exists() && log("s", "live").exists());
+
+    // rm --scope removes the exited one, refuses the running one, exits non-zero.
+    let out = env.taba(&a, &["rm", "--scope", "s"]);
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(!record("s", "done").exists() && !log("s", "done").exists());
+    assert!(record("s", "live").exists() && log("s", "live").exists());
+    // Another scope's exited service is untouched.
+    assert!(record("other", "done").exists() && log("other", "done").exists());
+    let rows = env.ps_json(&a);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(find(&rows, "s/live")["status"], "running");
+    assert_eq!(find(&rows, "other/done")["status"], "exited");
+
+    // After stopping, the whole scope can be removed.
+    let out = env.taba(&a, &["stop", "--scope", "s"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let out = env.taba(&a, &["rm", "--scope", "s"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(!record("s", "live").exists() && !log("s", "live").exists());
+    assert!(!home.join("services/s").exists() && !home.join("logs/s").exists());
+    assert!(record("other", "done").exists() && log("other", "done").exists());
+
+    // Unknown services are an error.
+    let out = env.taba(&a, &["rm", "s/live"]);
+    assert!(!out.status.success(), "{}", text(&out));
+}
+
+/// `rm` ignores a tampered `log_path` in the record: it only deletes files
+/// under TABA_HOME derived from the scope and name.
+#[test]
+fn rm_never_deletes_outside_taba_home() {
+    let mut env = Env::new("rmsafe");
+    let a = env.dir("a");
+    let outside = env.dir("outside").join("precious.log");
+    std::fs::write(&outside, "keep me").unwrap();
+    let cmd = sleeper();
+    let out = env.taba(&a, &run_plain("s", "x", &cmd));
+    assert!(out.status.success(), "{}", text(&out));
+    let out = env.taba(&a, &["stop", "s/x"]);
+    assert!(out.status.success(), "{}", text(&out));
+
+    let record = env.home().join("services/s/x.json");
+    let mut v: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+    v["log_path"] = serde_json::json!(outside);
+    std::fs::write(&record, serde_json::to_vec(&v).unwrap()).unwrap();
+
+    let out = env.taba(&a, &["rm", "s/x"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(!record.exists());
+    assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep me");
+}
+
+/// Human output shows the home directory as `~`; JSON keeps absolute paths.
+/// The log header has a readable local timestamp.
+#[test]
+fn human_output_abbreviates_home() {
+    let mut env = Env::new("tilde");
+    let a = env.dir("proj");
+    env.scopes.push("s".into());
+    let taba = |args: &[&str]| {
+        Command::new(BIN)
+            .args(args)
+            .current_dir(&a)
+            .env("HOME", &env.root)
+            .env("TABA_HOME", env.home())
+            .env_remove("TABA_SCOPE")
+            .output()
+            .unwrap()
+    };
+    let port = free_port();
+    let cmd = server_cmd(port);
+    let out = taba(&run_args("s", "web", &port.to_string(), &cmd));
+    assert!(out.status.success(), "{}", text(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        stdout.starts_with(&format!("started s/web → http://localhost:{port}\n")),
+        "{stdout}"
+    );
+    assert!(stdout.contains("  dir  ~/proj\n"), "{stdout}");
+    assert!(stdout.contains("  logs taba logs s/web"), "{stdout}");
+    assert!(stdout.lines().all(|l| l.chars().count() <= 60), "{stdout}");
+
+    let out = taba(&["ps"]);
+    let table = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(table.contains("~/proj"), "{table}");
+    assert!(!table.contains(env.root.to_str().unwrap()), "{table}");
+
+    let out = taba(&["ps", "--json"]);
+    let rows: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(rows[0]["directory"], a.to_str().unwrap());
+    assert!(rows[0]["pid"].as_i64().unwrap() > 0);
+
+    let out = taba(&["logs", "s/web"]);
+    let first = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()
+        .unwrap()
+        .to_string();
+    assert!(!first.contains("unix time"), "{first}");
+    // "--- taba: YYYY-MM-DD HH:MM:SS +HHMM starting ..."
+    let ts = first.strip_prefix("--- taba: ").unwrap();
+    let b = ts.as_bytes();
+    assert!(
+        b[4] == b'-' && b[7] == b'-' && b[10] == b' ' && b[13] == b':' && b[16] == b':',
+        "{first}"
+    );
+
+    let out = taba(&["stop", "s/web"]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("~/proj"));
 }

@@ -45,6 +45,53 @@ pub fn info(pid: i32) -> Option<ProcInfo> {
     })
 }
 
+/// Argument vector of `pid` (KERN_PROCARGS2), or `None` if it cannot be read.
+pub fn argv(pid: i32) -> Option<Vec<String>> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    let mut size: libc::size_t = 0;
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || size < 4 {
+        return None;
+    }
+    let mut buf = vec![0u8; size];
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || size < 4 {
+        return None;
+    }
+    buf.truncate(size);
+    // Layout: argc (i32), exec path, NUL padding, then argc NUL-terminated args.
+    let argc = i32::from_ne_bytes(buf[..4].try_into().ok()?) as usize;
+    let mut rest = &buf[4..];
+    let end = rest.iter().position(|b| *b == 0)?;
+    rest = &rest[end..];
+    let start = rest.iter().position(|b| *b != 0)?;
+    rest = &rest[start..];
+    let args: Vec<String> = rest
+        .split(|b| *b == 0)
+        .take(argc)
+        .map(|a| String::from_utf8_lossy(a).into_owned())
+        .collect();
+    if args.is_empty() { None } else { Some(args) }
+}
+
 /// Lists all pids currently visible.
 fn all_pids() -> Vec<i32> {
     let mut cap = 4096usize;
