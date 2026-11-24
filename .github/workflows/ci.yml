@@ -30,14 +30,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      # The first start of a fresh Python can take tens of seconds on macOS
-      # runners (first-launch checks, bytecode); do it before the tests time it.
-      - name: Warm up Python
-        shell: bash
-        run: |
-          python --version
-          python -c "import http.server, runpy, signal, socketserver, subprocess"
-          python3 -c "import http.server" || true
       - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --check
@@ -47,25 +39,3 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --locked
-      - name: Debug (temporary)
-        if: failure() && runner.os == 'macOS'
-        run: |
-          export TABA_HOME=$RUNNER_TEMP/dbg
-          cat > /tmp/probe.py <<'PY'
-          import time, sys
-          t0 = time.time()
-          def say(m): print(f"{time.time()-t0:7.2f} {m}", flush=True)
-          say("interpreter up")
-          import socket; say("import socket")
-          socket.gethostname(); say("gethostname")
-          socket.getfqdn("127.0.0.1"); say("getfqdn 127.0.0.1")
-          import http.server; say("import http.server")
-          s = http.server.HTTPServer(("127.0.0.1", 18997), http.server.SimpleHTTPRequestHandler); say("server bound")
-          PY
-          date +%T.%N
-          ./target/debug/taba run --scope d --name probe -- python3 -u /tmp/probe.py
-          sleep 45
-          cat $TABA_HOME/logs/d/probe.log
-          ./target/debug/taba run --scope d --name probe2 -- /bin/sh -c 'date +%T; python3 -u /tmp/probe.py; date +%T'
-          sleep 45
-          cat $TABA_HOME/logs/d/probe2.log

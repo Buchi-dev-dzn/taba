@@ -207,14 +207,40 @@ fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
     panic!("timed out waiting for {what}");
 }
 
-const SERVER: [&str; 6] = [PY, "-m", "http.server", "{port}", "--bind", "127.0.0.1"];
+/// A script that runs `python -m http.server ARGS...` without the reverse
+/// DNS lookup `HTTPServer.server_bind` does (`socket.getfqdn`), which takes
+/// over 30 s in detached processes on GitHub's macOS runners.
+fn serve_py() -> &'static str {
+    static PATH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR"));
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join("taba-serve.py");
+        let tmp = dir.join(format!("taba-serve.py.{}", std::process::id()));
+        std::fs::write(
+            &tmp,
+            "import runpy, socket, sys\n\
+             socket.getfqdn = lambda name='': name or 'localhost'\n\
+             sys.argv = ['http.server'] + sys.argv[1:]\n\
+             runpy.run_module('http.server', run_name='__main__', alter_sys=True)\n",
+        )
+        .unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+        path.to_str().unwrap().to_string()
+    });
+    &PATH
+}
+
+/// `python3 -m http.server {port} --bind 127.0.0.1`, through `serve_py`.
+fn server() -> [&'static str; 5] {
+    [PY, serve_py(), "{port}", "--bind", "127.0.0.1"]
+}
 
 /// `run --name NAME --port auto --wait --json -- python3 -m http.server {port}`
 fn run_auto(name: &str) -> Vec<&str> {
     let mut v = vec![
         "run", "--name", name, "--port", "auto", "--wait", "--json", "--",
     ];
-    v.extend_from_slice(&SERVER);
+    v.extend_from_slice(&server());
     v
 }
 
@@ -350,7 +376,7 @@ fn m1_04_unmanaged_holder_is_skipped_and_reported() {
     let mut args = vec![
         "run", "--name", "web", "--port", &spec, "--wait", "--json", "--",
     ];
-    args.extend_from_slice(&SERVER);
+    args.extend_from_slice(&server());
     let out = f.taba(&f.wt_a, &args);
     assert_eq!(exit(&out), 0, "{}", text(&out));
     let v = json(&out);
@@ -359,7 +385,7 @@ fn m1_04_unmanaged_holder_is_skipped_and_reported() {
 
     let ps = p.to_string();
     let mut args = vec!["run", "--name", "api", "--port", &ps, "--json", "--"];
-    args.extend_from_slice(&SERVER);
+    args.extend_from_slice(&server());
     let out = f.taba(&f.wt_a, &args);
     assert_eq!(exit(&out), 4, "{}", text(&out));
     let v = json(&out);
@@ -395,9 +421,9 @@ fn m1_05_not_ready_and_start_failed() {
             "--",
             PY,
             "-c",
-            "import runpy, sys, time; time.sleep(5); \
+            "import runpy, socket, sys, time; time.sleep(5); \
              sys.argv = ['http.server', '{port}', '--bind', '127.0.0.1']; \
-             runpy.run_module('http.server', run_name='__main__')",
+             socket.getfqdn = lambda name='': name or 'localhost';              runpy.run_module('http.server', run_name='__main__')",
         ],
     );
     assert_eq!(exit(&out), 4, "{}", text(&out));
@@ -656,7 +682,7 @@ fn m1_09_v01_state_still_works() {
     let f = Fixture::new("v01");
     let port = (20000..30000).find(|p| port_free(*p)).unwrap();
     let ps = port.to_string();
-    let cmd = [PY, "-m", "http.server", &ps, "--bind", "127.0.0.1"];
+    let cmd = [PY, serve_py(), &ps, "--bind", "127.0.0.1"];
     let mut run = vec![
         "run", "--scope", "old", "--name", "web", "--port", &ps, "--",
     ];
