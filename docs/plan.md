@@ -1,4 +1,6 @@
 > Superseded by [design-v0.2.md](design-v0.2.md). Kept for history.
+>
+> Release versioning rules and the release process: [releasing.md](releasing.md).
 
 # taba Proposal v0.1
 
