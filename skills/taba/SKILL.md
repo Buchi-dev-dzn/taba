@@ -15,10 +15,14 @@ taba whoami [--json]
 taba run [--scope S] --name N [--port P | --port auto | --port auto:START]
          [--wait[=SECS]] [--ready tcp|http:PATH|log:REGEX] [--json] -- CMD...
 taba ps [--scope S] [--running] [--json]
-taba logs [-f] S/N | N
+taba ps --all [--json]
+taba logs [-f] S/N | N [--json]
 taba stop S/N | N | --scope S [--timeout SECS] [--json]
-taba rm S/N | N | --scope S
+taba rm S/N | N | --scope S [--json]
 ```
+
+Every command takes `--json` (or `TABA_OUTPUT=json` in the environment) and
+then prints exactly one JSON document with `"ok"`, for success and failure.
 
 ## Procedure
 
@@ -27,8 +31,11 @@ taba rm S/N | N | --scope S
    that already exist in it. If `scope` is `null`, you are outside a git
    worktree: `cd` into the worktree you work in, or pass `--scope`.
 2. **Reuse before you start.** If a service you need is listed, check it with
-   `taba ps --scope <scope> --json`. If it has `"status": "running"`, use its
-   `url` and don't start another.
+   `taba ps --scope <scope> --json` (rows are under `services`). If it has
+   `"status": "running"`, use its `url` and don't start another. To see
+   what holds a port, including processes taba didn't start, use
+   `taba ps --all --json` (rows under `listeners`, with `managed`,
+   `directory` and `git.branch`). It is read-only.
 3. **Start with `--port auto --wait --json`** and put `{port}` where the app
    takes its port:
 
@@ -88,6 +95,7 @@ taba logs login-fix-3f9a/web -f   # follow until the service exits
 `-f` blocks until the service exits. In a non-interactive tool call, prefer
 the plain form, or pipe it through `tail`. The log path is also in
 `taba ps --json` (`log_path`). Logs of any scope are readable.
+`taba logs web --json` returns the text in `log` (not with `-f`).
 
 ## Stopping and cleaning up
 

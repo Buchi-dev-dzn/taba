@@ -100,8 +100,23 @@ pub fn command_line(pid: i32) -> Option<String> {
     if let Some(base) = Path::new(&args[0]).file_name() {
         args[0] = base.to_string_lossy().into_owned();
     }
-    let line = args
-        .iter()
+    let line = join_args(&args);
+    let chars: Vec<char> = line.chars().collect();
+    if chars.len() <= MAX {
+        return Some(line);
+    }
+    let head: String = chars[..MAX / 2].iter().collect();
+    let tail: String = chars[chars.len() - (MAX / 2 - 3)..].iter().collect();
+    Some(format!("{head} … {tail}"))
+}
+
+/// Full command line of `pid` (program path and arguments), for `ps --all`.
+pub fn command_line_full(pid: i32) -> Option<String> {
+    proc::argv(pid).map(|a| join_args(&a))
+}
+
+fn join_args(args: &[String]) -> String {
+    args.iter()
         .map(|a| {
             if a.is_empty() || a.contains(char::is_whitespace) {
                 format!("'{a}'")
@@ -110,14 +125,7 @@ pub fn command_line(pid: i32) -> Option<String> {
             }
         })
         .collect::<Vec<_>>()
-        .join(" ");
-    let chars: Vec<char> = line.chars().collect();
-    if chars.len() <= MAX {
-        return Some(line);
-    }
-    let head: String = chars[..MAX / 2].iter().collect();
-    let tail: String = chars[chars.len() - (MAX / 2 - 3)..].iter().collect();
-    Some(format!("{head} … {tail}"))
+        .join(" ")
 }
 
 /// `wslrelay.exe` listens on Windows for ports of servers inside WSL 2

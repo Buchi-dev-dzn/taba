@@ -30,16 +30,17 @@ use linux as os;
 use macos as os;
 
 #[cfg(unix)]
-pub use os::{argv, listeners};
+pub use os::{all_listeners, argv, cwd, listeners};
 #[cfg(unix)]
 pub use unix::{
-    KILL_SIGNAL, group_is_ours, in_group, info, resolve_program, spawn_detached, stop_group,
+    GRACEFUL_ACTION, KILL_ACTION, KILL_SIGNAL, group_is_ours, in_group, info, pgid,
+    resolve_program, spawn_detached, stop_group,
 };
 
 #[cfg(windows)]
 pub use windows::{
-    KILL_SIGNAL, argv, ctrl_break_helper, group_is_ours, in_group, info, listeners,
-    resolve_program, spawn_detached, stop_group,
+    GRACEFUL_ACTION, KILL_ACTION, KILL_SIGNAL, all_listeners, argv, ctrl_break_helper, cwd,
+    group_is_ours, in_group, info, listeners, pgid, resolve_program, spawn_detached, stop_group,
 };
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
@@ -80,6 +81,36 @@ pub enum StopResult {
     Terminated,
     /// Still running at the timeout and killed (SIGKILL / TerminateJobObject).
     Killed,
+}
+
+/// A TCP socket in LISTEN state and the process holding it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Socket {
+    pub port: u16,
+    /// Bound address: `127.0.0.1`, `::1`, or `*` for any address.
+    pub address: String,
+    pub pid: i32,
+}
+
+/// `*` for an unspecified address, else the address itself.
+pub fn format_ip(ip: std::net::IpAddr) -> String {
+    if ip.is_unspecified() {
+        "*".to_string()
+    } else {
+        ip.to_string()
+    }
+}
+
+/// Splits lsof's `127.0.0.1:4113`, `*:5173` or `[::1]:4113`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn split_host_port(s: &str) -> Option<(String, u16)> {
+    let (host, port) = s.rsplit_once(':')?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let host = match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => format_ip(ip),
+        Err(_) => host.to_string(),
+    };
+    Some((host, port.parse().ok()?))
 }
 
 /// A listening TCP socket's owner: pid and short command name.

@@ -85,8 +85,7 @@ impl Env {
     fn ps_json(&mut self, cwd: &Path) -> Vec<serde_json::Value> {
         let out = self.taba(cwd, &["ps", "--json"]);
         assert!(out.status.success(), "ps failed: {}", text(&out));
-        serde_json::from_slice::<serde_json::Value>(&out.stdout)
-            .unwrap()
+        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["services"]
             .as_array()
             .unwrap()
             .clone()
@@ -400,7 +399,8 @@ fn two_checkouts_on_different_ports_are_listed_by_directory() {
 
     // --scope filter.
     let out = env.taba(&elsewhere, &["ps", "--scope", "feat-b", "--json"]);
-    let rows: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let rows: serde_json::Value =
+        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["services"].clone();
     assert_eq!(rows.as_array().unwrap().len(), 1);
     assert_eq!(rows[0]["service"], "feat-b/web");
 }
@@ -652,7 +652,8 @@ fn rm_removes_only_exited_services_in_the_given_scope() {
     // ps keeps exited services by default; --running hides them.
     assert_eq!(env.ps_json(&a).len(), 3);
     let out = env.taba(&a, &["ps", "--running", "--json"]);
-    let rows: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let rows: serde_json::Value =
+        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["services"].clone();
     let rows = rows.as_array().unwrap();
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0]["service"], "s/live");
@@ -759,7 +760,8 @@ fn human_output_abbreviates_home() {
     assert!(!table.contains(env.root.to_str().unwrap()), "{table}");
 
     let out = taba(&["ps", "--json"]);
-    let rows: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let rows: serde_json::Value =
+        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["services"].clone();
     assert_eq!(rows[0]["directory"], a.to_str().unwrap());
     assert!(rows[0]["pid"].as_i64().unwrap() > 0);
 

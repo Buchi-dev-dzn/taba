@@ -180,8 +180,8 @@ taba is meant for AI coding agents as much as for people:
   this, for orchestrators that want task-named scopes. Run `taba whoami` to
   see which scope applies.
 - **Errors are machine-readable.** With `--json` (or `TABA_OUTPUT=json`),
-  `run`, `stop` and `whoami` print one JSON document for success and
-  failure. A failure has `error.code`, `error.message`, `error.details` and
+  every command prints one JSON document on stdout for success and failure,
+  and nothing on stderr. A failure has `error.code`, `error.message`, `error.details` and
   `error.next`, a list of allowed next steps, most preferred first. `next`
   never suggests `kill` or `--force`; when only a person can resolve the
   error, it ends with "ask the human". See [Errors](#errors).
@@ -190,7 +190,9 @@ taba is meant for AI coding agents as much as for people:
 
   ```console
   $ taba ps --scope login-fix --json
-  [
+  {
+    "ok": true,
+    "services": [
     {
       "service": "login-fix/web",
       "scope": "login-fix",
@@ -212,8 +214,13 @@ taba is meant for AI coding agents as much as for people:
       "log_path": "/Users/Shared/demo/taba-home/logs/login-fix/web.log",
       "instance": "72306-1795509874101287"
     }
-  ]
+    ],
+    "warnings": []
+  }
   ```
+- **Use `taba ps --all`** to see every port you have open, whether taba
+  started it or not, with its directory and git branch. It never stops or
+  changes anything.
 - Each started process gets `TABA_SCOPE` and `TABA_SERVICE` in its environment.
 
 ### Agent skill
@@ -319,7 +326,8 @@ that. Measurements against Docker are in [docs/benchmarks.md](docs/benchmarks.md
 | `taba run [--scope S] --name N [--port P \| auto \| auto:START] [--wait[=SECS]] [--ready CHECK] [--json] -- CMD...` | Start `CMD` detached as service `S/N`, in its own process group, with output appended to its log. `{port}` in `CMD` is replaced by the port, and `PORT` is set. |
 | `taba whoami [--scope S] [--json]` | Show the scope taba uses here, its source (`flag`, `env`, `git`), worktree, branch, agent and services. |
 | `taba ps [--scope S] [--running] [--json]` | List services with status `running`, `starting`, `stopping` or `exited`, plus URL and directory (`~` for your home; absolute in `--json`). `--running` hides exited ones. |
-| `taba logs [-f] S/N` (or `N` in your scope) | Print the log. Add `-f` to follow it until the service exits. |
+| `taba ps --all [--json]` | List every listening TCP port of your user, managed by taba or not: address, pid, command, directory, git worktree and branch, and the taba service if there is one. Read-only. |
+| `taba logs [-f] S/N` (or `N` in your scope) | Print the log. Add `-f` to follow it until the service exits. With `--json`, the log text is in `log` (not with `-f`). |
 | `taba stop S/N` (or `N` in your scope) | Stop one service of your own scope. |
 | `taba stop --scope S` | Stop every service in scope `S`. |
 | `taba stop ... --timeout SECS` | Seconds to wait between SIGTERM and SIGKILL (Windows: Ctrl+Break and job termination; default 5). |
@@ -334,11 +342,18 @@ flags.
 
 ### Errors
 
-With `--json` or `TABA_OUTPUT=json`, `run`, `stop` and `whoami` print
-`{"ok": true, ..., "warnings": [...]}` or
-`{"ok": false, "error": {"code", "message", "details", "next"}, ...}`.
-Without it, the message and the next steps go to stderr. The exit status
-follows the code:
+With `--json` or `TABA_OUTPUT=json`, every command prints one JSON document
+on stdout, `{"ok": true, ..., "warnings": [...]}` or
+`{"ok": false, "error": {"code", "message", "details", "next"}, ...}`, and
+nothing on stderr. `ps` lists its rows under `services`, `ps --all` under
+`listeners`, and `stop` and `rm` report each service under `results`. A
+stopped service's `signal` is `TERM` or `KILL` on every platform;
+`platform_action` says what was done (`sigterm`, `sigkill`, or on Windows
+`ctrl_break`, `terminate_job_object`).
+Without `--json`, the message and the next steps go to stderr. Commands in
+`next` are quoted for the shell of the platform: POSIX `sh` on macOS and
+Linux, PowerShell on Windows (in cmd.exe, use double quotes where they show
+single quotes). The exit status follows the code:
 
 | Code | Exit | Meaning |
 | --- | --- | --- |
@@ -364,7 +379,7 @@ follows the code:
 | --- | --- |
 | `TABA_SCOPE` | The caller's scope when `--scope` is not given; beats the git worktree. |
 | `TABA_AGENT` | Name of the acting agent, recorded with services and `--force` events (default `human`). |
-| `TABA_OUTPUT` | `json` makes `run`, `stop`, `whoami` and `ps` print JSON. |
+| `TABA_OUTPUT` | `json` makes every command print JSON (except `logs -f`, which streams text). |
 | `TABA_HOME` | State directory (default `~/.taba`). |
 | `TABA_SCOPE`, `TABA_SERVICE`, `PORT` | Set *inside* each started process: its scope, its service name and (with `--port`) its port. |
 

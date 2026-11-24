@@ -143,8 +143,58 @@ pub fn rfc3339(secs: u64) -> String {
     )
 }
 
-/// Quotes `arg` for a POSIX shell if it needs it.
+/// Rows as aligned columns separated by two spaces; the last column is not
+/// padded.
+pub fn render_table<const N: usize>(rows: &[[String; N]]) -> String {
+    let widths: Vec<usize> = (0..N)
+        .map(|i| rows.iter().map(|r| r[i].chars().count()).max().unwrap_or(0))
+        .collect();
+    rows.iter()
+        .map(|r| {
+            let mut line = String::new();
+            for (i, cell) in r.iter().enumerate() {
+                if i + 1 == N {
+                    line.push_str(cell);
+                } else {
+                    line.push_str(cell);
+                    line.push_str(&" ".repeat(widths[i] - cell.chars().count() + 2));
+                }
+            }
+            line.trim_end().to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Quotes `arg` for the shell agents and humans use here, if it needs it:
+/// POSIX `sh` quoting on macOS and Linux, PowerShell quoting on Windows
+/// (single quotes, `''` inside). In cmd.exe, use double quotes instead.
 pub fn shell_quote(arg: &str) -> String {
+    if cfg!(windows) {
+        powershell_quote(arg)
+    } else {
+        posix_quote(arg)
+    }
+}
+
+/// PowerShell: `{`, `}`, `,`, `@`, `$`, `;`, `(`, `)`, quotes, backticks and
+/// spaces are special, so anything beyond a small safe set is quoted.
+pub fn powershell_quote(arg: &str) -> String {
+    let safe = !arg.is_empty()
+        && !arg.starts_with('@')
+        && arg.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '-' | '_' | '.' | '/' | '\\' | ':' | '=' | '+' | '%')
+        });
+    if safe {
+        arg.to_string()
+    } else {
+        format!("'{}'", arg.replace('\'', "''"))
+    }
+}
+
+/// Quotes `arg` for a POSIX shell if it needs it.
+pub fn posix_quote(arg: &str) -> String {
     let safe = !arg.is_empty()
         && arg.chars().all(|c| {
             c.is_ascii_alphanumeric()
@@ -192,11 +242,33 @@ mod tests {
     }
 
     #[test]
-    fn shell_quote_only_when_needed() {
-        assert_eq!(shell_quote("--port"), "--port");
-        assert_eq!(shell_quote("{port}"), "{port}");
-        assert_eq!(shell_quote("a b"), "'a b'");
-        assert_eq!(shell_quote("it's"), r"'it'\''s'");
-        assert_eq!(shell_quote(""), "''");
+    fn posix_quote_only_when_needed() {
+        assert_eq!(posix_quote("--port"), "--port");
+        assert_eq!(posix_quote("{port}"), "{port}");
+        assert_eq!(posix_quote("a b"), "'a b'");
+        assert_eq!(posix_quote("it's"), r"'it'\''s'");
+        assert_eq!(posix_quote(""), "''");
+    }
+
+    #[test]
+    fn powershell_quote_only_when_needed() {
+        assert_eq!(powershell_quote("--port"), "--port");
+        assert_eq!(powershell_quote(r"C:\src\app"), r"C:\src\app");
+        // `{port}` would be a script block in PowerShell.
+        assert_eq!(powershell_quote("{port}"), "'{port}'");
+        assert_eq!(powershell_quote("a b"), "'a b'");
+        assert_eq!(powershell_quote("it's"), "'it''s'");
+        assert_eq!(powershell_quote("$x"), "'$x'");
+        assert_eq!(powershell_quote("@args"), "'@args'");
+        assert_eq!(powershell_quote(""), "''");
+    }
+
+    #[test]
+    fn tables_align_all_but_the_last_column() {
+        let t = render_table(&[
+            ["A".to_string(), "BB".to_string(), "x".to_string()],
+            ["CCC".to_string(), "D".to_string(), "".to_string()],
+        ]);
+        assert_eq!(t, "A    BB  x\nCCC  D");
     }
 }

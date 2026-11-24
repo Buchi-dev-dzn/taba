@@ -10,6 +10,15 @@ use std::time::Duration;
 /// What `stop` uses after the timeout (for messages).
 pub const KILL_SIGNAL: &str = "SIGKILL";
 
+/// `platform_action` values in `stop` results.
+pub const GRACEFUL_ACTION: &str = "sigterm";
+pub const KILL_ACTION: &str = "sigkill";
+
+/// Process group of `pid`.
+pub fn pgid(pid: i32) -> Option<i32> {
+    raw_info(pid).map(|r| r.pgid)
+}
+
 /// Reads kernel information about `pid`. Returns `None` if no such process
 /// is visible to the current user.
 pub fn info(pid: i32) -> Option<ProcInfo> {

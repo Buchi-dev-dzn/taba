@@ -116,8 +116,26 @@ pub fn all_pids() -> Vec<i32> {
         .collect()
 }
 
-/// Socket inodes listening on TCP `port` (IPv4 and IPv6).
-fn listening_inodes(port: u16) -> Vec<u64> {
+/// Decodes a `/proc/net/tcp{,6}` address (`0100007F` or 32 hex digits, each
+/// 32-bit word in host byte order).
+fn decode_addr(hex: &str) -> Option<String> {
+    let words: Vec<u32> = (0..hex.len() / 8)
+        .map(|i| u32::from_str_radix(&hex[i * 8..i * 8 + 8], 16).ok())
+        .collect::<Option<_>>()?;
+    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_ne_bytes()).collect();
+    Some(match bytes.len() {
+        4 => super::format_ip(std::net::IpAddr::from(
+            <[u8; 4]>::try_from(&bytes[..]).ok()?,
+        )),
+        16 => super::format_ip(std::net::IpAddr::from(
+            <[u8; 16]>::try_from(&bytes[..]).ok()?,
+        )),
+        _ => return None,
+    })
+}
+
+/// Listening sockets as (inode, address, port), IPv4 and IPv6.
+fn listening_sockets() -> Vec<(u64, String, u16)> {
     let mut out = Vec::new();
     for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
         let Ok(text) = fs::read_to_string(table) else {
@@ -128,46 +146,93 @@ fn listening_inodes(port: u16) -> Vec<u64> {
             if f.len() < 10 || f[3] != "0A" {
                 continue; // 0A = TCP_LISTEN
             }
-            let local_port = f[1]
-                .rsplit(':')
-                .next()
-                .and_then(|p| u16::from_str_radix(p, 16).ok());
-            if local_port == Some(port)
-                && let Ok(inode) = f[9].parse::<u64>()
-                && inode != 0
-            {
-                out.push(inode);
+            let Some((addr, port)) = f[1].split_once(':') else {
+                continue;
+            };
+            let (Ok(port), Some(addr), Ok(inode)) = (
+                u16::from_str_radix(port, 16),
+                decode_addr(addr),
+                f[9].parse::<u64>(),
+            ) else {
+                continue;
+            };
+            if inode != 0 {
+                out.push((inode, addr, port));
             }
         }
     }
     out
 }
 
-/// Pids listening on TCP `port`, with their command names. Only processes
-/// whose `/proc/PID/fd` this user can read are found (as with lsof).
-pub fn listeners(port: u16) -> Vec<super::Listener> {
-    let inodes = listening_inodes(port);
-    if inodes.is_empty() {
-        return Vec::new();
-    }
-    let wanted: Vec<String> = inodes.iter().map(|i| format!("socket:[{i}]")).collect();
+/// Maps socket inodes to the pids holding them. Only processes whose
+/// `/proc/PID/fd` this user can read are found (as with lsof).
+fn socket_owners(inodes: &[u64]) -> Vec<(u64, i32)> {
     let mut res = Vec::new();
+    if inodes.is_empty() {
+        return res;
+    }
     for pid in all_pids() {
         let Ok(fds) = fs::read_dir(format!("/proc/{pid}/fd")) else {
             continue;
         };
-        let holds = fds.flatten().any(|fd| {
-            fs::read_link(fd.path())
-                .is_ok_and(|l| wanted.iter().any(|w| l.as_os_str() == w.as_str()))
-        });
-        if holds {
-            let comm = fs::read_to_string(format!("/proc/{pid}/comm"))
-                .map(|c| c.trim_end().to_string())
-                .unwrap_or_default();
-            res.push((pid, comm));
+        for fd in fds.flatten() {
+            let Ok(link) = fs::read_link(fd.path()) else {
+                continue;
+            };
+            let link = link.to_string_lossy();
+            if let Some(inode) = link
+                .strip_prefix("socket:[")
+                .and_then(|r| r.strip_suffix(']'))
+                .and_then(|i| i.parse::<u64>().ok())
+                && inodes.contains(&inode)
+                && !res.contains(&(inode, pid))
+            {
+                res.push((inode, pid));
+            }
         }
     }
     res
+}
+
+fn comm(pid: i32) -> String {
+    fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map(|c| c.trim_end().to_string())
+        .unwrap_or_default()
+}
+
+/// Pids listening on TCP `port`, with their command names.
+pub fn listeners(port: u16) -> Vec<super::Listener> {
+    let inodes: Vec<u64> = listening_sockets()
+        .into_iter()
+        .filter(|s| s.2 == port)
+        .map(|s| s.0)
+        .collect();
+    let mut pids: Vec<i32> = socket_owners(&inodes).into_iter().map(|o| o.1).collect();
+    pids.dedup();
+    pids.into_iter().map(|p| (p, comm(p))).collect()
+}
+
+/// Every TCP socket in LISTEN state held by a process of the current user.
+pub fn all_listeners() -> Vec<super::Socket> {
+    let sockets = listening_sockets();
+    let inodes: Vec<u64> = sockets.iter().map(|s| s.0).collect();
+    let owners = socket_owners(&inodes);
+    let mut res = Vec::new();
+    for (inode, address, port) in sockets {
+        for (_, pid) in owners.iter().filter(|o| o.0 == inode) {
+            res.push(super::Socket {
+                port,
+                address: address.clone(),
+                pid: *pid,
+            });
+        }
+    }
+    res
+}
+
+/// Current working directory of `pid`.
+pub fn cwd(pid: i32) -> Option<std::path::PathBuf> {
+    fs::read_link(format!("/proc/{pid}/cwd")).ok()
 }
 
 #[cfg(test)]

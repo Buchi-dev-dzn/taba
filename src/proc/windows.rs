@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 use windows_sys::Wdk::System::Threading::{
-    NtQueryInformationProcess, ProcessCommandLineInformation,
+    NtQueryInformationProcess, ProcessBasicInformation, ProcessCommandLineInformation,
 };
 use windows_sys::Win32::Foundation::{
     CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS,
@@ -40,6 +40,9 @@ use windows_sys::Win32::NetworkManagement::IpHelper::{
     GetExtendedTcpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCPROW_OWNER_PID, TCP_TABLE_OWNER_PID_LISTENER,
 };
 use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
+use windows_sys::Win32::Security::{
+    EqualSid, GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser,
+};
 use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
 use windows_sys::Win32::System::Console::{
     AttachConsole, CTRL_BREAK_EVENT, FreeConsole, GenerateConsoleCtrlEvent, SetConsoleCtrlHandler,
@@ -47,6 +50,7 @@ use windows_sys::Win32::System::Console::{
 use windows_sys::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
+use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
     TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
@@ -57,15 +61,24 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::Threading::{
     CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_SUSPENDED,
-    GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, OpenProcess, OpenThread,
-    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
-    QueryFullProcessImageNameW, ResumeThread, THREAD_SUSPEND_RESUME, TerminateProcess,
-    WaitForSingleObject,
+    GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, IsWow64Process, OpenProcess,
+    OpenProcessToken, OpenThread, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_TERMINATE, PROCESS_VM_READ, QueryFullProcessImageNameW, ResumeThread,
+    THREAD_SUSPEND_RESUME, TerminateProcess, WaitForSingleObject,
 };
 use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
 /// What `stop` uses after the timeout (for messages).
 pub const KILL_SIGNAL: &str = "forced termination";
+
+/// `platform_action` values in `stop` results (JSON keeps `TERM` / `KILL`).
+pub const GRACEFUL_ACTION: &str = "ctrl_break";
+pub const KILL_ACTION: &str = "terminate_job_object";
+
+/// Process group of `pid`: Windows has none beyond the service's job.
+pub fn pgid(_pid: i32) -> Option<i32> {
+    None
+}
 
 // Job object access rights (winnt.h).
 const JOB_OBJECT_QUERY: u32 = 0x0004;
@@ -199,18 +212,18 @@ fn image_name(pid: i32) -> Option<String> {
     path.file_name().map(|n| n.to_string_lossy().into_owned())
 }
 
-/// Pids listening on TCP `port` (IPv4 and IPv6), with their image names.
-pub fn listeners(port: u16) -> Vec<Listener> {
-    let mut pids: Vec<i32> = Vec::new();
+/// Every listening TCP socket on the machine (IPv4 and IPv6), any user.
+fn listener_rows() -> Vec<super::Socket> {
+    let mut out = Vec::new();
     for af in [AF_INET, AF_INET6] {
         let Some(table) = tcp_listener_table(af) else {
             continue;
         };
         let count = u32::from_ne_bytes(table[..4].try_into().unwrap()) as usize;
-        let (row_size, port_at, pid_at) = if af == AF_INET {
-            (std::mem::size_of::<MIB_TCPROW_OWNER_PID>(), 8, 20)
+        let row_size = if af == AF_INET {
+            std::mem::size_of::<MIB_TCPROW_OWNER_PID>()
         } else {
-            (std::mem::size_of::<MIB_TCP6ROW_OWNER_PID>(), 20, 52)
+            std::mem::size_of::<MIB_TCP6ROW_OWNER_PID>()
         };
         for i in 0..count {
             let row = 4 + i * row_size;
@@ -219,16 +232,168 @@ pub fn listeners(port: u16) -> Vec<Listener> {
             };
             let field = |at: usize| u32::from_ne_bytes(r[at..at + 4].try_into().unwrap());
             // dwLocalPort holds the port in network byte order.
-            let p = u16::from_be((field(port_at) & 0xffff) as u16);
-            let pid = field(pid_at) as i32;
-            if p == port && !pids.contains(&pid) {
-                pids.push(pid);
-            }
+            let (ip, port_at, pid_at) = if af == AF_INET {
+                let a: [u8; 4] = r[4..8].try_into().unwrap();
+                (std::net::IpAddr::from(a), 8, 20)
+            } else {
+                let a: [u8; 16] = r[0..16].try_into().unwrap();
+                (std::net::IpAddr::from(a), 20, 52)
+            };
+            out.push(super::Socket {
+                port: u16::from_be((field(port_at) & 0xffff) as u16),
+                address: super::format_ip(ip),
+                pid: field(pid_at) as i32,
+            });
+        }
+    }
+    out
+}
+
+/// Pids listening on TCP `port` (IPv4 and IPv6), with their image names.
+pub fn listeners(port: u16) -> Vec<Listener> {
+    let mut pids: Vec<i32> = Vec::new();
+    for s in listener_rows() {
+        if s.port == port && !pids.contains(&s.pid) {
+            pids.push(s.pid);
         }
     }
     pids.into_iter()
         .map(|pid| (pid, image_name(pid).unwrap_or_else(|| format!("pid {pid}"))))
         .collect()
+}
+
+/// Every listening TCP socket held by a process of the current user.
+pub fn all_listeners() -> Vec<super::Socket> {
+    let mut mine: Vec<(i32, bool)> = Vec::new();
+    let mut out = Vec::new();
+    for s in listener_rows() {
+        let ok = match mine.iter().find(|m| m.0 == s.pid) {
+            Some(m) => m.1,
+            None => {
+                let ok = same_user(s.pid);
+                mine.push((s.pid, ok));
+                ok
+            }
+        };
+        if ok && !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    out
+}
+
+fn token_user(process: HANDLE) -> Option<Vec<u64>> {
+    let mut token: HANDLE = std::ptr::null_mut();
+    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
+        return None;
+    }
+    let token = Handle(token);
+    let mut buf: Vec<u64> = vec![0; 64];
+    let mut len = 0u32;
+    let ok = unsafe {
+        GetTokenInformation(
+            token.0,
+            TokenUser,
+            buf.as_mut_ptr().cast(),
+            (buf.len() * 8) as u32,
+            &mut len,
+        )
+    };
+    (ok != 0).then_some(buf)
+}
+
+/// Whether `pid` runs as the same user as taba.
+fn same_user(pid: i32) -> bool {
+    let Some(h) = open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION) else {
+        return false;
+    };
+    let (Some(theirs), Some(ours)) = (token_user(h.0), token_user(unsafe { GetCurrentProcess() }))
+    else {
+        return false;
+    };
+    let sid = |b: &Vec<u64>| unsafe { (*(b.as_ptr() as *const TOKEN_USER)).User.Sid };
+    unsafe { EqualSid(sid(&theirs), sid(&ours)) != 0 }
+}
+
+/// Current working directory of `pid`, read from its process parameters
+/// (PEB). Only for 64-bit processes; `None` otherwise or without access.
+pub fn cwd(pid: i32) -> Option<PathBuf> {
+    let h = open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ)?;
+    let mut wow64 = 0;
+    if unsafe { IsWow64Process(h.0, &mut wow64) } == 0 || wow64 != 0 {
+        return None;
+    }
+    // PROCESS_BASIC_INFORMATION (winternl.h).
+    #[repr(C)]
+    struct BasicInfo {
+        exit_status: i32,
+        peb: *mut core::ffi::c_void,
+        affinity: usize,
+        priority: i32,
+        pid: usize,
+        parent: usize,
+    }
+    let mut pbi: BasicInfo = unsafe { std::mem::zeroed() };
+    let mut len = 0u32;
+    let status = unsafe {
+        NtQueryInformationProcess(
+            h.0,
+            ProcessBasicInformation,
+            (&raw mut pbi).cast(),
+            std::mem::size_of::<BasicInfo>() as u32,
+            &mut len,
+        )
+    };
+    if status < 0 || pbi.peb.is_null() {
+        return None;
+    }
+    let read = |addr: usize, buf: &mut [u8]| -> bool {
+        let mut got = 0usize;
+        unsafe {
+            ReadProcessMemory(
+                h.0,
+                addr as *const _,
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                &mut got,
+            ) != 0
+                && got == buf.len()
+        }
+    };
+    // PEB.ProcessParameters at 0x20; RTL_USER_PROCESS_PARAMETERS.CurrentDirectory.DosPath
+    // (a UNICODE_STRING: u16 length, u16 max, 4 bytes padding, u64 buffer) at 0x38.
+    let mut word = [0u8; 8];
+    if !read(pbi.peb as usize + 0x20, &mut word) {
+        return None;
+    }
+    let params = u64::from_ne_bytes(word) as usize;
+    let mut us = [0u8; 16];
+    if params == 0 || !read(params + 0x38, &mut us) {
+        return None;
+    }
+    let length = u16::from_ne_bytes([us[0], us[1]]) as usize;
+    let buffer = u64::from_ne_bytes(us[8..16].try_into().unwrap()) as usize;
+    if length == 0 || buffer == 0 || length > 65_534 {
+        return None;
+    }
+    let mut raw = vec![0u8; length];
+    if !read(buffer, &mut raw) {
+        return None;
+    }
+    let wide: Vec<u16> = raw
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_ne_bytes(*c))
+        .collect();
+    let s = OsString::from_wide(&wide).to_string_lossy().into_owned();
+    // The current directory keeps a trailing backslash (`C:\src\`).
+    let trimmed = if s.len() > 3 {
+        s.trim_end_matches('\\')
+    } else {
+        &s
+    };
+    Some(PathBuf::from(trimmed))
 }
 
 fn tcp_listener_table(af: u16) -> Option<Vec<u8>> {

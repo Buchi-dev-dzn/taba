@@ -1772,6 +1772,34 @@ holds the other way round for taba inside WSL in mirrored mode.
 3. `ps --all` signals nothing and writes nothing (the `TABA_HOME` mtime is
    unchanged).
 
+#### M2 implementation notes
+
+- `ps --json` is now an envelope like every other command:
+  `{"ok": true, "services": [...], "warnings": []}`. The rows keep every
+  v0.1 field. This changes the v0.1 output (a bare array); the v0.1 and M1
+  tests read `services` now.
+- `logs --json` returns `{"ok": true, "service", "log_path", "log"}` with
+  the whole log as text. `logs -f` streams raw text, so `-f --json` is
+  `E_USAGE`, and `TABA_OUTPUT=json` does not apply to `-f`.
+- `rm --json` reports `results` like `stop` (`removed`, or `refused` with
+  the error).
+- `stop` results keep `"signal": "TERM"` / `"KILL"` on every platform and
+  add `platform_action`: `sigterm` / `sigkill` on macOS and Linux,
+  `ctrl_break` / `terminate_job_object` on Windows (owner decision, M2).
+- Commands in `next` are quoted for the platform's shell: POSIX `sh` on
+  macOS and Linux, PowerShell on Windows (single quotes, `''` inside;
+  `{port}` is quoted because PowerShell would read it as a script block).
+  In cmd.exe, use double quotes instead (owner decision, M2).
+- `ps --all` lists listeners with `lsof -a -u UID -iTCP -sTCP:LISTEN` and
+  each process's directory with `lsof -d cwd` on macOS, `/proc/net/tcp{,6}`
+  and `/proc/PID/cwd` on Linux, and `GetExtendedTcpTable` with the
+  process's token user and a PEB read of its current directory on Windows
+  (64-bit processes; others show `directory: null`). `pgid` is `null` on
+  Windows. `holder` and `lease` are added in M3. `managed` matches the
+  pid to a verified record through the service's process group (Windows:
+  its job). It opens the state read-only and renews nothing.
+- `ps --all` shows `W_NO_LSOF` when `lsof` is missing on macOS.
+
 ### M3: agents, leases and gc
 
 1. `TABA_AGENT=a1` with `TABA_AGENT_PID` set to a live `sleep` starts a
