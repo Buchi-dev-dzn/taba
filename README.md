@@ -66,6 +66,55 @@ cd taba
 cargo install --locked --path .
 ```
 
+### Updating
+
+`taba update --check` asks the official
+[GitHub Releases](https://github.com/Buchi-dev-dzn/taba/releases) of
+`Buchi-dev-dzn/taba` whether a newer stable version exists, and changes
+nothing. `taba update` does the same and, only where it can prove the install
+is an official standalone archive install, replaces the binary. taba never
+checks for updates on its own, and both commands leave services and state
+alone.
+
+- **What counts as newer:** the highest stable SemVer release strictly above
+  the running version. Drafts, GitHub prereleases and SemVer prereleases such
+  as `v0.3.0-rc.1` are ignored.
+- **Where it downloads from:** the GitHub API and
+  `github.com/Buchi-dev-dzn/taba/releases/download/...`, with one redirect
+  allowed only to GitHub's release-asset hosts. Proxy settings are not used.
+  Metadata, `SHA256SUMS` and archives have fixed size limits, and so does
+  decompression.
+- **What is checked:** the archive for the running build's target triple
+  (the names in the table above) must be listed exactly once in that
+  release's `SHA256SUMS` and match it. It must contain exactly `taba`,
+  `LICENSE` and `README.md` as regular files with plain names, and `taba` must
+  be an ELF executable for the expected CPU. The downloaded binary is never
+  run.
+- **When it replaces the binary (Linux x86_64 and arm64 only):** the running
+  `taba` must be byte-identical to the `taba` in the official archive of the
+  running version, verified the same way. It and its directory must be owned by
+  you (taba must not run as root). The binary must have no other hard links,
+  neither may be group- or world-writable, and it must not live under a package manager, Cargo (`~/.cargo/bin`), Homebrew, Nix, Snap,
+  a version manager or a `target/` build directory. The new file is written
+  next to the old one, synced, and renamed over it atomically. Until that
+  rename succeeds the old binary is untouched, and a concurrent
+  `taba update` is refused. Running services keep running; the next `taba`
+  command uses the new version. If the rename succeeds, there is no copy of
+  the old version to roll back to: download it again from GitHub Releases.
+- **Everywhere else, `taba update` only reports the new version** and points
+  you to a manual upgrade (status `manual_update`). That covers Cargo and
+  source builds (`cargo install ...` again), package-manager installs, and
+  macOS, where self-replacement has not been tested. On Windows, `taba update`
+  is check-only: taba does not replace its own running `.exe`. To upgrade on
+  Windows, wait for running `taba` commands to finish, then replace `taba.exe`
+  with the one from the verified archive. Running services do not use
+  `taba.exe`.
+
+`SHA256SUMS` comes from the same GitHub release as the archive. It detects
+corrupted or swapped downloads, but it is not an independent signature:
+anyone who can change the release can change both. taba relies on HTTPS to
+GitHub and on the security of the repository for authenticity.
+
 ## Quick start
 
 **Start services**, each owned by a scope and a name. `run` returns right away,
@@ -390,6 +439,8 @@ that. Measurements against Docker are in [docs/benchmarks.md](docs/benchmarks.md
 | `taba stop ... --force --reason TEXT` | Stop a service of another scope; recorded in `events.jsonl`. |
 | `taba rm S/N` (or `N` in your scope) | Delete a stopped service's record and log. Refuses a running service, and another scope's service without `--force --reason`. |
 | `taba rm --scope S` | Delete the records and logs of every stopped service in scope `S`; running ones are kept and reported. |
+| `taba update --check [--json]` | Report whether a newer stable release exists on official GitHub Releases. Read-only. |
+| `taba update [--json]` | Check, then replace an eligible official standalone Linux install. Otherwise, report the manual upgrade path. See [Updating](#updating). |
 
 `--ready` is `tcp` (default when there is a port), `http:PATH` or
 `log:REGEX`, and needs `--wait`. `--agent NAME` on `run`, `stop`, `rm` and
@@ -425,6 +476,10 @@ single quotes). The exit status follows the code:
 | `E_NOT_READY` | 4 | `--wait` timed out; the process is still running. |
 | `E_NOT_FOUND` | 5 | No such service. |
 | `E_STATE`, `E_SIGNAL_FAILED` | 1 | State directory unreadable or too new; a signal failed. |
+| `E_UPDATE_FAILED` | 1 | `taba update` could not reach, read or verify the release. The installed binary is unchanged. |
+
+`taba update --json` reports `status`: `up_to_date`, `update_available`
+(with `--check`), `updated`, or `manual_update` with a `reason`.
 
 `stop --scope` reports each service in `results` (`stopped`, `killed`,
 `not_running`, or `refused` with its error) and exits 3 if any was refused.
@@ -565,6 +620,10 @@ taba is an early prototype:
   `taba stop --scope S` acts as `S`. The rules prevent accidents between
   cooperating agents, not deliberate misuse. Agent leases, which tell a live
   holder of a scope from its successor, come in a later milestone.
+- **Self-update is limited.** `taba update` replaces the binary only for
+  official standalone Linux installs. It is check-only on Windows and macOS,
+  and release checksums are not independent signatures; see
+  [Updating](#updating).
 
 ## Roadmap
 
