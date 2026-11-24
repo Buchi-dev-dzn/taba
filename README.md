@@ -1,79 +1,212 @@
 # taba
 
-Start, list and stop local processes (dev servers and the like), bundled by
-work scope. Docker-style `run / ps / logs / stop`, without containers.
-macOS only, single binary, no daemon. See [docs/plan.md](docs/plan.md) for
-the design.
+**Bundle what you start, per task.** *taba* (束) is Japanese for "bundle".
 
-## Build
+![platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey)
+![language: Rust](https://img.shields.io/badge/language-Rust-orange)
+![status: prototype](https://img.shields.io/badge/status-prototype-yellow)
+
+`taba` starts, lists and stops local processes such as dev servers, grouped by
+the task they belong to. It gives you Docker-style `run / ps / logs / stop`
+without containers. It's one binary, with no daemon and no config file.
+
+![taba ps showing three services in two scopes, login-fix and billing](docs/images/ps.svg)
+
+## The problem
+
+When you work with AI coding agents and several terminals, `localhost` ports
+pile up. One task alone can leave three servers running. A few hours later,
+nobody knows what is on `:5173`, which checkout it runs from, or whether it is
+safe to kill. `taba` records the owner (a named **scope**) when a process
+starts, so anyone can later see what belongs to which task and stop exactly
+that task's processes.
+
+## Install
+
+`taba` is built from source with Rust and runs on macOS only. It has no
+Homebrew formula or crates.io release yet.
 
 ```sh
-cargo build --release      # binary at target/release/taba
-cargo test                 # integration tests (need python3)
+git clone <this repo> taba && cd taba
+cargo install --path .        # installs `taba` into ~/.cargo/bin
 ```
 
-## Usage
+## Quick start
+
+**Start services**, each owned by a scope and a name. `run` returns right away,
+and the process keeps running after you close the terminal. Running the same
+command a second time reuses the service that is already running and does not
+start a copy.
 
 ```sh
-# Start a command detached, owned by scope "login-fix", named "web".
-# --port is only declared/tracked; pass the port to your command yourself.
 taba run --scope login-fix --name web --port 5173 -- npm run dev -- --port 5173 --strictPort
-
-taba ps                      # SERVICE / STATUS / URL / DIRECTORY
-taba ps --scope login-fix    # only one scope
-taba ps --json               # all fields, machine readable
-
-taba logs login-fix/web      # print the log
-taba logs login-fix/web -f   # follow until the service exits
-
-taba stop login-fix/web      # stop one service
-taba stop --scope login-fix  # stop every service in a scope
 ```
 
-`--scope` falls back to `$TABA_SCOPE` for `run`, and for `logs` / `stop` when
-the target is given as a bare `NAME`. `ps` lists every scope unless
-`--scope` is passed. `stop` with no target needs an explicit `--scope`.
+![taba run starting services in two checkouts, then re-running one](docs/images/run.svg)
 
-## Behaviour
+> `--port` only tells taba which port to track. Pass the port to your own
+> command as well.
 
-- **Detached:** the command runs in a new session / process group
-  (`setsid`) with stdin from `/dev/null` and stdout+stderr appended to the
-  log, so closing the launching terminal does not stop it. No supervisor
-  process is used.
-- **Idempotent run:** the same scope + name + command + directory (+ port)
-  that is still running prints the existing entry and starts nothing. The
-  same name with a different command, directory or port is an error while
-  the old one is running. An *exited* entry is replaced by a new `run`.
-- **Ports:** if the declared port is claimed by another running taba
-  service, or anything is already listening on it, `run` fails, names the
-  owning taba service (or the unmanaged pid/command found via `lsof`), and
-  starts nothing.
-- **Safe stop:** taba only signals process groups it started, and only if
-  the recorded identity still matches: the leader pid with its exact start
-  time, or (if the leader has exited) a surviving group whose members all
-  started after the recorded start time. It sends SIGTERM to the group,
-  then SIGKILL after `--timeout` seconds (default 5). Unmanaged processes are
-  never signalled. Stopping never deletes files; logs and records stay.
-- **Status:** `ps` shows `running` or `exited` (dead, or identity no longer
-  matches).
+**See what is running**, across every scope or for a single one:
 
-## State
+```sh
+taba ps                     # SERVICE / STATUS / URL / DIRECTORY
+taba ps --scope billing     # one scope only
+taba ps --json              # every field, for scripts and agents
+```
 
-Everything lives under `~/.taba` (override with `TABA_HOME`):
+**Port conflicts are reported before anything starts.** If the port is in use,
+taba names the owner and starts nothing:
+
+![taba run refusing ports held by another taba service and by an unmanaged process](docs/images/port-conflict.svg)
+
+**Read logs.** stdout and stderr go to one log file per service:
+
+```sh
+taba logs billing/web       # print the log
+taba logs billing/web -f    # follow it until the service exits
+```
+
+![taba logs printing a service's log](docs/images/logs.svg)
+
+**Stop one service, or a whole task at once.** Services in other scopes keep
+running:
+
+```sh
+taba stop billing/web
+taba stop --scope billing
+```
+
+![taba stop --scope billing stops two services and leaves login-fix running](docs/images/stop-scope.svg)
+
+The screenshots show real output from `scripts/readme-screenshots.sh`, which
+runs `python3 -m http.server` sample services under a throwaway `TABA_HOME`.
+
+## Use with AI agents
+
+taba is meant for AI coding agents as much as for people:
+
+- **Set `TABA_SCOPE` once per task.** `run` uses it when `--scope` is omitted.
+  `logs` and `stop` use it when you give a bare `NAME` instead of `SCOPE/NAME`.
+  `stop` with no target always needs an explicit `--scope`.
+- **Use `taba ps --json`** to find a service that is already running before
+  starting another, and to read its URL, directory, pid and log path:
+
+  ```console
+  $ taba ps --scope login-fix --json
+  [
+    {
+      "command": [
+        "python3",
+        "-u",
+        "-m",
+        "http.server",
+        "8001"
+      ],
+      "directory": "/Users/Shared/demo/shop-login-fix",
+      "log_path": "/Users/Shared/demo/taba-home/logs/login-fix/web.log",
+      "name": "web",
+      "pgid": 20081,
+      "pid": 20081,
+      "port": 8001,
+      "scope": "login-fix",
+      "service": "login-fix/web",
+      "start_time": 1795501198411910,
+      "status": "running",
+      "url": "http://localhost:8001"
+    }
+  ]
+  ```
+- Each started process gets `TABA_SCOPE` and `TABA_SERVICE` in its environment.
+
+### AGENTS.md / CLAUDE.md snippet
+
+Paste this into `AGENTS.md` or `CLAUDE.md`:
+
+```markdown
+## Long-running processes (dev servers, watchers, databases)
+
+- Start them with `taba run --scope <task> --name <name> --port <port> -- <cmd>`,
+  never with `&` or `nohup`. Pass the same port to the command itself.
+- Use one scope per task or branch (or `$TABA_SCOPE` if set).
+- Before starting, run `taba ps --scope <task> --json` and reuse a service that
+  is already running.
+- If a port is taken, do not kill the other process. Pick another port or ask.
+- Read output with `taba logs <task>/<name>`.
+- Stop only your own scope: `taba stop --scope <task>`. Never stop other
+  scopes or processes taba didn't start.
+- At hand-off, report each service's name and URL, and say whether you left
+  it running or stopped it.
+```
+
+## Ownership model
+
+- **A scope owns its processes.** The owner is a named task, not the terminal
+  or agent that started the process. Ownership survives closing the terminal.
+- **taba stops only what it started and can still verify.** A service is
+  signalled only if its identity still matches: the leader pid with its exact
+  start time or, if the leader has exited, a surviving process group whose
+  members all started after the recorded time. taba sends SIGTERM to the
+  group, then SIGKILL after `--timeout` seconds (default 5).
+- **Unmanaged processes are never touched.** A process taba didn't start, or
+  one it can no longer verify, is reported, never signalled.
+- **taba never deletes files.** Stopping a service leaves its record and log in
+  place.
+- **`run` is idempotent.** The same scope, name, command, directory and port
+  returns the service that is already running. The same name with different
+  settings is an error while the old service runs.
+
+## Reference
+
+### Commands
+
+| Command | What it does |
+| --- | --- |
+| `taba run [--scope S] --name N [--port P] -- CMD...` | Start `CMD` detached as service `S/N`, in its own process group, with output appended to its log. |
+| `taba ps [--scope S] [--json]` | List services with status `running` or `exited`, plus URL and directory. |
+| `taba logs [-f] S/N` (or `N` with `$TABA_SCOPE`) | Print the log. Add `-f` to follow it until the service exits. |
+| `taba stop S/N` (or `N` with `--scope` / `$TABA_SCOPE`) | Stop one service. |
+| `taba stop --scope S` | Stop every service in scope `S`. |
+| `taba stop ... --timeout SECS` | Seconds to wait between SIGTERM and SIGKILL (default 5). |
+
+Run `taba <command> --help` to see all flags.
+
+### Environment variables
+
+| Variable | Meaning |
+| --- | --- |
+| `TABA_SCOPE` | Default scope for `run`, and for `logs` / `stop` when the target is a bare `NAME`. |
+| `TABA_HOME` | State directory (default `~/.taba`). |
+| `TABA_SCOPE`, `TABA_SERVICE` | Set *inside* each started process, so it knows its own scope and service. |
+
+### State and logs
 
 ```text
-services/<scope>/<name>.json   scope, name, command, cwd, port, pid, pgid, start time, log path
-logs/<scope>/<name>.log        stdout + stderr (appended across runs)
-lock                           flock for concurrent `run`s
+$TABA_HOME (default ~/.taba)
+├── services/<scope>/<name>.json   # command, directory, port, pid, pgid, start time, log path
+├── logs/<scope>/<name>.log        # stdout + stderr, appended across runs
+└── lock                           # serialises concurrent `run`s
 ```
 
-The child also gets `TABA_SCOPE` and `TABA_SERVICE` in its environment.
+## Limitations
 
-## Limitations (prototype)
+taba is an early prototype:
 
-- macOS only (uses `proc_pidinfo` / `proc_listallpids`).
-- Port detection checks loopback (IPv4/IPv6) connects and a wildcard bind;
-  a server bound only to a non-loopback address may go unnoticed.
-- No command to delete exited records or rotate logs yet.
-- If the started command moves its children into a different process group
-  or session, those children are not tracked or stopped.
+- **macOS only.** It uses `proc_pidinfo` / `proc_listallpids`.
+- **Port detection is partial.** taba checks loopback (IPv4/IPv6) connects and
+  a wildcard bind. A server bound only to a non-loopback address may go
+  unnoticed.
+- **Exited entries are replaced on re-run.** A new `run` with the same
+  scope/name overwrites the record of an exited service. The log is appended.
+- **Some children are not tracked.** Children that move into a different
+  process group or session are not tracked, and `stop` won't reach them.
+- **No prune command.** Nothing removes exited records or rotates logs yet.
+
+## Roadmap
+
+- `prune` for exited records and old logs
+- Linux support
+- Better port detection (non-loopback binds)
+- Prebuilt binaries and a Homebrew formula
+
+See [docs/plan.md](docs/plan.md) for the design notes.

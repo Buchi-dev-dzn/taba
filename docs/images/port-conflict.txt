@@ -1,0 +1,4 @@
+$ taba run --scope billing --name admin --port 8001 -- python3 -u -m http.server 8001
+taba: port 8001 is already claimed by taba service login-fix/web (/Users/Shared/demo/shop-login-fix)
+$ taba run --scope billing --name admin --port 9000 -- python3 -u -m http.server 9000
+taba: port 9000 is in use by pid 20099 (Python), which is not managed by taba
