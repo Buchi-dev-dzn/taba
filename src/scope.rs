@@ -34,6 +34,7 @@ pub struct Caller {
     pub branch: Option<String>,
     /// `--agent`, else `$TABA_AGENT`, else `human`.
     pub agent: String,
+    pub agent_pid: Option<(i32, u64)>,
     pub cwd: PathBuf,
 }
 
@@ -88,6 +89,9 @@ pub fn resolve(scope_flag: Option<String>, agent_flag: Option<String>) -> Result
         source,
         worktree,
         branch,
+        agent_pid: (agent != "human")
+            .then(crate::lease::agent_pid_from_env)
+            .flatten(),
         agent,
         cwd,
     })

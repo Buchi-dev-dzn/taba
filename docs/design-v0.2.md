@@ -1850,6 +1850,21 @@ holds the other way round for taba inside WSL in mirrored mode.
     `stop` of a claimed but unborrowed service succeeds and discards the
     claims.
 
+#### M3 implementation notes
+
+- A live lease checks both the agent name and a recorded PID/start-time pair.
+  Without a PID it checks the name only. Both are still self-reported, not
+  credentials. `--scope` alone does not let a caller impersonate the holder.
+- TTL expires even if the agent process is still alive. The lease tests
+  exercise this with a live fixture process; they do not establish whether
+  any real harness exits at a usage-limit prompt.
+- If a PID has disappeared, grace starts when taba first observes its absence;
+  the OS may no longer know the process's exact exit time. After a TTL expiry
+  or explicit lease end, grace starts at the recorded time.
+- Cross-scope `stop` and `rm` still require `--force --reason`; use `gc` for
+  expired services. The v0.1 test fixture continues to pass the owning scope
+  explicitly (decision 4), and M1's audit assertion now filters force events.
+
 ### M4: borrows and lifetimes
 
 Setup: `wt-a` runs `db` (a third throwaway worktree, `wt-c`, is used as a

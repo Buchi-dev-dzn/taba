@@ -373,6 +373,27 @@ single quotes). The exit status follows the code:
 `stop --scope` reports each service in `results` (`stopped`, `killed`,
 `not_running`, or `refused` with its error) and exits 3 if any was refused.
 
+### Agent leases and cleanup
+
+Set `TABA_AGENT` to a distinct session name and `TABA_AGENT_PID` to the
+long-lived agent's PID, then run `taba whoami`. A live holder prevents other
+agents from mutating the scope, even if they pass its name with `--scope`.
+If the holder exits, ends its lease, or passes its TTL, the next caller in
+that scope can take over without restarting services. These identifiers
+prevent accidents; they are not credentials.
+
+- `taba renew [--ttl DURATION]` renews the lease. The default is `4h` for
+  agents and `none` for humans; `--ttl`, `TABA_TTL`, and `lease_ttl` in
+  `$TABA_HOME/config.toml` override the default in that order.
+- `taba lease end` marks the caller's leases expired without stopping anything.
+- `taba claim S/N` queues for another scope's service; `--cancel` withdraws
+  the claim. `taba disown S/N` hands it to the first eligible claimant now.
+- `taba gc --dry-run` previews cleanup. `taba gc` hands over claimed services
+  after `claim_grace` and drops unclaimed expired services after `gc_grace`.
+  `run` and `whoami` also perform bounded cleanup outside the caller's scope.
+- `run --service-ttl DURATION` sets an independent service timeout.
+  `taba keep --reason TEXT` pins the scope; `taba keep --off` clears it.
+
 ### Environment variables
 
 | Variable | Meaning |

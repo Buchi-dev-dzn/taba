@@ -122,6 +122,34 @@ pub fn rfc3339_now() -> String {
     rfc3339(now_micros() / 1_000_000)
 }
 
+pub fn now_secs() -> u64 {
+    now_micros() / 1_000_000
+}
+
+/// Parses the UTC form taba writes (`2026-11-24T10:02:11Z`) into seconds
+/// since the Unix epoch.
+pub fn parse_rfc3339(s: &str) -> Option<u64> {
+    let b = s.as_bytes();
+    if b.len() != 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[19] != b'Z' {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
+    let (y, m, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (hh, mm, ss) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || hh > 23 || mm > 59 || ss > 60 {
+        return None;
+    }
+    // Days from civil date (Howard Hinnant's algorithm).
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86_400 + hh * 3600 + mm * 60 + ss).ok()
+}
+
 pub fn rfc3339(secs: u64) -> String {
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
@@ -239,6 +267,11 @@ mod tests {
         assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
         assert_eq!(rfc3339(951_782_400), "2000-02-29T00:00:00Z");
         assert_eq!(rfc3339(1_795_502_011), "2026-11-24T06:33:31Z");
+        for t in [0, 951_782_400, 1_795_502_011, 4_102_444_799] {
+            assert_eq!(parse_rfc3339(&rfc3339(t)), Some(t));
+        }
+        assert_eq!(parse_rfc3339("2026-13-01T00:00:00Z"), None);
+        assert_eq!(parse_rfc3339("soon"), None);
     }
 
     #[test]
