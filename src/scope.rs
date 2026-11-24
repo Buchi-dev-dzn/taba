@@ -67,6 +67,14 @@ pub fn resolve(scope_flag: Option<String>, agent_flag: Option<String>) -> Result
     let cwd = std::env::current_dir()
         .and_then(|d| crate::util::canonicalize(&d))
         .map_err(|e| TabaError::state(format!("cannot resolve current directory: {e}")))?;
+    resolve_at(cwd, scope_flag, agent_flag)
+}
+
+pub fn resolve_at(
+    cwd: PathBuf,
+    scope_flag: Option<String>,
+    agent_flag: Option<String>,
+) -> Result<Caller> {
     let agent = resolve_agent(agent_flag)?;
     let worktree = find_worktree(&cwd);
     let branch = worktree.as_deref().and_then(read_branch);

@@ -1475,9 +1475,12 @@ Codex documents a `PreToolUse` event with matcher `Bash`, `tool_input.command`
 in stdin, and blocking by exit code 2 or
 `hookSpecificOutput.permissionDecision: "deny"`. That is the same shape as
 Claude Code, so `taba hook codex pre-tool-use` shares the implementation and
-differs only in identity (`codex:<session_id>`). Whether Codex honours
-`permissionDecision: "ask"` is **not confirmed**; until it is, the Codex hook
-denies `--force` instead of asking (decision 9 falls back to decision 4). Codex requires non-managed
+uses the identity `codex:<session_id>`. The
+[Codex hook reference](https://developers.openai.com/codex/hooks#pretooluse)
+explicitly says `permissionDecision: "ask"` is unsupported for PreToolUse.
+The Codex hook thus denies `--force` and tells the agent to ask a human to
+run it separately. Claude Code asks for every hooked agent; taba cannot
+identify whether a tool call came from a coordinator or a worker. Codex requires non-managed
 hooks to be trusted through `/hooks` before they run, and its own docs call
 tool hooks "a useful guardrail, not a complete enforcement boundary". A
 SessionStart env file and SessionEnd behaviour are **not confirmed** for
@@ -1962,6 +1965,18 @@ second borrower).
    plus S4) ends with both servers running and no cross-scope kill.
 
 ---
+
+#### M6 implementation notes
+
+- The hook inspects common Bash command shapes without running them. It
+  returns no permission decision for an ordinary allowed command, so normal
+  harness permissions still apply. Unparseable commands are logged and left
+  to the harness. Native PowerShell commands, shell scripts, and expansion
+  are outside its coverage.
+- Claude Code's SessionStart writes the session name to `CLAUDE_ENV_FILE`;
+  it does not infer an agent PID from an unverified parent process. SessionEnd
+  marks leases for that identity ended without stopping services. TTL remains
+  the backstop when the harness does not send an end event.
 
 ## 9. Decisions (2026-11-24)
 

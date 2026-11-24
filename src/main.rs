@@ -6,6 +6,7 @@ mod config;
 mod error;
 mod gc;
 mod handoff;
+mod hooks;
 mod lease;
 mod listing;
 mod ports;
@@ -267,6 +268,11 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Inspect agent hook input on stdin
+    Hook {
+        harness: hooks::Harness,
+        event: hooks::Event,
+    },
     /// Internal (Windows): send Ctrl+Break to console process group PGID,
     /// attaching to the console of process ATTACH
     #[cfg(windows)]
@@ -447,6 +453,20 @@ fn main() -> ExitCode {
                 borrows::release(store, &scope::resolve(scope, agent)?, &target)
             }),
         ),
+        Cmd::Hook { harness, event } => {
+            return match hooks::run(harness, event) {
+                Ok(value) => {
+                    if let Some(value) = value {
+                        error::print_json(&value);
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("taba hook: {}", e.message);
+                    ExitCode::from(1)
+                }
+            };
+        }
         Cmd::Move {
             target,
             scope,
