@@ -47,3 +47,15 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --locked
+      - name: Debug (temporary)
+        if: failure() && runner.os == 'macOS'
+        run: |
+          set -x
+          time python3 -c "import socket; print(socket.gethostname())"
+          time python3 -c "import socket; print(socket.getfqdn('127.0.0.1'))"
+          time python3 -c "import socket; print(socket.getfqdn(''))"
+          (python3 -u -m http.server 18998 --bind 127.0.0.1 2>&1 | while read l; do echo "$(date +%T) $l"; done) &
+          for i in $(seq 1 60); do curl -s -o /dev/null http://127.0.0.1:18998/ && { echo "up after $i s"; break; }; sleep 1; done
+          export TABA_HOME=$RUNNER_TEMP/dbg
+          ./target/debug/taba run --scope d --name web --port 18999 --wait=60 -- python3 -u -m http.server 18999 --bind 127.0.0.1 || true
+          cat $TABA_HOME/logs/d/web.log || true
