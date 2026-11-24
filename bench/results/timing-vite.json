@@ -1,5 +1,5 @@
 {
-  "work_dir": "/private/var/folders/5w/gtydprbj12n1k1p0dxz3x1gh0000gn/T/taba-bench-d8htbzpz",
+  "work_dir": "$TMPDIR/taba-bench-d8htbzpz",
   "rounds": 12,
   "port": 18733,
   "npm_install_vite_s": 27.107129458003328,

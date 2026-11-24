@@ -30,14 +30,14 @@ Port 18735 is in use, trying another one...
 ```console
 $ taba run --scope bench --name web --port 18735 -- python3 -m http.server 18735
 started bench/web → http://localhost:18735
-  dir  /private/var/folders/5w/gtydprbj12n1k1p0dxz3x1gh0000gn/T/taba-scen-8olfzbi4/rerun
+  dir  $TMPDIR/taba-scen-8olfzbi4/rerun
   logs taba logs bench/web
 [exit 0]
 ```
 ```console
 $ taba run --scope bench --name web --port 18735 -- python3 -m http.server 18735
 already running bench/web → http://localhost:18735
-  dir  /private/var/folders/5w/gtydprbj12n1k1p0dxz3x1gh0000gn/T/taba-scen-8olfzbi4/rerun
+  dir  $TMPDIR/taba-scen-8olfzbi4/rerun
   logs taba logs bench/web
 [exit 0]
 ```
@@ -47,12 +47,12 @@ Same name, different command:
 
 ```console
 $ taba run --scope bench --name web --port 18735 -- python3 -m http.server 18736
-taba: bench/web is already running with a different command, directory or port (command ["python3", "-m", "http.server", "18735"], dir /private/var/folders/5w/gtydprbj12n1k1p0dxz3x1gh0000gn/T/taba-scen-8olfzbi4/rerun, port 18735); stop it first
+taba: bench/web is already running with a different command, directory or port (command ["python3", "-m", "http.server", "18735"], dir $TMPDIR/taba-scen-8olfzbi4/rerun, port 18735); stop it first
 [exit 1]
 ```
 ```console
 $ taba stop bench/web
-bench/web: stopped  /private/var/folders/5w/gtydprbj12n1k1p0dxz3x1gh0000gn/T/taba-scen-8olfzbi4/rerun
+bench/web: stopped  $TMPDIR/taba-scen-8olfzbi4/rerun
 [exit 0]
 ```
 ### C. `docker run -d -p P:P ...`, twice
@@ -148,7 +148,7 @@ Holder pid 38361 still alive: True, still answering: True
 
 ```console
 $ taba run --scope bench --name web --port 18735 -- python3 -m http.server 18735
-taba: port 18735 is already claimed by taba service other/api (/private/var/folders/5w/gtydprbj12n1k1p0dxz3x1gh0000gn/T/taba-scen-8olfzbi4/conflict)
+taba: port 18735 is already claimed by taba service other/api ($TMPDIR/taba-scen-8olfzbi4/conflict)
 [exit 1]
 ```
 ## 7. Visibility from a fresh terminal
@@ -158,9 +158,9 @@ Three servers: A (nohup) in `checkout-a` on :18735, B (taba, scope login-fix) in
 ```console
 $ lsof -nP -iTCP -sTCP:LISTEN   # filtered to the three ports
 COMMAND     PID  USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
-com.docke 30532 buchi  135u  IPv6 0xadd43504bf2aab3d      0t0  TCP *:18737 (LISTEN)
-Python    38397 buchi    4u  IPv6 0x7e2b279ba52ffa41      0t0  TCP *:18735 (LISTEN)
-Python    38399 buchi    4u  IPv6 0x48548f5af9779b99      0t0  TCP *:18736 (LISTEN)
+com.docke 30532 <user> 135u  IPv6 0xadd43504bf2aab3d      0t0  TCP *:18737 (LISTEN)
+Python    38397 <user>   4u  IPv6 0x7e2b279ba52ffa41      0t0  TCP *:18735 (LISTEN)
+Python    38399 <user>   4u  IPv6 0x48548f5af9779b99      0t0  TCP *:18736 (LISTEN)
 [exit 0]
 ```
 ```console
@@ -171,14 +171,14 @@ $ ps -axo pid,command | grep http.server
 ```
 ```console
 $ lsof -a -p PID -d cwd   # for the A and B pids
-/private/var/folders/5w/gtydprbj12n1k1p0dxz3x1gh0000gn/T/taba-scen-8olfzbi4/checkout-a
-/private/var/folders/5w/gtydprbj12n1k1p0dxz3x1gh0000gn/T/taba-scen-8olfzbi4/checkout-b
+$TMPDIR/taba-scen-8olfzbi4/checkout-a
+$TMPDIR/taba-scen-8olfzbi4/checkout-b
 [exit 0]
 ```
 ```console
 $ taba ps
 SERVICE        STATUS   URL                     DIRECTORY
-login-fix/web  running  http://localhost:18736  /private/var/folders/5w/gtydprbj12n1k1p0dxz3x1gh0000gn/T/taba-scen-8olfzbi4/checkout-b
+login-fix/web  running  http://localhost:18736  $TMPDIR/taba-scen-8olfzbi4/checkout-b
 [exit 0]
 ```
 ```console
@@ -189,7 +189,7 @@ CONTAINER ID   IMAGE           COMMAND                  PORTS                   
 ```
 ```console
 $ docker inspect --format '{{range .Mounts}}{{.Source}}{{end}}' ID
-/private/var/folders/5w/gtydprbj12n1k1p0dxz3x1gh0000gn/T/taba-scen-8olfzbi4/checkout-c
+$TMPDIR/taba-scen-8olfzbi4/checkout-c
 [exit 0]
 ```
 ## 8. Working-tree access
@@ -232,12 +232,12 @@ $ find $TABA_HOME -type f   # size path, after one service and 100 requests
 ```
 ```console
 $ du -sk $TABA_HOME
-20	/private/var/folders/5w/gtydprbj12n1k1p0dxz3x1gh0000gn/T/taba-scen-8olfzbi4/taba-home
+20	$TMPDIR/taba-scen-8olfzbi4/taba-home
 [exit 0]
 ```
 ```console
 $ ls -l target/release/taba
--rwxr-xr-x@ 1 buchi  staff  1274096 Nov 24 15:39 /Users/buchi/orca/workspaces/taba/kelp/target/release/taba
+-rwxr-xr-x@ 1 <user> staff  1274096 Nov 24 15:39 <repo>/target/release/taba
 [exit 0]
 ```
 ```console
@@ -252,7 +252,7 @@ $ du -sh /Applications/Docker.app
 ```
 ```console
 $ du -h ~/Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw
-1.2G	/Users/buchi/Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw
+1.2G	~/Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw
 [exit 0]
 ```
 ```console
