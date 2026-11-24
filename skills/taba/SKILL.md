@@ -100,6 +100,14 @@ the plain form, or pipe it through `tail`. The log path is also in
 `taba ps --json` (`log_path`). Logs of any scope are readable.
 `taba logs web --json` returns the text in `log` (not with `-f`).
 
+## Borrowing another scope's service
+
+Use `taba borrow S/N --json` for the URL and borrow ID. Check that ID with
+`taba borrow --check ID --json` before a long test run, and release it when
+finished. For maintenance use `taba borrow --mut S/N -- COMMAND`; the
+command gets `TABA_BORROWED_URL`. If stop reports `E_BORROWED`, consider
+`taba disown S/N` instead of forcing it. It hands over the live instance.
+
 ## Stopping and cleaning up
 
 ```sh

@@ -122,7 +122,22 @@ pub fn offer(store: &Store, svc: &Service, how: &str, dry: bool) -> Result<Optio
             break;
         }
     }
-    if how == "disown" && chosen.is_none() {
+    let borrower = if chosen.is_none() {
+        let mut candidate = None;
+        for b in crate::borrows::live(store, svc)? {
+            if b.scope != svc.scope
+                && store.get(&b.scope, &svc.name)?.is_none()
+                && store.live_op(&b.scope, &svc.name)?.is_none()
+            {
+                candidate = Some(b.scope);
+                break;
+            }
+        }
+        candidate
+    } else {
+        None
+    };
+    if how == "disown" && chosen.is_none() && borrower.is_none() {
         return Ok(None);
     }
     if !dry {
@@ -135,8 +150,10 @@ pub fn offer(store: &Store, svc: &Service, how: &str, dry: bool) -> Result<Optio
         }
         store.put_claims(&svc.scope, &svc.name, &q)?;
     }
-    let Some((_, target)) = chosen else {
-        return Ok(None);
+    let (target, how) = match (chosen, borrower) {
+        (Some((_, target)), _) => (target, how),
+        (None, Some(target)) => (target, if how == "disown" { how } else { "borrower" }),
+        _ => return Ok(None),
     };
     let to = format!("{target}/{}", svc.name);
     if !dry {
@@ -157,6 +174,7 @@ pub fn transfer(store: &Store, svc: &Service, target: &str, how: &str) -> Result
     let event = json!({"at":rfc3339(now_secs()), "event":"service_moved", "how":how, "from":svc.id(), "to":moved.id(), "instance":svc.instance()});
     moved.moves.push(event.clone());
     store.move_service(&svc.scope, &moved)?;
+    crate::borrows::moved(store, svc, target)?;
     store.append_event(&event)?;
     lease::notify(
         store,

@@ -516,7 +516,7 @@ impl Store {
     }
 }
 
-fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
+pub(crate) fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
     match fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .map(Some)
@@ -528,14 +528,14 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<Option<T
 
 /// Writes to a temporary file and renames it, so lock-free readers see the
 /// old or the new content, never a partial one.
-fn write_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
+pub(crate) fn write_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     fs::create_dir_all(path.parent().expect("record has parent"))?;
     let tmp = path.with_extension("json.tmp");
     fs::write(&tmp, serde_json::to_vec_pretty(value)?)?;
     fs::rename(tmp, path)
 }
 
-fn remove_file_and_empty_parent(path: &Path) -> io::Result<()> {
+pub(crate) fn remove_file_and_empty_parent(path: &Path) -> io::Result<()> {
     match fs::remove_file(path) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}

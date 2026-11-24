@@ -1897,6 +1897,17 @@ second borrower).
    killed), and `wt-a`'s holder pid is killed. `gc` ends `wt-b`'s borrow,
    finds no live claimant, and drops `db` after `gc_grace`.
 
+#### M4 implementation notes
+
+- Borrows are stored by ID under `borrows/`, so a service hand-over can
+  update them without changing IDs. The acquiring scope's borrow ends.
+- With `--json`, a maintenance command's output is captured in the result;
+  otherwise it uses the terminal. If taba dies, the next access no longer
+  considers that command's borrow live; it does not promise to kill the child.
+- An exclusive borrower restarts an existing stopped service by running
+  `taba run --scope OWNER --name NAME …` from its own scope. The replacement
+  retains the exclusive lock; the old shared borrows become dangling.
+
 ### M5: move
 
 1. Automatic take-over: a1 (with `TABA_AGENT_PID` set to a `sleep`) runs

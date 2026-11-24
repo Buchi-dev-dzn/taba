@@ -1,5 +1,6 @@
 //! taba: start, list, inspect and stop local processes, grouped by work scope.
 
+mod borrows;
 mod claims;
 mod config;
 mod error;
@@ -195,6 +196,36 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Record a shared or exclusive borrow of another scope's service
+    Borrow {
+        target: String,
+        #[arg(long)]
+        scope: Option<String>,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long, conflicts_with_all = ["exclusive", "ttl", "wait_lock", "command"])]
+        check: bool,
+        #[arg(long = "mut")]
+        exclusive: bool,
+        #[arg(long, value_parser = config::parse_ttl_flag)]
+        ttl: Option<config::Ttl>,
+        #[arg(long, default_value_t = 0.0)]
+        wait_lock: f64,
+        #[arg(long)]
+        json: bool,
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
+    /// End a borrow by ID or service
+    Release {
+        target: String,
+        #[arg(long)]
+        scope: Option<String>,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Queue for ownership of another scope's service
     Claim {
         target: String,
@@ -353,6 +384,49 @@ fn main() -> ExitCode {
         Cmd::Gc { dry_run, json } => (
             json || env_json(),
             mutating_cmd(|store, cfg| gc::collect(store, cfg, dry_run, usize::MAX, None)),
+        ),
+        Cmd::Borrow {
+            target,
+            scope,
+            agent,
+            check,
+            exclusive,
+            ttl,
+            wait_lock,
+            json,
+            command,
+        } => {
+            let json = json || env_json();
+            (
+                json,
+                mutating_cmd(|store, cfg| {
+                    borrows::cmd(
+                        store,
+                        cfg,
+                        &scope::resolve(scope, agent)?,
+                        borrows::Request {
+                            target,
+                            check,
+                            exclusive,
+                            ttl,
+                            wait: wait_lock,
+                            command,
+                            json,
+                        },
+                    )
+                }),
+            )
+        }
+        Cmd::Release {
+            target,
+            scope,
+            agent,
+            json,
+        } => (
+            json || env_json(),
+            mutating_cmd(|store, _| {
+                borrows::release(store, &scope::resolve(scope, agent)?, &target)
+            }),
         ),
         Cmd::Claim {
             target,
@@ -628,14 +702,37 @@ fn cmd_run(a: RunArgs) -> Result<Output> {
     gc::collect(&store, &cfg, false, 5, Some(&scope))?;
     let lock = store.lock()?;
     store.mark_version()?;
-    let touched = lease::touch(&store, &cfg, &caller, &scope, lease::Access::Create, a.ttl)?;
+    let existing = store.get(&scope, &name)?;
+    let mut delegation = None;
+    if a.scope.is_some()
+        && a.ttl.is_none()
+        && let Some(ex) = &existing
+        && !ex.is_running()
+    {
+        let borrower = scope::resolve(None, a.agent.clone())?;
+        if borrower.scope.as_deref() != Some(scope.as_str()) {
+            delegation = borrows::live(&store, ex)?
+                .into_iter()
+                .find(|b| b.exclusive && b.owned(&borrower));
+        }
+    }
+    let touched = if delegation.is_some() {
+        lease::Touched::default()
+    } else {
+        lease::touch(&store, &cfg, &caller, &scope, lease::Access::Create, a.ttl)?
+    };
     let id = format!("{scope}/{name}");
     if let Some(op) = store.live_op(&scope, &name)? {
         return Err(busy(&id, &op));
     }
     store.clear_stale_op(&scope, &name)?;
 
-    let existing = store.get(&scope, &name)?;
+    if let Some(ex) = &existing
+        && !ex.is_running()
+        && delegation.is_none()
+    {
+        borrows::authorise(&store, ex, &caller, false, false)?;
+    }
     if let Some(ex) = &existing
         && ex.is_running()
     {
@@ -774,6 +871,9 @@ fn cmd_run(a: RunArgs) -> Result<Output> {
         moves: Vec::new(),
     };
     store.put(&svc)?;
+    if let Some(borrow) = &delegation {
+        borrows::rebind(&store, borrow, &svc)?;
+    }
     let op = if replacing { "replace" } else { "start" };
     store.put_op(&scope, &name, &OpLock::mine(op, &caller.agent))?;
     // The port is reserved by the record now; wait without the global lock.
@@ -999,6 +1099,8 @@ fn cmd_ps(scope: Option<String>, running_only: bool) -> Result<Output> {
         let now = util::now_secs();
         let rec = store.get_scope(&s.scope)?;
         let queue = store.get_claims(&s.scope, &s.name)?;
+        let borrows = borrows::live(&store, s)?;
+        let exclusive = borrows.iter().find(|b| b.exclusive);
         rows.push(json!({
             "service": s.id(),
             "scope": s.scope,
@@ -1018,6 +1120,8 @@ fn cmd_ps(scope: Option<String>, running_only: bool) -> Result<Output> {
             "keep": rec.as_ref().is_some_and(|r| r.keep),
             "keep_reason": rec.as_ref().and_then(|r| r.keep_reason.as_deref()),
             "claims": claims::rows(&store, &queue)?,
+            "borrows": { "shared": borrows.iter().filter(|b| !b.exclusive).count(), "exclusive": usize::from(exclusive.is_some()) },
+            "locked_by": exclusive.map(|b| &b.scope),
         }));
     }
 
@@ -1275,7 +1379,7 @@ fn stop_one(
     timeout: Duration,
     force_reason: Option<&str>,
 ) -> Result<Stopped> {
-    let svc = {
+    let (svc, preserve_exclusive) = {
         let _lock = store.lock()?;
         let svc = store
             .get(scope, name)?
@@ -1285,9 +1389,16 @@ fn stop_one(
             let cfg = config::Config::load(store.root())?;
             lease::touch(store, &cfg, caller, scope, lease::Access::Mutate, None)?;
         }
-        if !owner && force_reason.is_none() {
+        let exclusive = !owner
+            && borrows::live(store, &svc)?
+                .iter()
+                .any(|b| b.exclusive && b.owned(caller));
+        if !owner && !exclusive && force_reason.is_none() {
             return Err(not_owner(caller, &svc, "stop"));
         }
+        let preserve_exclusive =
+            borrows::authorise(store, &svc, caller, force_reason.is_some(), true)?
+                && force_reason.is_none();
         if let Some(op) = store.live_op(scope, name)? {
             return Err(busy(&svc.id(), &op));
         }
@@ -1307,7 +1418,7 @@ fn stop_one(
             let overrode: &[&str] = if owner { &[] } else { &["E_NOT_OWNER"] };
             record_force(store, "force_stop", caller, &svc, reason, overrode)?;
         }
-        svc
+        (svc, preserve_exclusive)
     };
 
     // Re-verify identity immediately before signalling (as v0.1 does).
@@ -1318,10 +1429,11 @@ fn stop_one(
     };
     {
         let _lock = store.lock()?;
+        store.release_op(scope, name)?;
         if res.is_ok() && !svc.is_running() {
+            borrows::break_all(store, &svc, preserve_exclusive)?;
             claims::discard(store, &svc)?;
         }
-        store.release_op(scope, name)?;
     }
     let forced = force_reason.is_some();
     match res {
@@ -1409,7 +1521,7 @@ fn cmd_rm(
                 )),
             )
         } else {
-            None
+            borrows::authorise(&store, &svc, &caller, reason.is_some(), false).err()
         };
         if let Some(e) = refusal {
             if single {
@@ -1425,6 +1537,7 @@ fn cmd_rm(
             let overrode: &[&str] = if owner { &[] } else { &["E_NOT_OWNER"] };
             record_force(&store, "force_rm", &caller, &svc, r, overrode)?;
         }
+        borrows::break_all(&store, &svc, false)?;
         store.remove(&svc.scope, &svc.name)?;
         lines.push(format!("{}: removed (record and log)", svc.id()));
         results.push(json!({ "service": svc.id(), "result": "removed" }));
