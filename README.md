@@ -47,6 +47,10 @@ Compare the archive's SHA-256 with the matching line in `SHA256SUMS`: use
 Linux binaries are built on Ubuntu 22.04 (x86_64) and 24.04 (arm64); use a
 source build if your system has an older glibc or uses musl.
 
+Releases follow [docs/releasing.md](docs/releasing.md): fixes and
+backward-compatible additions ship as 0.2.x patches, and only breaking changes
+bump the minor version.
+
 To build the released version from Git with Rust and Cargo:
 
 ```sh
