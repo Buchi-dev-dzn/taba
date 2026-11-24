@@ -23,7 +23,7 @@ pub(super) fn verified_binary(
         return Err(failure(format!("SHA-256 mismatch for {name}")));
     }
     let executable = executable_from_tar_gz(&archive)?;
-    validate_elf(&executable, target)?;
+    validate_executable(&executable, target)?;
     Ok(executable)
 }
 
@@ -124,12 +124,30 @@ fn executable_from_tar_gz(bytes: &[u8]) -> Result<Vec<u8>> {
     executable.ok_or_else(unsafe_archive)
 }
 
-fn validate_elf(bytes: &[u8], target: Target) -> Result<()> {
-    let expected_machine = match target.triple {
-        "x86_64-unknown-linux-gnu" => 62,
-        "aarch64-unknown-linux-gnu" => 183,
-        _ => return Err(failure("not a supported Linux ELF target")),
-    };
+fn validate_executable(bytes: &[u8], target: Target) -> Result<()> {
+    match target.triple {
+        "x86_64-unknown-linux-gnu" => validate_elf(bytes, 62),
+        "aarch64-unknown-linux-gnu" => validate_elf(bytes, 183),
+        // CPU_TYPE_X86_64 and CPU_TYPE_ARM64 (CPU_ARCH_ABI64 | base type).
+        "x86_64-apple-darwin" => validate_mach_o(bytes, 0x0100_0007),
+        "aarch64-apple-darwin" => validate_mach_o(bytes, 0x0100_000c),
+        _ => Err(failure("not a supported self-update target")),
+    }
+}
+
+/// A thin 64-bit little-endian Mach-O executable (`MH_EXECUTE`) for one CPU type.
+/// Universal (fat) binaries are rejected: official archives contain one architecture.
+fn validate_mach_o(bytes: &[u8], cpu_type: u32) -> Result<()> {
+    let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+    if bytes.len() < 32 || word(0) != 0xfeed_facf || word(4) != cpu_type || word(12) != 2 {
+        return Err(failure(
+            "archive executable does not match the expected macOS Mach-O target",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_elf(bytes: &[u8], expected_machine: u8) -> Result<()> {
     if bytes.len() < 64
         || !bytes.starts_with(b"\x7fELF\x02\x01\x01")
         || !matches!(bytes[16..18], [2 | 3, 0])

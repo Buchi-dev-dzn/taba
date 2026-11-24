@@ -6,9 +6,9 @@ use serde::Deserialize;
 use serde_json::json;
 use std::{cmp::Ordering, io::Read, time::Duration};
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 mod archive;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod install;
 #[cfg(test)]
 mod tests;
@@ -68,9 +68,9 @@ struct Release {
 #[derive(Deserialize)]
 struct Asset {
     name: String,
-    #[cfg(any(target_os = "linux", test))]
+    #[cfg(any(target_os = "linux", target_os = "macos", test))]
     state: String,
-    #[cfg(any(target_os = "linux", test))]
+    #[cfg(any(target_os = "linux", target_os = "macos", test))]
     size: usize,
 }
 
@@ -80,7 +80,7 @@ impl Release {
         (!self.draft && !self.prerelease && version.pre.is_empty()).then_some(version)
     }
 
-    #[cfg(any(target_os = "linux", test))]
+    #[cfg(any(target_os = "linux", target_os = "macos", test))]
     fn asset_size(&self, name: &str, limit: usize) -> Result<usize> {
         let mut entries = self.assets.iter().filter(|asset| asset.name == name);
         match (entries.next(), entries.next()) {
@@ -126,7 +126,10 @@ fn newest(releases: Vec<Release>, current: &Version) -> Result<Option<(Version, 
 }
 
 #[derive(Clone, Copy)]
-#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", test)),
+    allow(dead_code)
+)]
 enum Download {
     Api,
     Asset,
@@ -139,7 +142,7 @@ fn api_list(page: usize) -> Url {
     .expect("fixed API base")
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn api_tag(tag: &str) -> Url {
     let mut url = Url::parse(&format!(
         "https://api.github.com/repos/{REPO}/releases/tags"
@@ -149,7 +152,7 @@ fn api_tag(tag: &str) -> Url {
     url
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn asset_url(tag: &str, name: &str) -> Url {
     let mut url = Url::parse(&format!("{RELEASES}/download")).expect("fixed release base");
     url.path_segments_mut().unwrap().push(tag).push(name);
@@ -250,7 +253,7 @@ fn read_bounded(reader: impl Read, limit: usize) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn download_asset(
     fetch: &impl Fetch,
     release: &Release,
@@ -342,17 +345,17 @@ pub(super) fn command(check: bool) -> Result<Output> {
         &current,
         env!("TABA_BUILD_TARGET"),
         |release, version, target| {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             {
                 install::update(&fetch, &current, release, version, target)
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             {
                 let _ = (release, target);
                 let reason = if cfg!(windows) {
                     "Windows is check-only: taba will not replace its loaded .exe. Close taba processes before manually replacing it."
                 } else {
-                    "Automatic replacement is supported only for eligible standalone Linux installations."
+                    "Automatic replacement is supported only for eligible standalone Linux and macOS installations."
                 };
                 Ok(manual(version, reason))
             }

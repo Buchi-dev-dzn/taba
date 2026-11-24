@@ -626,6 +626,107 @@ fn python_tarfile_archive_verifies() {
     assert_eq!(verify(&archive).unwrap(), elf(62));
 }
 
+// ---- macOS targets and Mach-O executables -------------------------------------
+
+const ARM64: u32 = 0x0100_000c;
+const X86_64: u32 = 0x0100_0007;
+const DARWIN: [(&str, u32); 2] = [
+    ("aarch64-apple-darwin", ARM64),
+    ("x86_64-apple-darwin", X86_64),
+];
+
+/// A minimal thin 64-bit Mach-O `MH_EXECUTE` header for `cpu`.
+fn mach_o(cpu: u32) -> Vec<u8> {
+    let mut bytes = vec![0u8; 256];
+    bytes[..4].copy_from_slice(&0xfeed_facf_u32.to_le_bytes());
+    bytes[4..8].copy_from_slice(&cpu.to_le_bytes());
+    bytes[12..16].copy_from_slice(&2u32.to_le_bytes());
+    bytes
+}
+
+/// Publish `archive` as `target`'s v0.3.0 asset with a matching `SHA256SUMS`.
+fn verify_for(triple: &str, archive: &[u8]) -> Result<Vec<u8>> {
+    let target = target(triple).unwrap();
+    let name = target.asset("v0.3.0");
+    let sums = format!("{}  {name}\n", sha(archive));
+    let release = parse(release_json(
+        "v0.3.0",
+        false,
+        false,
+        &[(&name, archive.len()), ("SHA256SUMS", sums.len())],
+    ));
+    let mock = Mock::default()
+        .with(asset_url("v0.3.0", &name), archive.to_vec())
+        .with(asset_url("v0.3.0", "SHA256SUMS"), sums);
+    verified_binary(&mock, &release, target)
+}
+
+#[test]
+fn macos_targets_select_their_official_archives() {
+    for (triple, _) in DARWIN {
+        assert_eq!(
+            target(triple).unwrap().asset("v0.3.0"),
+            format!("taba-v0.3.0-{triple}.tar.gz")
+        );
+    }
+    let mock = listing(&[release_json(
+        "v0.3.0",
+        false,
+        false,
+        &[
+            ("taba-v0.3.0-aarch64-apple-darwin.tar.gz", 10),
+            ("taba-v0.3.0-x86_64-apple-darwin.tar.gz", 10),
+            ("taba-v0.3.0-x86_64-unknown-linux-gnu.tar.gz", 10),
+        ],
+    )]);
+    for (triple, _) in DARWIN {
+        let out = run(&mock, true, &v("0.2.0"), triple, never_install).unwrap();
+        assert_eq!(
+            out.body["asset"],
+            format!("taba-v0.3.0-{triple}.tar.gz"),
+            "{triple}"
+        );
+        let out = run(&mock, false, &v("0.2.0"), triple, |_, _, target| {
+            assert_eq!(target.triple, triple);
+            Ok(Output::new(
+                json!({"status": "installed-by-test"}),
+                String::new(),
+            ))
+        })
+        .unwrap();
+        assert_eq!(out.body["status"], "installed-by-test", "{triple}");
+    }
+}
+
+#[test]
+fn macos_archives_require_a_matching_thin_mach_o() {
+    for (triple, cpu) in DARWIN {
+        assert_eq!(
+            verify_for(triple, &official(&mach_o(cpu))).unwrap(),
+            mach_o(cpu)
+        );
+        let other = if cpu == ARM64 { X86_64 } else { ARM64 };
+        let mut fat = mach_o(cpu);
+        fat[..4].copy_from_slice(&0xcafe_babe_u32.to_be_bytes());
+        let mut dylib = mach_o(cpu);
+        dylib[12] = 6; // MH_DYLIB
+        for (case, binary) in [
+            ("other architecture", mach_o(other)),
+            ("Linux ELF", elf(62)),
+            ("universal binary", fat),
+            ("not an executable", dylib),
+            ("truncated header", mach_o(cpu)[..16].to_vec()),
+        ] {
+            assert!(
+                verify_for(triple, &official(&binary)).is_err(),
+                "{triple}: {case}"
+            );
+        }
+    }
+    // A Mach-O is never accepted for a Linux target.
+    assert!(verify_for(LINUX, &official(&mach_o(X86_64))).is_err());
+}
+
 // ---- end-to-end Linux replacement in a disposable directory -------------------
 
 #[cfg(target_os = "linux")]
@@ -671,7 +772,15 @@ mod linux_install {
     }
 
     fn run_update(mock: &Mock, exe: &std::path::Path, release: &Release) -> Result<Output> {
-        super::super::install::update_at(mock, exe, &v("0.2.1"), release, &v("0.3.0"), linux())
+        super::super::install::update_at(
+            mock,
+            exe,
+            &v("0.2.1"),
+            release,
+            &v("0.3.0"),
+            linux(),
+            None,
+        )
     }
 
     fn is_root() -> bool {
@@ -741,6 +850,354 @@ mod linux_install {
         // No metadata for the running version: the request fails, nothing is touched.
         assert!(run_update(&Mock::default(), &exe, &release).is_err());
         assert_eq!(fs::read(&exe).unwrap(), elf(62));
+    }
+}
+
+// ---- end-to-end macOS replacement in a disposable directory -------------------
+
+#[cfg(target_os = "macos")]
+mod macos_install {
+    use super::*;
+    use std::{
+        fs, io,
+        os::unix::fs::{MetadataExt, PermissionsExt},
+        path::Path,
+    };
+
+    fn release_with(
+        triple: &str,
+        tag: &str,
+        binary: &[u8],
+    ) -> (serde_json::Value, Vec<(Url, Vec<u8>)>) {
+        let name = target(triple).unwrap().asset(tag);
+        let archive = official(binary);
+        let sums = format!("{}  {name}\n", sha(&archive));
+        let meta = release_json(
+            tag,
+            false,
+            false,
+            &[(&name, archive.len()), ("SHA256SUMS", sums.len())],
+        );
+        (
+            meta,
+            vec![
+                (asset_url(tag, &name), archive),
+                (asset_url(tag, "SHA256SUMS"), sums.into_bytes()),
+            ],
+        )
+    }
+
+    fn fixture(triple: &str, old: &[u8], new: &[u8]) -> (Mock, Release) {
+        let (old_meta, old_assets) = release_with(triple, "v0.2.1", old);
+        let (new_meta, new_assets) = release_with(triple, "v0.3.0", new);
+        let mut mock =
+            Mock::default().with(api_tag("v0.2.1"), serde_json::to_vec(&old_meta).unwrap());
+        for (url, body) in old_assets.into_iter().chain(new_assets) {
+            mock = mock.with(url, body);
+        }
+        (mock, parse(new_meta))
+    }
+
+    /// An installed official binary in a private, canonical directory.
+    fn installed(old: &[u8]) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let exe = fs::canonicalize(dir.path()).unwrap().join("taba");
+        fs::write(&exe, old).unwrap();
+        fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+        (dir, exe)
+    }
+
+    fn run_update(
+        mock: &Mock,
+        triple: &str,
+        exe: &Path,
+        release: &Release,
+        check: &dyn Fn(&Path) -> io::Result<()>,
+    ) -> Result<Output> {
+        super::super::install::update_at(
+            mock,
+            exe,
+            &v("0.2.1"),
+            release,
+            &v("0.3.0"),
+            target(triple).unwrap(),
+            Some(check),
+        )
+    }
+
+    fn leftovers(exe: &Path) -> Vec<String> {
+        fs::read_dir(exe.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.starts_with(".taba-update-"))
+            .collect()
+    }
+
+    fn is_root() -> bool {
+        // SAFETY: no preconditions.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    fn pair(cpu: u32) -> (Vec<u8>, Vec<u8>) {
+        let (old, mut new) = (mach_o(cpu), mach_o(cpu));
+        new[100] = 7;
+        (old, new)
+    }
+
+    #[test]
+    fn official_standalone_install_is_replaced_and_checked() {
+        if is_root() {
+            return;
+        }
+        for (triple, cpu) in DARWIN {
+            let (old, new) = pair(cpu);
+            let (mock, release) = fixture(triple, &old, &new);
+            let (_dir, exe) = installed(&old);
+            let checked = std::cell::Cell::new(false);
+            let check = |path: &Path| {
+                // The self-check sees the new bytes at the real path.
+                assert_eq!(path, exe.as_path());
+                assert_eq!(fs::read(path).unwrap(), new);
+                checked.set(true);
+                Ok(())
+            };
+            let out = run_update(&mock, triple, &exe, &release, &check).unwrap();
+            assert_eq!(out.body["status"], "updated", "{triple}");
+            assert!(checked.get(), "{triple}: self-check must run");
+            assert_eq!(fs::read(&exe).unwrap(), new);
+            assert_eq!(fs::metadata(&exe).unwrap().mode() & 0o777, 0o755);
+            assert!(
+                leftovers(&exe).is_empty(),
+                "{triple}: {:?}",
+                leftovers(&exe)
+            );
+        }
+    }
+
+    #[test]
+    fn replacement_failure_keeps_original_bytes() {
+        if is_root() {
+            return;
+        }
+        for (triple, cpu) in DARWIN {
+            let (old, new) = pair(cpu);
+            let (mock, release) = fixture(triple, &old, &new);
+            let (dir, exe) = installed(&old);
+            // A read-only directory: the staged file cannot be created, nothing is replaced.
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+            let result = run_update(&mock, triple, &exe, &release, &|_| Ok(()));
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(result.is_err(), "{triple}");
+            assert_eq!(fs::read(&exe).unwrap(), old);
+            assert!(leftovers(&exe).is_empty());
+
+            // A tampered new archive is rejected before anything is staged.
+            let (mut mock, release) = fixture(triple, &old, &new);
+            let name = target(triple).unwrap().asset("v0.3.0");
+            let mut tampered = mock.responses[asset_url("v0.3.0", &name).as_str()].clone();
+            let last = tampered.len() - 1;
+            tampered[last] ^= 1;
+            mock = mock.with(asset_url("v0.3.0", &name), tampered);
+            assert!(run_update(&mock, triple, &exe, &release, &|_| Ok(())).is_err());
+            assert_eq!(fs::read(&exe).unwrap(), old);
+            assert!(leftovers(&exe).is_empty());
+        }
+    }
+
+    #[test]
+    fn failed_self_check_rolls_back_to_the_original_file() {
+        if is_root() {
+            return;
+        }
+        for (triple, cpu) in DARWIN {
+            let (old, new) = pair(cpu);
+            let (mock, release) = fixture(triple, &old, &new);
+            let (_dir, exe) = installed(&old);
+            let before = fs::metadata(&exe).unwrap();
+            let check = |_: &Path| Err(io::Error::other("killed by signal 9"));
+            let error = run_update(&mock, triple, &exe, &release, &check)
+                .err()
+                .unwrap();
+            let text = error.to_json().to_string();
+            assert!(text.contains("was restored"), "{text}");
+            assert_eq!(fs::read(&exe).unwrap(), old);
+            let after = fs::metadata(&exe).unwrap();
+            assert_eq!(
+                (after.ino(), after.mode()),
+                (before.ino(), before.mode()),
+                "{triple}: the original inode is back"
+            );
+            assert!(
+                leftovers(&exe).is_empty(),
+                "{triple}: {:?}",
+                leftovers(&exe)
+            );
+        }
+    }
+
+    #[test]
+    fn package_manager_and_unofficial_installs_need_manual_update() {
+        if is_root() {
+            return;
+        }
+        let (triple, cpu) = DARWIN[0];
+        let (old, new) = pair(cpu);
+        let (mock, release) = fixture(triple, &old, &new);
+        let (_dir, exe) = installed(&new); // not the official v0.2.1 bytes
+        let out = run_update(&mock, triple, &exe, &release, &|_| unreachable!()).unwrap();
+        assert_eq!(out.body["status"], "manual_update");
+        assert_eq!(fs::read(&exe).unwrap(), new);
+        for path in [
+            "/opt/homebrew/bin/taba",
+            "/usr/local/Cellar/taba/0.2.1/bin/taba",
+            "/Users/u/.cargo/bin/taba",
+        ] {
+            let out = run_update(
+                &mock,
+                triple,
+                Path::new(path),
+                &release,
+                &|_| unreachable!(),
+            )
+            .unwrap();
+            assert_eq!(out.body["status"], "manual_update", "{path}");
+        }
+    }
+}
+
+/// End to end on this Mac with real binaries. Run sequentially per architecture:
+///
+/// `TABA_UPDATE_E2E_DIR=<dir> cargo test [--target x86_64-apple-darwin] -- --ignored --test-threads=1 macos_end_to_end`
+///
+/// `<dir>` holds `v0.2.0.json` (GitHub's release metadata for v0.2.0),
+/// `download/v0.2.0/{SHA256SUMS,taba-v0.2.0-<triple>.tar.gz}` (the official assets), and
+/// `candidates/<case>/{v0.2.1.json,v0.2.1/<assets>}` for each local v0.2.1 candidate
+/// (`good`, `wrong-version`, `bad-signature`). The fetcher maps the fixed official URLs
+/// to these files, acting as the release server; nothing else is read.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "needs TABA_UPDATE_E2E_DIR with official v0.2.0 and local v0.2.1 archives"]
+fn macos_end_to_end() {
+    use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
+
+    struct Files(std::path::PathBuf);
+    impl Fetch for Files {
+        fn get(&self, _kind: Download, url: Url, limit: usize) -> Result<Vec<u8>> {
+            let path = match url.as_str() {
+                u if u == api_tag("v0.2.0").as_str() => self.0.join("v0.2.0.json"),
+                u => {
+                    let rest = u
+                        .strip_prefix(&format!("{RELEASES}/download/"))
+                        .unwrap_or_else(|| panic!("unexpected URL {u}"));
+                    self.0.join("download").join(rest)
+                }
+            };
+            read_bounded(fs::File::open(&path).unwrap(), limit)
+        }
+    }
+
+    let root = std::path::PathBuf::from(std::env::var("TABA_UPDATE_E2E_DIR").unwrap());
+    let triple = env!("TABA_BUILD_TARGET");
+    let target = target(triple).unwrap();
+    let official = root.join("download/v0.2.0").join(target.asset("v0.2.0"));
+    let current = v("0.2.0");
+    let version = |exe: &Path| {
+        let out = Command::new(exe).arg("--version").output().unwrap();
+        (
+            out.status,
+            String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        )
+    };
+
+    for (case, expect_updated) in [
+        ("good", true),
+        ("wrong-version", false),
+        ("bad-signature", false),
+    ] {
+        let candidate = root.join("candidates").join(case);
+        if !candidate.exists() {
+            eprintln!("{triple} {case}: skipped (no candidate)");
+            continue;
+        }
+        // A fresh standalone install: the official v0.2.0 binary, extracted as shipped.
+        let dir = tempfile::tempdir_in(&root).unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let bin = fs::canonicalize(dir.path()).unwrap();
+        assert!(
+            Command::new("tar")
+                .arg("-xzf")
+                .arg(&official)
+                .arg("-C")
+                .arg(&bin)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let exe = bin.join("taba");
+        let original = fs::read(&exe).unwrap();
+        assert_eq!(version(&exe).1, "taba 0.2.0");
+        // Keep v0.2.0 running from the file being replaced (it waits on stdin).
+        let mut running = Command::new(&exe)
+            .args(["hook", "codex", "pre-tool-use"])
+            .env("HOME", dir.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+
+        // The candidate's v0.2.1 metadata and assets, served at the official URLs.
+        let mut fetch_root = root.join("download");
+        fs::create_dir_all(&fetch_root).unwrap();
+        let link = fetch_root.join("v0.2.1");
+        let _ = fs::remove_file(&link);
+        std::os::unix::fs::symlink(candidate.join("v0.2.1"), &link).unwrap();
+        fetch_root.pop();
+        let release: Release =
+            serde_json::from_slice(&fs::read(candidate.join("v0.2.1.json")).unwrap()).unwrap();
+        let next = release.stable_version().unwrap();
+        let check = |path: &Path| install::version_check(path, &next);
+        let result = install::update_at(
+            &Files(fetch_root),
+            &exe,
+            &current,
+            &release,
+            &next,
+            target,
+            Some(&check),
+        );
+        drop(running.stdin.take());
+        let still_running = running.wait().unwrap();
+        let after = version(&exe);
+        eprintln!(
+            "{triple} {case}: result={} | --version after: {:?} | running v0.2.0 exited with {still_running}",
+            match &result {
+                Ok(out) => serde_json::to_string(&out.body).unwrap(),
+                Err(error) => error.to_json().to_string(),
+            },
+            after
+        );
+        if expect_updated {
+            assert_eq!(result.unwrap().body["status"], "updated");
+            assert_eq!(after.1, "taba 0.2.1");
+            assert!(after.0.success());
+        } else {
+            let text = result.err().unwrap().to_json().to_string();
+            assert!(text.contains("was restored"), "{text}");
+            assert_eq!(fs::read(&exe).unwrap(), original, "v0.2.0 bytes intact");
+            assert_eq!(after.1, "taba 0.2.0");
+        }
+        assert_eq!(
+            fs::metadata(&exe).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        let leftovers: Vec<_> = fs::read_dir(&bin)
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|n| n.starts_with(".taba-update-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 }
 

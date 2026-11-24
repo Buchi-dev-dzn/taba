@@ -12,7 +12,7 @@ serde_json = { version = "1.0.154", features = ["preserve_order"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-webpki-roots"] }
 semver = "1"
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 flate2 = "1"
 sha2 = "0.10"
 tar = "0.4"
