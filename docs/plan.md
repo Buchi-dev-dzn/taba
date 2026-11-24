@@ -2,8 +2,6 @@
 
 **Bundle what you start, by the work it belongs to.**
 
-(*taba*, 束, is Japanese for "bundle".)
-
 `taba` is a CLI for starting, inspecting and stopping local processes such as development servers, grouped by work item ("scope"). It provides only the Docker-style `run / ps / logs / stop` operations, without containers. It does not depend on Orca or any particular AI tool and is used from an ordinary terminal.
 
 ## Problem

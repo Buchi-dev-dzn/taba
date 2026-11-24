@@ -1,6 +1,6 @@
 # taba
 
-**Bundle what you start, per task.** *taba* (束) is Japanese for "bundle".
+**Bundle what you start, per task.**
 
 ![platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey)
 ![language: Rust](https://img.shields.io/badge/language-Rust-orange)
