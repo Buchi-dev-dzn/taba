@@ -1,7 +1,7 @@
 //! Integration tests for the acceptance criteria in docs/plan.md (v0.1).
 //!
 //! Each test uses its own temporary TABA_HOME and small `python3 -m
-//! http.server` processes on free high ports.
+//! http.server` (Windows: `python`) processes on free high ports.
 //!
 //! Since v0.2 (decision 4), `stop` and `rm` refuse callers outside the
 //! service's scope, humans included, so these tests act from the owning
@@ -10,7 +10,6 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -18,6 +17,20 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_taba");
+
+/// The Python interpreter: `python3` on Unix; on Windows `python3` is often
+/// only the Microsoft Store stub, so `python`.
+const PY: &str = if cfg!(windows) { "python" } else { "python3" };
+
+/// `canonicalize`, without the `\\?\` prefix on Windows (as taba prints paths).
+fn canon(p: &Path) -> PathBuf {
+    let c = p.canonicalize().unwrap();
+    let s = c.to_string_lossy().to_string();
+    match s.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+        _ => c,
+    }
+}
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -61,6 +74,7 @@ impl Env {
             .args(args)
             .current_dir(cwd)
             .env("TABA_HOME", self.home())
+            .env("PYTHONPATH", python_path())
             .env_remove("TABA_SCOPE")
             .env_remove("TABA_AGENT")
             .env_remove("TABA_OUTPUT")
@@ -105,7 +119,20 @@ trait CanonOrCreate {
 impl CanonOrCreate for PathBuf {
     fn canonicalize_or_create(self) -> PathBuf {
         std::fs::create_dir_all(&self).unwrap();
-        self.canonicalize().unwrap()
+        canon(&self)
+    }
+}
+
+/// `p` as taba prints it for humans: with the home directory as `~` (on
+/// Windows the temp directory is inside the user profile).
+fn shown(p: &Path) -> String {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|h| !h.is_empty())
+        .map(|h| canon(Path::new(&h)));
+    match home.as_deref().and_then(|h| p.strip_prefix(h).ok()) {
+        Some(rest) => format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display()),
+        None => p.display().to_string(),
     }
 }
 
@@ -155,9 +182,28 @@ fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
     panic!("timed out waiting for {what}");
 }
 
+/// A directory for `PYTHONPATH` with a `sitecustomize.py` that skips the
+/// reverse DNS lookup `http.server` does on startup (`socket.getfqdn`),
+/// which takes over 30 s on GitHub's macOS runners.
+fn python_path() -> &'static str {
+    static DIR: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("taba-pythonpath");
+        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = dir.join(format!("sitecustomize.py.{}", std::process::id()));
+        std::fs::write(
+            &tmp,
+            "import socket\nsocket.getfqdn = lambda name='': name or 'localhost'\n",
+        )
+        .unwrap();
+        std::fs::rename(&tmp, dir.join("sitecustomize.py")).unwrap();
+        dir.to_str().unwrap().to_string()
+    });
+    &DIR
+}
+
 fn server_cmd(port: u16) -> Vec<String> {
     vec![
-        "python3".into(),
+        PY.into(),
         "-m".into(),
         "http.server".into(),
         port.to_string(),
@@ -185,9 +231,10 @@ struct Unmanaged(Child);
 
 impl Unmanaged {
     fn start(port: u16, cwd: &Path) -> Unmanaged {
-        let child = Command::new("python3")
+        let child = Command::new(PY)
             .args(server_cmd(port).iter().skip(1))
             .current_dir(cwd)
+            .env("PYTHONPATH", python_path())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -202,6 +249,112 @@ impl Drop for Unmanaged {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
+}
+
+/// Unix: a shell in its own session runs `first`, then `cd second_dir`, then
+/// the remaining commands, and stays around; once `ready` returns, the whole
+/// session is hung up and killed.
+#[cfg(unix)]
+fn close_terminal_after(
+    cwd: &Path,
+    home: &Path,
+    cmds: &[String],
+    second_dir: &Path,
+    ready: impl FnOnce(),
+) {
+    use std::os::unix::process::CommandExt;
+    let script = format!(
+        "{} && cd {} && {} && exec sleep 600",
+        cmds[0],
+        second_dir.display(),
+        cmds[1..].join(" && ")
+    );
+    let mut terminal = Command::new("/bin/sh");
+    terminal
+        .args(["-c", &script])
+        .current_dir(cwd)
+        .env("TABA_HOME", home)
+        .env("PYTHONPATH", python_path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    unsafe {
+        terminal.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let mut terminal = terminal.spawn().unwrap();
+    ready();
+    let tpg = terminal.id() as i32;
+    unsafe {
+        libc::kill(-tpg, libc::SIGHUP);
+        libc::kill(-tpg, libc::SIGKILL);
+    }
+    terminal.wait().unwrap();
+}
+
+/// Windows: `cmd.exe` with its own console runs the commands inside a job
+/// that kills everything in it when closed (like a terminal or CI runner
+/// that cleans up after itself, allowing breakaway); once `ready` returns,
+/// the job is closed.
+#[cfg(windows)]
+fn close_terminal_after(
+    cwd: &Path,
+    home: &Path,
+    cmds: &[String],
+    second_dir: &Path,
+    ready: impl FnOnce(),
+) {
+    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, SetInformationJobObject,
+    };
+    use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+
+    let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    assert!(!job.is_null());
+    let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+    limits.BasicLimitInformation.LimitFlags =
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+    let ok = unsafe {
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            (&raw const limits).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    };
+    assert_ne!(ok, 0);
+    // `cd /d DIR && ...`; a trailing ping keeps the terminal open.
+    let script = format!(
+        "{} && cd /d {} && {} && ping -n 600 127.0.0.1 >NUL",
+        cmds[0],
+        second_dir.display(),
+        cmds[1..].join(" && ")
+    );
+    // A pause first, so the job is assigned before anything is started.
+    let script = format!("ping -n 2 127.0.0.1 >NUL && {script}");
+    let mut terminal = Command::new("cmd.exe")
+        .arg("/c")
+        .raw_arg(&script)
+        .current_dir(cwd)
+        .env("TABA_HOME", home)
+        .env("PYTHONPATH", python_path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .unwrap();
+    let ok = unsafe { AssignProcessToJobObject(job, terminal.as_raw_handle()) };
+    assert_ne!(ok, 0);
+    ready();
+    unsafe { CloseHandle(job) };
+    terminal.wait().unwrap();
 }
 
 /// Criteria 1 and 2: two checkouts serve on different ports, and `ps` from a
@@ -241,7 +394,8 @@ fn two_checkouts_on_different_ports_are_listed_by_directory() {
     }
     let line_a = table.lines().find(|l| l.starts_with("feat-a/web")).unwrap();
     assert!(
-        line_a.contains(&format!("http://localhost:{pa}")) && line_a.contains(a.to_str().unwrap())
+        line_a.contains(&format!("http://localhost:{pa}")) && line_a.contains(&shown(&a)),
+        "{table}"
     );
 
     // --scope filter.
@@ -331,36 +485,23 @@ fn survives_terminal_close_and_stop_is_targeted() {
     env.scopes.push("feat-a".into());
     env.scopes.push("feat-b".into());
 
-    // Simulate a terminal: a shell in its own session that launches taba
-    // and then stays around, which we then hang up and kill as a group.
-    let script = format!(
-        "{BIN} run --scope feat-a --name web --port {pa} -- python3 -m http.server {pa} --bind 127.0.0.1 && \
-         cd {b} && {BIN} run --scope feat-b --name web --port {pb} -- python3 -m http.server {pb} --bind 127.0.0.1 && \
-         exec sleep 600",
-        b = b.display()
+    // Simulate a terminal that launches taba and then goes away, taking
+    // everything it still owns with it.
+    let run = |scope: &str, port: u16| {
+        format!(
+            "{BIN} run --scope {scope} --name web --port {port} -- {PY} -m http.server {port} --bind 127.0.0.1"
+        )
+    };
+    close_terminal_after(
+        &a,
+        &home,
+        &[run("feat-a", pa), run("feat-b", pb)],
+        &b,
+        || {
+            wait_until("server a", || http_ok(pa));
+            wait_until("server b", || http_ok(pb));
+        },
     );
-    let mut terminal = Command::new("/bin/sh");
-    terminal
-        .args(["-c", &script])
-        .current_dir(&a)
-        .env("TABA_HOME", &home)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    unsafe {
-        terminal.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
-    let mut terminal = terminal.spawn().unwrap();
-    wait_until("server a", || http_ok(pa));
-    wait_until("server b", || http_ok(pb));
-    let tpg = terminal.id() as i32;
-    unsafe {
-        libc::kill(-tpg, libc::SIGHUP);
-        libc::kill(-tpg, libc::SIGKILL);
-    }
-    terminal.wait().unwrap();
 
     thread::sleep(Duration::from_millis(300));
     assert!(http_ok(pa), "server a died with its terminal");
@@ -445,14 +586,16 @@ fn scope_falls_back_to_env() {
     let mut env = Env::new("envscope");
     let a = env.dir("a");
     env.scopes.push("from-env".into());
-    let out = env.taba(&a, &["run", "--name", "x", "--", "sleep", "30"]);
+    let sleeper = sleep_cmd(30);
+    let out = env.taba(&a, &run_noscope("x", &sleeper));
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("TABA_SCOPE"));
 
     let out = Command::new(BIN)
-        .args(["run", "--name", "x", "--", "sleep", "30"])
+        .args(run_noscope("x", &sleeper))
         .current_dir(&a)
         .env("TABA_HOME", env.home())
+        .env("PYTHONPATH", python_path())
         .env("TABA_SCOPE", "from-env")
         .output()
         .unwrap();
@@ -462,8 +605,23 @@ fn scope_falls_back_to_env() {
     assert!(rows[0]["url"].is_null());
 }
 
+/// A command that runs for `secs` seconds, on every platform.
+fn sleep_cmd(secs: u32) -> Vec<String> {
+    vec![
+        PY.into(),
+        "-c".into(),
+        format!("import time; time.sleep({secs})"),
+    ]
+}
+
 fn sleeper() -> Vec<String> {
-    vec!["sleep".into(), "300".into()]
+    sleep_cmd(300)
+}
+
+fn run_noscope<'a>(name: &'a str, cmd: &'a [String]) -> Vec<&'a str> {
+    let mut v = vec!["run", "--name", name, "--"];
+    v.extend(cmd.iter().map(|s| s.as_str()));
+    v
 }
 
 fn run_plain<'a>(scope: &'a str, name: &'a str, cmd: &'a [String]) -> Vec<&'a str> {
@@ -574,6 +732,7 @@ fn human_output_abbreviates_home() {
             .current_dir(&a)
             .env("HOME", &env.root)
             .env("TABA_HOME", env.home())
+            .env("PYTHONPATH", python_path())
             .env_remove("TABA_SCOPE")
             .env_remove("TABA_AGENT")
             .env_remove("TABA_OUTPUT")
@@ -589,13 +748,14 @@ fn human_output_abbreviates_home() {
         stdout.starts_with(&format!("started s/web → http://localhost:{port}\n")),
         "{stdout}"
     );
-    assert!(stdout.contains("  dir  ~/proj\n"), "{stdout}");
+    let proj = format!("~{}proj", std::path::MAIN_SEPARATOR);
+    assert!(stdout.contains(&format!("  dir  {proj}\n")), "{stdout}");
     assert!(stdout.contains("  logs taba logs s/web"), "{stdout}");
     assert!(stdout.lines().all(|l| l.chars().count() <= 60), "{stdout}");
 
     let out = taba(&["ps"]);
     let table = String::from_utf8_lossy(&out.stdout).to_string();
-    assert!(table.contains("~/proj"), "{table}");
+    assert!(table.contains(&proj), "{table}");
     assert!(!table.contains(env.root.to_str().unwrap()), "{table}");
 
     let out = taba(&["ps", "--json"]);
@@ -619,5 +779,5 @@ fn human_output_abbreviates_home() {
     );
 
     let out = taba(&["stop", "s/web", "--scope", "s"]);
-    assert!(String::from_utf8_lossy(&out.stdout).contains("~/proj"));
+    assert!(String::from_utf8_lossy(&out.stdout).contains(&proj));
 }

@@ -17,7 +17,6 @@ use serde_json::{Value, json};
 use state::{OpLock, Service, Store};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::unix::process::CommandExt;
 use std::process::{Command, ExitCode, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -108,7 +107,8 @@ enum Cmd {
         /// Agent acting (default: $TABA_AGENT, else "human")
         #[arg(long)]
         agent: Option<String>,
-        /// Seconds to wait after SIGTERM before sending SIGKILL
+        /// Seconds to wait after SIGTERM (Windows: Ctrl+Break) before SIGKILL
+        /// (Windows: TerminateJobObject)
         #[arg(long, default_value_t = 5.0)]
         timeout: f64,
         /// Stop a service of another scope (needs --reason; recorded)
@@ -138,6 +138,11 @@ enum Cmd {
         #[arg(long, requires = "force")]
         reason: Option<String>,
     },
+    /// Internal (Windows): send Ctrl+Break to console process group PGID,
+    /// attaching to the console of process ATTACH
+    #[cfg(windows)]
+    #[command(name = "__ctrl-break", hide = true)]
+    CtrlBreak { attach: u32, pgid: u32 },
 }
 
 fn env_json() -> bool {
@@ -182,6 +187,10 @@ fn main() -> ExitCode {
     };
 
     let (json_mode, res): (bool, Result<Option<Output>>) = match cli.cmd {
+        #[cfg(windows)]
+        Cmd::CtrlBreak { attach, pgid } => {
+            return ExitCode::from(proc::ctrl_break_helper(attach, pgid));
+        }
         Cmd::Run {
             scope,
             agent,
@@ -517,7 +526,7 @@ fn cmd_run(a: RunArgs) -> Result<Output> {
     let log_offset = log.metadata()?.len();
     let log_err = log.try_clone()?;
 
-    let mut cmd = Command::new(&command[0]);
+    let mut cmd = Command::new(proc::resolve_program(&command[0]));
     cmd.args(&command[1..])
         .current_dir(&caller.cwd)
         .env("TABA_SCOPE", &scope)
@@ -528,16 +537,6 @@ fn cmd_run(a: RunArgs) -> Result<Output> {
     if let Some(p) = port {
         cmd.env("PORT", p.to_string());
     }
-    // New session => new process group with pgid == pid and no controlling
-    // terminal, so closing the launching terminal does not SIGHUP it.
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
     let start_failed = |message: String| {
         TabaError::new("E_START_FAILED", message)
             .details(json!({
@@ -545,16 +544,15 @@ fn cmd_run(a: RunArgs) -> Result<Output> {
             }))
             .next(Next::run("read the log", format!("taba logs {id}")))
     };
-    let child = cmd
-        .spawn()
-        .map_err(|e| start_failed(format!("cannot start {:?}: {e}", command[0])))?;
-    let pid = child.id() as i32;
-    // The child is intentionally not waited on: once taba exits it is
-    // re-parented to launchd, which reaps it.
-    drop(child);
-
-    let info = proc::info(pid)
-        .ok_or_else(|| start_failed(format!("{id} exited immediately; see taba logs {id}")))?;
+    // Detached: its own session / process group (Unix) or console and job
+    // (Windows), so closing the launching terminal does not stop it.
+    let spawned = proc::spawn_detached(cmd).map_err(|e| match e {
+        proc::SpawnError::Start(e) => start_failed(format!("cannot start {:?}: {e}", command[0])),
+        proc::SpawnError::Vanished => {
+            start_failed(format!("{id} exited immediately; see taba logs {id}"))
+        }
+    })?;
+    let pid = spawned.pid;
     let mut svc = Service {
         scope: scope.clone(),
         name: name.clone(),
@@ -562,12 +560,12 @@ fn cmd_run(a: RunArgs) -> Result<Output> {
         cwd: caller.cwd.clone(),
         port,
         pid,
-        pgid: pid,
-        start_time: info.start_time,
+        pgid: spawned.pgid,
+        start_time: spawned.start_time,
         log_path: log_path.clone(),
         command_template: Some(template),
         port_request,
-        instance: Some(format!("{pid}-{}", info.start_time)),
+        instance: Some(format!("{pid}-{}", spawned.start_time)),
         started_by: Some(caller.agent.clone()),
         ready: None,
     };
@@ -949,7 +947,7 @@ fn cmd_stop(
         results.push(r);
         let what = match d.result {
             "stopped" => "stopped".to_string(),
-            "killed" => "stopped (SIGKILL after timeout)".to_string(),
+            "killed" => format!("stopped ({} after timeout)", proc::KILL_SIGNAL),
             _ if d.unverifiable => format!(
                 "not running (exited; pid {} is now another process, not signalled)",
                 d.svc.pid
@@ -1045,7 +1043,7 @@ fn stop_one(
 
     // Re-verify identity immediately before signalling (as v0.1 does).
     let res = if svc.is_running() {
-        proc::stop_group(svc.pgid, timeout).map(Some)
+        proc::stop_group(svc.pid, svc.pgid, svc.start_time, timeout).map(Some)
     } else {
         Ok(None)
     };

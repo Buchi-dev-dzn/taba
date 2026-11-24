@@ -8,7 +8,7 @@
 
 **Bundle what you start, per task.**
 
-![platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey)
+![platform: macOS | Linux | Windows](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)
 ![license: MIT](https://img.shields.io/badge/license-MIT-blue)
 ![language: Rust](https://img.shields.io/badge/language-Rust-orange)
 ![status: prototype](https://img.shields.io/badge/status-prototype-yellow)
@@ -30,8 +30,9 @@ belongs to which task, and only that task can stop its processes.
 
 ## Install
 
-`taba` is built from source with Rust and runs on macOS only. It has no
-Homebrew formula or crates.io release yet.
+`taba` is built from source with Rust and runs on macOS, Linux and Windows
+(see [Platforms](#platforms)). It has no Homebrew formula or crates.io
+release yet.
 
 ```sh
 git clone <this repo> taba && cd taba
@@ -298,7 +299,8 @@ that. Measurements against Docker are in [docs/benchmarks.md](docs/benchmarks.md
   signalled only if its identity still matches: the leader pid with its exact
   start time or, if the leader has exited, a surviving process group whose
   members all started after the recorded time. taba sends SIGTERM to the
-  group, then SIGKILL after `--timeout` seconds (default 5).
+  group, then SIGKILL after `--timeout` seconds (default 5). On Windows the
+  group is a Job Object, and taba sends Ctrl+Break, then terminates the job.
 - **Unmanaged processes are never touched.** A process taba didn't start, or
   one it can no longer verify, is reported, never signalled.
 - **Stopping never deletes files.** A stopped service keeps its record and log
@@ -320,7 +322,7 @@ that. Measurements against Docker are in [docs/benchmarks.md](docs/benchmarks.md
 | `taba logs [-f] S/N` (or `N` in your scope) | Print the log. Add `-f` to follow it until the service exits. |
 | `taba stop S/N` (or `N` in your scope) | Stop one service of your own scope. |
 | `taba stop --scope S` | Stop every service in scope `S`. |
-| `taba stop ... --timeout SECS` | Seconds to wait between SIGTERM and SIGKILL (default 5). |
+| `taba stop ... --timeout SECS` | Seconds to wait between SIGTERM and SIGKILL (Windows: Ctrl+Break and job termination; default 5). |
 | `taba stop ... --force --reason TEXT` | Stop a service of another scope; recorded in `events.jsonl`. |
 | `taba rm S/N` (or `N` in your scope) | Delete a stopped service's record and log. Refuses a running service, and another scope's service without `--force --reason`. |
 | `taba rm --scope S` | Delete the records and logs of every stopped service in scope `S`; running ones are kept and reported. |
@@ -380,18 +382,62 @@ $TABA_HOME (default ~/.taba)
 
 State written by taba 0.1 is read unchanged.
 
+## Platforms
+
+taba runs on macOS, Linux and Windows, and CI tests all three. Output,
+JSON fields and error codes are the same everywhere; how taba tracks and
+stops processes differs:
+
+| | macOS | Linux | Windows |
+| --- | --- | --- | --- |
+| Process facts | `proc_pidinfo`, `KERN_PROCARGS2` | `/proc/PID/stat`, `cmdline` | `GetProcessTimes`, the process's command line |
+| Listening ports | `lsof` | `/proc/net/tcp{,6}` | `GetExtendedTcpTable` |
+| A service's processes | its process group (new session) | its process group (new session) | its Job Object |
+| `stop` | SIGTERM, then SIGKILL | SIGTERM, then SIGKILL | Ctrl+Break, then terminate the job |
+| State lock | `flock` | `flock` | `LockFileEx` |
+
+On Windows:
+
+- A service runs with its own hidden console, so closing the terminal that
+  started it does not stop it. If that terminal runs its children in a job
+  that kills them on close and forbids breakaway, the service is still part
+  of that job and stops with it.
+- `stop`'s graceful step is Ctrl+Break, which most runtimes (Node, Python,
+  Go) treat as SIGBREAK and exit on. JSON keeps `"signal": "TERM"` /
+  `"KILL"` for the two steps.
+- Programs are looked up with `PATHEXT`, so `taba run -- npm run dev` runs
+  `npm.cmd`.
+- `python3` is often only the Microsoft Store stub; use `python`.
+- Paths print as `C:\...`, with `~` for `%USERPROFILE%`, and `next`
+  commands are quoted for POSIX shells (Git Bash, WSL).
+
+### WSL and Windows
+
+A server in WSL and one on Windows live in separate process spaces. taba
+inside WSL sees only WSL processes, and taba on Windows only Windows ones;
+neither can stop the other's servers, and each keeps its own `~/.taba`.
+
+Ports are another matter: WSL forwards `localhost` ports to Windows (and
+in mirrored networking mode, both ways). A port used by a WSL server
+therefore looks taken from Windows, but its process is not visible there.
+taba on Windows reports such a port as `E_PORT_IN_USE` with
+`holder.kind: "unknown"`, saying it is forwarded from WSL (`wslrelay.exe`)
+or held by a process it cannot see, which may run outside this OS (WSL, a
+VM or a container). `--port auto` skips such ports. Run `taba ps` inside
+WSL to see what holds it there.
+
 ## Limitations
 
 taba is an early prototype:
 
-- **macOS only.** It uses `proc_pidinfo` / `proc_listallpids`.
 - **Port detection is partial.** taba checks loopback (IPv4/IPv6) connects and
   a wildcard bind. A server bound only to a non-loopback address may go
   unnoticed.
 - **Exited entries are replaced on re-run.** A new `run` with the same
   scope/name overwrites the record of an exited service. The log is appended.
 - **Some children are not tracked.** Children that move into a different
-  process group or session are not tracked, and `stop` won't reach them.
+  process group or session (Windows: break away from the job) are not
+  tracked, and `stop` won't reach them.
 - **No log rotation.** Logs grow across runs until you `taba rm` the service.
 - **Ownership is a convention, not security.** `--scope`, `$TABA_SCOPE` and
   `$TABA_AGENT` are claims: any process of your user can name any scope, and
@@ -405,7 +451,6 @@ taba is an early prototype:
   `ps --all` (M2), agent leases and `gc` (M3), borrows of another scope's
   service (M4), hand-over with `move` (M5), agent hooks (M6)
 - Log rotation
-- Linux support
 - Better port detection (non-loopback binds)
 - Prebuilt binaries and a Homebrew formula
 

@@ -21,6 +21,22 @@ use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_taba");
 
+/// The Python interpreter: `python3` on Unix; on Windows `python3` is often
+/// only the Microsoft Store stub, so `python`.
+const PY: &str = if cfg!(windows) { "python" } else { "python3" };
+
+const NULL_DEVICE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
+
+/// `canonicalize`, without the `\\?\` prefix on Windows (as taba prints paths).
+fn canon(p: &Path) -> PathBuf {
+    let c = p.canonicalize().unwrap();
+    let s = c.to_string_lossy().to_string();
+    match s.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+        _ => c,
+    }
+}
+
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -42,12 +58,12 @@ fn git(cwd: &Path, args: &[&str]) {
             "-c",
             "commit.gpgsign=false",
             "-c",
-            "core.hooksPath=/dev/null",
+            &format!("core.hooksPath={NULL_DEVICE}"),
         ])
         .args(args)
         .current_dir(cwd)
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_GLOBAL", NULL_DEVICE)
         .output()
         .expect("run git");
     assert!(out.status.success(), "git {args:?}: {}", text(&out));
@@ -59,7 +75,7 @@ impl Fixture {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let root = std::env::temp_dir().join(format!("taba-m1-{}-{test}-{n}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
-        let root = root.canonicalize().unwrap();
+        let root = canon(&root);
         let repo = root.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         git(&repo, &["init", "-q", "-b", "main"]);
@@ -86,6 +102,7 @@ impl Fixture {
         c.args(args)
             .current_dir(cwd)
             .env("TABA_HOME", self.home())
+            .env("PYTHONPATH", python_path())
             .env_remove("TABA_SCOPE")
             .env_remove("TABA_AGENT")
             .env_remove("TABA_OUTPUT");
@@ -191,14 +208,7 @@ fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
     panic!("timed out waiting for {what}");
 }
 
-const SERVER: [&str; 6] = [
-    "python3",
-    "-m",
-    "http.server",
-    "{port}",
-    "--bind",
-    "127.0.0.1",
-];
+const SERVER: [&str; 6] = [PY, "-m", "http.server", "{port}", "--bind", "127.0.0.1"];
 
 /// `run --name NAME --port auto --wait --json -- python3 -m http.server {port}`
 fn run_auto(name: &str) -> Vec<&str> {
@@ -207,6 +217,27 @@ fn run_auto(name: &str) -> Vec<&str> {
     ];
     v.extend_from_slice(&SERVER);
     v
+}
+
+const SLEEP_30: &str = "import time; time.sleep(30)";
+
+/// A directory for `PYTHONPATH` with a `sitecustomize.py` that skips the
+/// reverse DNS lookup `http.server` does on startup (`socket.getfqdn`),
+/// which takes over 30 s on GitHub's macOS runners.
+fn python_path() -> &'static str {
+    static DIR: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("taba-pythonpath");
+        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = dir.join(format!("sitecustomize.py.{}", std::process::id()));
+        std::fs::write(
+            &tmp,
+            "import socket\nsocket.getfqdn = lambda name='': name or 'localhost'\n",
+        )
+        .unwrap();
+        std::fs::rename(&tmp, dir.join("sitecustomize.py")).unwrap();
+        dir.to_str().unwrap().to_string()
+    });
+    &DIR
 }
 
 fn port_of(v: &Value) -> u16 {
@@ -218,7 +249,7 @@ struct Unmanaged(Child);
 
 impl Unmanaged {
     fn start(port: u16, cwd: &Path) -> Unmanaged {
-        let child = Command::new("python3")
+        let child = Command::new(PY)
             .args([
                 "-m",
                 "http.server",
@@ -227,6 +258,7 @@ impl Unmanaged {
                 "127.0.0.1",
             ])
             .current_dir(cwd)
+            .env("PYTHONPATH", python_path())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -382,9 +414,11 @@ fn m1_05_not_ready_and_start_failed() {
             "--wait=2",
             "--json",
             "--",
-            "sh",
+            PY,
             "-c",
-            "sleep 5; exec python3 -m http.server {port} --bind 127.0.0.1",
+            "import runpy, sys, time; time.sleep(5); \
+             sys.argv = ['http.server', '{port}', '--bind', '127.0.0.1']; \
+             runpy.run_module('http.server', run_name='__main__')",
         ],
     );
     assert_eq!(exit(&out), 4, "{}", text(&out));
@@ -402,7 +436,17 @@ fn m1_05_not_ready_and_start_failed() {
     let out = f.taba(
         &f.wt_a,
         &[
-            "run", "--name", "bad", "--port", "auto", "--wait", "--json", "--", "false",
+            "run",
+            "--name",
+            "bad",
+            "--port",
+            "auto",
+            "--wait",
+            "--json",
+            "--",
+            PY,
+            "-c",
+            "raise SystemExit(1)",
         ],
     );
     assert_eq!(exit(&out), 4, "{}", text(&out));
@@ -420,9 +464,9 @@ fn m1_05_not_ready_and_start_failed() {
             "--wait",
             "--json",
             "--",
-            "sh",
+            PY,
             "-c",
-            "echo boom-on-stderr >&2; exit 3",
+            "import sys; print('boom-on-stderr', file=sys.stderr); sys.exit(3)",
         ],
     );
     assert_eq!(exit(&out), 4, "{}", text(&out));
@@ -520,14 +564,15 @@ fn m1_06_cross_scope_stop_is_refused_unless_forced() {
 }
 
 /// M1.7: two simultaneous stops of one service: one stops it, the other
-/// gets `E_BUSY` or `not_running`, and SIGTERM is delivered once.
+/// gets `E_BUSY` or `not_running`, and SIGTERM (Windows: Ctrl+Break, which
+/// Python sees as SIGBREAK) is delivered once.
 #[test]
 fn m1_07_concurrent_stops_signal_once() {
     let f = Fixture::new("busy");
     // Counts SIGTERMs in its log and takes a second to exit after the first.
     let script = "import signal, sys, time\n\
                   def term(*_):\n    print('got-TERM', flush=True)\n    time.sleep(1)\n    sys.exit(0)\n\
-                  signal.signal(signal.SIGTERM, term)\n\
+                  signal.signal(getattr(signal, 'SIGBREAK', signal.SIGTERM), term)\n\
                   print('ready', flush=True)\n\
                   while True:\n    time.sleep(0.05)\n";
     let out = f.taba(
@@ -541,7 +586,7 @@ fn m1_07_concurrent_stops_signal_once() {
             "log:^ready$",
             "--json",
             "--",
-            "python3",
+            PY,
             "-c",
             script,
         ],
@@ -588,14 +633,17 @@ fn m1_08_no_scope_outside_a_repository() {
     let f = Fixture::new("noscope");
     let out = f.taba(
         &f.outside,
-        &["run", "--name", "x", "--json", "--", "sleep", "30"],
+        &["run", "--name", "x", "--json", "--", PY, "-c", SLEEP_30],
     );
     assert_eq!(exit(&out), 2, "{}", text(&out));
     assert_eq!(json(&out)["error"]["code"], "E_NO_SCOPE");
     assert!(f.ps(&[]).is_empty());
 
     let out = f
-        .cmd(&f.outside, &["run", "--name", "x", "--", "sleep", "30"])
+        .cmd(
+            &f.outside,
+            &["run", "--name", "x", "--", PY, "-c", SLEEP_30],
+        )
         .env("TABA_SCOPE", "x")
         .output()
         .unwrap();
@@ -629,7 +677,7 @@ fn m1_09_v01_state_still_works() {
     let f = Fixture::new("v01");
     let port = (20000..30000).find(|p| port_free(*p)).unwrap();
     let ps = port.to_string();
-    let cmd = ["python3", "-m", "http.server", &ps, "--bind", "127.0.0.1"];
+    let cmd = [PY, "-m", "http.server", &ps, "--bind", "127.0.0.1"];
     let mut run = vec![
         "run", "--scope", "old", "--name", "web", "--port", &ps, "--",
     ];
@@ -698,7 +746,16 @@ fn m1_10_one_scope_many_services() {
     let api = json(&f.taba(&f.wt_a, &run_auto("api")));
     let out = f.taba(
         &f.wt_a,
-        &["run", "--name", "worker", "--json", "--", "sleep", "300"],
+        &[
+            "run",
+            "--name",
+            "worker",
+            "--json",
+            "--",
+            PY,
+            "-c",
+            "import time; time.sleep(300)",
+        ],
     );
     assert_eq!(exit(&out), 0, "{}", text(&out));
     let worker = json(&out);

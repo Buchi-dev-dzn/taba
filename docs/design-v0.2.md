@@ -58,7 +58,7 @@ else's work.
   the app or wait for it: it sleeps 200 ms and checks the process is alive.
 - `stop` signals a process group only if its identity still matches: leader
   pid plus start time, or surviving members that all started after the
-  recorded time (`src/proc.rs`, `group_is_ours`). It sends SIGTERM, then
+  recorded time (`src/proc/`, `group_is_ours`). It sends SIGTERM, then
   SIGKILL after `--timeout`.
 - `stop` and `rm` accept **any** scope. Nothing checks who is asking.
 - The state has one global `flock` (`$TABA_HOME/lock`), and records are
@@ -1499,10 +1499,11 @@ was replaced by Antigravity CLI on 2026-06-18, so it is not a v0.2 target.
   ([comparison.md](comparison.md)).
 - **A daemon.** Leases, gc and locks are designed to work without any
   resident process. There is no launchd agent in v0.2.
-- **Linux (for now).** The design is portable (flock, process groups, pid
-  plus start time), but `src/proc.rs` uses macOS APIs (`proc_pidinfo`,
-  `proc_listallpids`, `KERN_PROCARGS2`), and `ps --all` needs
-  `PROC_PIDVNODEPATHINFO`. Linux would need `/proc` versions of these.
+- **Platform gaps.** taba runs on macOS, Linux and Windows (section 8,
+  "Platform notes"). `ps --all` (M2) lists listeners through
+  `proc::listeners`, which exists on all three; the working directory of an
+  unmanaged process needs `PROC_PIDVNODEPATHINFO` (macOS), `/proc/PID/cwd`
+  (Linux) or a PEB read (Windows), still to be written.
 - **Security between users or against a malicious agent.** Identity is
   claimed, not proven (section 2, "Limits").
 - **Proxies and stable hostnames** (`web.login-fix.localhost`). These would
@@ -1510,7 +1511,7 @@ was replaced by Antigravity CLI on 2026-06-18, so it is not a v0.2 target.
 - **Database-level locking.** `borrow --mut` is an advisory lock that agents
   take before touching a shared DB. taba does not understand schemas,
   connections or transactions.
-- **Log rotation, Windows, a TUI.** Unchanged from v0.1.
+- **Log rotation, a TUI.** Unchanged from v0.1.
 
 ---
 
@@ -1692,6 +1693,74 @@ Where the design left a choice open, M1 does this:
   directory without a scope now pass `--scope`: decision 4 deliberately
   changes that behaviour, so "keeps every v0.1 test passing" holds only
   with that change.
+
+#### Platform notes (Windows and Linux ports)
+
+taba was macOS-only through M1. The process code now sits behind one
+module, `src/proc/` (`mod.rs` is the API the rest of taba uses), with
+`macos.rs` and `linux.rs` for process facts, `unix.rs` shared by both
+(process groups, `setsid`, signals), and `windows.rs`. Records, JSON output,
+error codes and exit statuses are the same on every platform. CI runs the
+whole test suite on macOS, Linux and Windows.
+
+Linux reads `/proc/PID/stat` (process group, state, start time),
+`/proc/PID/cmdline` (argv) and `/proc/net/tcp{,6}` with `/proc/PID/fd`
+(listeners; like `lsof`, only this user's processes). Groups and signals
+work as on macOS. The start time is the boot time (`btime`) plus the start
+tick (10 ms resolution). The kernel recomputes `btime` from the wall clock,
+which moves when the clock is stepped (NTP, or WSL catching up after the
+host slept), so the first `btime` read in a boot is kept in
+`$TMPDIR/taba-btime-UID-BOOTID` and reused, keeping recorded start times
+comparable.
+
+Windows differs where the OS has no equivalent:
+
+- **Group = Job Object.** `run` starts the process suspended, puts it in a
+  new job named `Local\taba-PID-START`, gives the process an inheritable
+  handle to the job, and resumes it. Children join the job, like a process
+  group; the job's name stays valid while any process holds that handle
+  (children started with handle inheritance, such as Node's or cmd's, do).
+  `pgid` is recorded as the pid, as on Unix. When no process holds the job
+  any more (the leader exited and its children did not inherit the handle,
+  e.g. Python's `subprocess` default), taba falls back to the leader's
+  descendants by parent pid, each started after the leader (and before any
+  reuse of the leader's pid). Breaking away from the job is the Windows
+  counterpart of leaving the process group: such children are not tracked.
+- **Detaching.** `CREATE_NO_WINDOW` gives the service its own hidden
+  console (the counterpart of a new session: closing the launching terminal
+  does not end it), `CREATE_NEW_PROCESS_GROUP` its own console process group,
+  and `CREATE_BREAKAWAY_FROM_JOB` takes it out of the launching terminal's or
+  CI runner's job when that job allows breakaway; when it does not, the
+  service stays in that job (nested) and ends with it. taba's own standard
+  handles are made non-inheritable before spawning, so a service never holds
+  the pipe of whoever reads taba's output.
+- **No SIGTERM.** `stop` sends Ctrl+Break to the service's console (through
+  a hidden helper, `taba __ctrl-break PID PGID`, because only a process
+  attached to a console can signal it). Node, Python and Go see it as
+  SIGBREAK and exit by default. After `--timeout` it calls
+  `TerminateJobObject` (or `TerminateProcess` on the verified descendants
+  when there is no job). JSON keeps `"signal": "TERM"` / `"KILL"` for the
+  two steps; human output says "forced termination".
+- **Port checks.** `GetExtendedTcpTable` (IPv4 and IPv6) gives listeners and
+  their pids and is consulted first, because a refused loopback connect
+  takes about two seconds on Windows (taba's connect timeout is 150 ms
+  there). A bind refused with `WSAEACCES` (a reserved range, `netsh int
+  ipv4 show excludedportrange`) counts as in use, so `--port auto` skips it.
+- **Programs** resolve through `PATH` and `PATHEXT`, so `npm` runs
+  `npm.cmd`. Paths are canonicalized without the `\?\` prefix, `~` stands
+  for `%USERPROFILE%` (or `$HOME` when set), and the state lock is
+  `LockFileEx` (through `File::lock`, which is `flock` on Unix). `log:`
+  ready checks match CRLF output like LF.
+
+WSL and Windows are separate process spaces, each with its own taba state.
+WSL forwards `localhost` ports to Windows (`wslrelay.exe` in NAT mode; in
+mirrored mode the ports are shared both ways), so a WSL server's port looks
+taken from Windows while its process is invisible there. taba reports such
+a port as `E_PORT_IN_USE` with `holder.kind: "unknown"`: forwarded from WSL
+(`"outside": "wsl"`, with the relay's pid) when the listener is
+`wslrelay.exe`, else "a process taba cannot identify", which may be another
+user's or one outside this OS. taba never signals such a holder. The same
+holds the other way round for taba inside WSL in mirrored mode.
 
 ### M2: JSON everywhere and `ps --all`
 

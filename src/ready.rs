@@ -140,7 +140,9 @@ fn log_matches(svc: &Service, re: &Regex, offset: u64) -> bool {
     if f.read_to_end(&mut buf).is_err() {
         return false;
     }
-    re.is_match(&String::from_utf8_lossy(&buf))
+    // CRLF line ends (Windows programs) are matched like LF, so that `$`
+    // works at the end of a line.
+    re.is_match(&String::from_utf8_lossy(&buf).replace("\r\n", "\n"))
 }
 
 #[cfg(test)]
