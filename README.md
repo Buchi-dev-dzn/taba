@@ -119,9 +119,25 @@ taba is meant for AI coding agents as much as for people:
   ```
 - Each started process gets `TABA_SCOPE` and `TABA_SERVICE` in its environment.
 
+### Agent skill
+
+[`skills/taba/SKILL.md`](skills/taba/SKILL.md) is a skill in the Agent Skills
+format. It tells an agent when and how to use taba: reuse before starting,
+explicit ports, staying inside its own scope, and what to report at hand-off.
+To install it, copy or symlink the `skills/taba` directory into a skills
+folder your agent reads:
+
+```sh
+# Claude Code, for all projects
+mkdir -p ~/.claude/skills && ln -s "$PWD/skills/taba" ~/.claude/skills/taba
+
+# or for one project (Claude Code: .claude/skills, other agents: .agents/skills)
+mkdir -p .claude/skills && cp -R /path/to/taba/skills/taba .claude/skills/
+```
+
 ### AGENTS.md / CLAUDE.md snippet
 
-Paste this into `AGENTS.md` or `CLAUDE.md`:
+If your agent doesn't load skills, paste this into `AGENTS.md` or `CLAUDE.md`:
 
 ```markdown
 ## Long-running processes (dev servers, watchers, databases)
