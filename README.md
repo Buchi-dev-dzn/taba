@@ -3,6 +3,7 @@
 **Bundle what you start, per task.**
 
 ![platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey)
+![license: MIT](https://img.shields.io/badge/license-MIT-blue)
 ![language: Rust](https://img.shields.io/badge/language-Rust-orange)
 ![status: prototype](https://img.shields.io/badge/status-prototype-yellow)
 
@@ -243,3 +244,7 @@ taba is an early prototype:
 - Prebuilt binaries and a Homebrew formula
 
 See [docs/plan.md](docs/plan.md) for the design notes.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
