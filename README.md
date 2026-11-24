@@ -54,6 +54,18 @@ taba run --scope login-fix --name web --port 5173 -- npm run dev -- --port 5173 
 > `--port` only tells taba which port to track. Pass the port to your own
 > command as well.
 
+**What `taba run` does.** It wraps the command you already use, such as
+`npm run dev`. It starts it detached in its own process group, records the
+scope, name, directory and port, sends stdout and stderr to a log file, and
+gives you the prompt back. The server itself runs unchanged.
+
+| | `npm run dev` | `taba run … -- npm run dev` |
+| --- | --- | --- |
+| Terminal | busy until you press Ctrl-C | free again right away |
+| Close the terminal | the server stops | the server keeps running |
+| Output | in that terminal only | in a log file, `taba logs` from any terminal |
+| Later | find it with `ps` / `lsof` | `taba ps` shows task, URL and directory |
+
 **See what is running**, across every scope or for a single one:
 
 ```sh
@@ -175,6 +187,42 @@ If your agent doesn't load skills, paste this into `AGENTS.md` or `CLAUDE.md`:
 - At hand-off, report each service's name and URL, and say whether you left
   it running or stopped it.
 ```
+
+## taba vs Docker
+
+taba is for dev servers that don't need a container, so they don't get lost.
+It is not a Docker replacement. Measured on an Apple M1 with Docker Desktop
+4.97, `python -m http.server`, N = 15, medians. Method, machine and raw data
+are in [docs/benchmarks.md](docs/benchmarks.md).
+
+| | plain shell (`nohup … &`) | taba | Docker |
+| --- | ---: | ---: | ---: |
+| Start → first HTTP 200 | 216 ms | 226 ms | 537 ms |
+| Stop → port free | 3 ms | 66 ms | 3211 ms (161 ms with `--init`) |
+| Resident background process | none | none | Docker Desktop, ~2 GB |
+| Size on disk | – | 1.27 MB binary | 207 MB image |
+
+**Where taba helps**
+
+- Re-running the same command does not start a duplicate. It returns the
+  service that is already running.
+- On a port conflict, taba names the process holding the port and starts
+  nothing. Docker leaves a `Created` container behind.
+- `taba ps` shows the task and directory of each server.
+- It runs in place on your files. In our test, Docker bind-mount reads were
+  3–8× slower than native.
+- There is no daemon and no VM.
+
+**Where Docker is the right tool**
+
+- Isolation and reproducible environments. taba gives neither: a service is an
+  ordinary host process using whatever `node` or `python3` is on your `PATH`.
+- taba is not faster than starting with plain `&` or `nohup`. It adds
+  bookkeeping, not speed.
+- `taba run` currently waits ~200 ms before it returns.
+
+Not measured: Docker engine cold start (Docker Desktop was already running)
+and Vite inside Docker.
 
 ## Ownership model
 
