@@ -72,23 +72,38 @@ pub fn argv(pid: i32) -> Option<Vec<String>> {
             0,
         )
     };
-    if rc != 0 || size < 4 {
+    if rc != 0 {
         return None;
     }
-    buf.truncate(size);
-    // Layout: argc (i32), exec path, NUL padding, then argc NUL-terminated args.
-    let argc = i32::from_ne_bytes(buf[..4].try_into().ok()?) as usize;
-    let mut rest = &buf[4..];
-    let end = rest.iter().position(|b| *b == 0)?;
-    rest = &rest[end..];
-    let start = rest.iter().position(|b| *b != 0)?;
-    rest = &rest[start..];
-    let args: Vec<String> = rest
-        .split(|b| *b == 0)
-        .take(argc)
-        .map(|a| String::from_utf8_lossy(a).into_owned())
-        .collect();
-    if args.is_empty() { None } else { Some(args) }
+    parse_argv(buf.get(..size)?)
+}
+
+fn parse_argv(buf: &[u8]) -> Option<Vec<String>> {
+    let (argc, strings) = buf.split_first_chunk::<4>()?;
+    let argc = usize::try_from(i32::from_ne_bytes(*argc)).ok()?;
+    let path_end = strings.iter().position(|&byte| byte == 0)?;
+    // XNU pads the terminated exec path to the target's pointer width.
+    // Supported macOS processes are 64-bit, including under Rosetta.
+    // Skipping every NUL would discard empty leading args and then read envp.
+    let argv_start = (path_end + 1).next_multiple_of(8);
+    if strings
+        .get(path_end..argv_start)?
+        .iter()
+        .any(|&byte| byte != 0)
+    {
+        return None;
+    }
+    let mut rest = strings.get(argv_start..)?;
+    if argc == 0 || argc > rest.len() {
+        return None;
+    }
+    let mut args = Vec::new();
+    for _ in 0..argc {
+        let end = rest.iter().position(|&byte| byte == 0)?;
+        args.push(String::from_utf8_lossy(&rest[..end]).into_owned());
+        rest = &rest[end + 1..];
+    }
+    Some(args)
 }
 
 /// Lists all pids currently visible.
@@ -162,4 +177,25 @@ pub fn cwd(pid: i32) -> Option<std::path::PathBuf> {
         .lines()
         .find_map(|l| l.strip_prefix('n'))
         .map(std::path::PathBuf::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_argv;
+
+    #[test]
+    fn parses_empty_argv_entries_without_reading_environment() {
+        let mut buf = 4_i32.to_ne_bytes().to_vec();
+        buf.extend_from_slice(b"/x\0\0\0\0\0\0\0two words\0\0last\0ENV=ignored\0");
+        assert_eq!(parse_argv(&buf).unwrap(), ["", "two words", "", "last"]);
+    }
+
+    #[test]
+    fn rejects_incomplete_or_invalid_argv() {
+        let mut buf = 2_i32.to_ne_bytes().to_vec();
+        buf.extend_from_slice(b"/bin/sh\0sh\0unterminated");
+        assert_eq!(parse_argv(&buf), None);
+        buf[..4].copy_from_slice(&(-1_i32).to_ne_bytes());
+        assert_eq!(parse_argv(&buf), None);
+    }
 }
