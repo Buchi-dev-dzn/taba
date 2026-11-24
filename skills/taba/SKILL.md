@@ -125,6 +125,11 @@ human may still want the logs.
 
 ## Hand-off
 
+A successor in the same scope can take over after your lease ends. If you
+know the next agent, give it the scope with `taba move --to AGENT`. Use
+`taba move S/N --to SCOPE` when transferring just one service. Neither
+command restarts the service.
+
 When you hand work back, or may be cut off (usage limits), report each
 service you started, for example:
 
