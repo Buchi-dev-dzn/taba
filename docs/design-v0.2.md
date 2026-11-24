@@ -1475,9 +1475,12 @@ Codex documents a `PreToolUse` event with matcher `Bash`, `tool_input.command`
 in stdin, and blocking by exit code 2 or
 `hookSpecificOutput.permissionDecision: "deny"`. That is the same shape as
 Claude Code, so `taba hook codex pre-tool-use` shares the implementation and
-differs only in identity (`codex:<session_id>`). Whether Codex honours
-`permissionDecision: "ask"` is **not confirmed**; until it is, the Codex hook
-denies `--force` instead of asking (decision 9 falls back to decision 4). Codex requires non-managed
+uses the identity `codex:<session_id>`. The
+[Codex hook reference](https://developers.openai.com/codex/hooks#pretooluse)
+explicitly says `permissionDecision: "ask"` is unsupported for PreToolUse.
+The Codex hook thus denies `--force` and tells the agent to ask a human to
+run it separately. Claude Code asks for every hooked agent; taba cannot
+identify whether a tool call came from a coordinator or a worker. Codex requires non-managed
 hooks to be trusted through `/hooks` before they run, and its own docs call
 tool hooks "a useful guardrail, not a complete enforcement boundary". A
 SessionStart env file and SessionEnd behaviour are **not confirmed** for
@@ -1772,6 +1775,34 @@ holds the other way round for taba inside WSL in mirrored mode.
 3. `ps --all` signals nothing and writes nothing (the `TABA_HOME` mtime is
    unchanged).
 
+#### M2 implementation notes
+
+- `ps --json` is now an envelope like every other command:
+  `{"ok": true, "services": [...], "warnings": []}`. The rows keep every
+  v0.1 field. This changes the v0.1 output (a bare array); the v0.1 and M1
+  tests read `services` now.
+- `logs --json` returns `{"ok": true, "service", "log_path", "log"}` with
+  the whole log as text. `logs -f` streams raw text, so `-f --json` is
+  `E_USAGE`, and `TABA_OUTPUT=json` does not apply to `-f`.
+- `rm --json` reports `results` like `stop` (`removed`, or `refused` with
+  the error).
+- `stop` results keep `"signal": "TERM"` / `"KILL"` on every platform and
+  add `platform_action`: `sigterm` / `sigkill` on macOS and Linux,
+  `ctrl_break` / `terminate_job_object` on Windows (owner decision, M2).
+- Commands in `next` are quoted for the platform's shell: POSIX `sh` on
+  macOS and Linux, PowerShell on Windows (single quotes, `''` inside;
+  `{port}` is quoted because PowerShell would read it as a script block).
+  In cmd.exe, use double quotes instead (owner decision, M2).
+- `ps --all` lists listeners with `lsof -a -u UID -iTCP -sTCP:LISTEN` and
+  each process's directory with `lsof -d cwd` on macOS, `/proc/net/tcp{,6}`
+  and `/proc/PID/cwd` on Linux, and `GetExtendedTcpTable` with the
+  process's token user and a PEB read of its current directory on Windows
+  (64-bit processes; others show `directory: null`). `pgid` is `null` on
+  Windows. `holder` and `lease` are added in M3. `managed` matches the
+  pid to a verified record through the service's process group (Windows:
+  its job). It opens the state read-only and renews nothing.
+- `ps --all` shows `W_NO_LSOF` when `lsof` is missing on macOS.
+
 ### M3: agents, leases and gc
 
 1. `TABA_AGENT=a1` with `TABA_AGENT_PID` set to a live `sleep` starts a
@@ -1822,6 +1853,21 @@ holds the other way round for taba inside WSL in mirrored mode.
     `stop` of a claimed but unborrowed service succeeds and discards the
     claims.
 
+#### M3 implementation notes
+
+- A live lease checks both the agent name and a recorded PID/start-time pair.
+  Without a PID it checks the name only. Both are still self-reported, not
+  credentials. `--scope` alone does not let a caller impersonate the holder.
+- TTL expires even if the agent process is still alive. The lease tests
+  exercise this with a live fixture process; they do not establish whether
+  any real harness exits at a usage-limit prompt.
+- If a PID has disappeared, grace starts when taba first observes its absence;
+  the OS may no longer know the process's exact exit time. After a TTL expiry
+  or explicit lease end, grace starts at the recorded time.
+- Cross-scope `stop` and `rm` still require `--force --reason`; use `gc` for
+  expired services. The v0.1 test fixture continues to pass the owning scope
+  explicitly (decision 4), and M1's audit assertion now filters force events.
+
 ### M4: borrows and lifetimes
 
 Setup: `wt-a` runs `db` (a third throwaway worktree, `wt-c`, is used as a
@@ -1854,6 +1900,17 @@ second borrower).
    killed), and `wt-a`'s holder pid is killed. `gc` ends `wt-b`'s borrow,
    finds no live claimant, and drops `db` after `gc_grace`.
 
+#### M4 implementation notes
+
+- Borrows are stored by ID under `borrows/`, so a service hand-over can
+  update them without changing IDs. The acquiring scope's borrow ends.
+- With `--json`, a maintenance command's output is captured in the result;
+  otherwise it uses the terminal. If taba dies, the next access no longer
+  considers that command's borrow live; it does not promise to kill the child.
+- An exclusive borrower restarts an existing stopped service by running
+  `taba run --scope OWNER --name NAME …` from its own scope. The replacement
+  retains the exclusive lock; the old shared borrows become dangling.
+
 ### M5: move
 
 1. Automatic take-over: a1 (with `TABA_AGENT_PID` set to a `sleep`) runs
@@ -1879,6 +1936,15 @@ second borrower).
    `E_CONFLICT`. The same move by `wt-c` while a1 is alive returns
    `E_NOT_OWNER`; after a1's pid is killed it succeeds without `--force`.
 
+#### M5 implementation notes
+
+- An explicit scope give initially binds the recipient by agent name. The
+  recipient's first renewal with `TABA_AGENT_PID` binds the process identity.
+- Service moves keep the live process, URL, original working directory and
+  log stream. Active borrows follow the instance except the recipient's,
+  which ends. Target name conflicts and in-flight service operations are
+  refused before moving.
+
 ### M6: hooks and skill
 
 1. Feeding recorded PreToolUse JSON to `taba hook claude-code pre-tool-use`:
@@ -1899,6 +1965,18 @@ second borrower).
    plus S4) ends with both servers running and no cross-scope kill.
 
 ---
+
+#### M6 implementation notes
+
+- The hook inspects common Bash command shapes without running them. It
+  returns no permission decision for an ordinary allowed command, so normal
+  harness permissions still apply. Unparseable commands are logged and left
+  to the harness. Native PowerShell commands, shell scripts, and expansion
+  are outside its coverage.
+- Claude Code's SessionStart writes the session name to `CLAUDE_ENV_FILE`;
+  it does not infer an agent PID from an unverified parent process. SessionEnd
+  marks leases for that identity ended without stopping services. TTL remains
+  the backstop when the harness does not send an end event.
 
 ## 9. Decisions (2026-11-24)
 

@@ -50,6 +50,15 @@ pub struct Service {
     /// Set once a `--wait` ready check has passed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ready: Option<Ready>,
+    /// `run --service-ttl`: the service is dropped by `gc` once
+    /// `service_expires_at` has passed (renewed by an `already_running` run).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_ttl_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_expires_at: Option<String>,
+    /// Hand-offs of this service between scopes (`service_moved`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub moves: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -287,6 +296,165 @@ impl Store {
         f.write_all(&line)
     }
 
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    // ---- scope records (`scopes/<scope>.json`)
+
+    fn scope_path(&self, scope: &str) -> PathBuf {
+        self.root.join("scopes").join(format!("{scope}.json"))
+    }
+
+    pub fn get_scope(&self, scope: &str) -> io::Result<Option<crate::lease::ScopeRecord>> {
+        read_json(&self.scope_path(scope))
+    }
+
+    pub fn put_scope(&self, rec: &crate::lease::ScopeRecord) -> io::Result<()> {
+        write_json(&self.scope_path(&rec.scope), rec)
+    }
+
+    pub fn remove_scope(&self, scope: &str) -> io::Result<()> {
+        validate_ident("scope", scope).map_err(io::Error::other)?;
+        remove_file_and_empty_parent(&self.scope_path(scope))
+    }
+
+    /// Every scope record, sorted by scope.
+    pub fn list_scopes(&self) -> io::Result<Vec<crate::lease::ScopeRecord>> {
+        let mut out = Vec::new();
+        let dir = match fs::read_dir(self.root.join("scopes")) {
+            Ok(d) => d,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => return Err(e),
+        };
+        for e in dir {
+            let path = e?.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("json") {
+                continue;
+            }
+            if let Ok(Some(rec)) = read_json(&path) {
+                out.push(rec);
+            }
+        }
+        out.sort_by(|a: &crate::lease::ScopeRecord, b| a.scope.cmp(&b.scope));
+        Ok(out)
+    }
+
+    // ---- claim queues (`claims/<scope>/<name>.json`)
+
+    fn claims_path(&self, scope: &str, name: &str) -> PathBuf {
+        self.root
+            .join("claims")
+            .join(scope)
+            .join(format!("{name}.json"))
+    }
+
+    pub fn get_claims(&self, scope: &str, name: &str) -> io::Result<crate::claims::ClaimQueue> {
+        Ok(
+            read_json(&self.claims_path(scope, name))?.unwrap_or_else(|| {
+                crate::claims::ClaimQueue {
+                    service: format!("{scope}/{name}"),
+                    queue: Vec::new(),
+                }
+            }),
+        )
+    }
+
+    /// Writes the queue, or removes the file when it is empty.
+    pub fn put_claims(
+        &self,
+        scope: &str,
+        name: &str,
+        q: &crate::claims::ClaimQueue,
+    ) -> io::Result<()> {
+        let path = self.claims_path(scope, name);
+        if q.queue.is_empty() {
+            remove_file_and_empty_parent(&path)
+        } else {
+            write_json(&path, q)
+        }
+    }
+
+    /// Moves the record (rewritten as `svc`, already renamed) and the log of
+    /// `from_scope/name` to `svc.scope/name`. The running process keeps its
+    /// open log file, so logging continues in the renamed file.
+    pub fn move_service(&self, from_scope: &str, svc: &Service) -> io::Result<()> {
+        let old_log = self.log_path(from_scope, &svc.name);
+        let new_log = self.log_path(&svc.scope, &svc.name);
+        fs::create_dir_all(new_log.parent().expect("log has parent"))?;
+        if old_log.exists() {
+            fs::rename(&old_log, &new_log)?;
+        }
+        self.put(svc)?;
+        remove_file_and_empty_parent(&self.record_path(from_scope, &svc.name))?;
+        if let Some(dir) = old_log.parent() {
+            let _ = fs::remove_dir(dir);
+        }
+        let old_claims = self.claims_path(from_scope, &svc.name);
+        if old_claims.exists() {
+            let new_claims = self.claims_path(&svc.scope, &svc.name);
+            fs::create_dir_all(new_claims.parent().expect("claims have parent"))?;
+            fs::rename(&old_claims, &new_claims)?;
+            if let Some(dir) = old_claims.parent() {
+                let _ = fs::remove_dir(dir);
+            }
+        }
+        Ok(())
+    }
+
+    /// Logs without a service record (of dropped services), with their
+    /// scope directory.
+    pub fn orphan_logs(&self) -> io::Result<Vec<PathBuf>> {
+        let mut out = Vec::new();
+        let Ok(scopes) = fs::read_dir(self.root.join("logs")) else {
+            return Ok(out);
+        };
+        for s in scopes.flatten() {
+            let scope = s.file_name().to_string_lossy().into_owned();
+            let Ok(files) = fs::read_dir(s.path()) else {
+                continue;
+            };
+            for f in files.flatten() {
+                let path = f.path();
+                let Some(name) = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(|n| n.strip_suffix(".log"))
+                else {
+                    continue;
+                };
+                if !self.record_path(&scope, name).exists() {
+                    out.push(path);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Deletes one log file under `logs/` and its scope directory if empty.
+    pub fn remove_log_file(&self, path: &Path) -> io::Result<()> {
+        if !path.starts_with(self.root.join("logs")) {
+            return Err(io::Error::other("not a taba log"));
+        }
+        remove_file_and_empty_parent(path)
+    }
+
+    /// Deletes the record of `scope/name` (and its operation lock and claim
+    /// queue), keeping the log: `gc` drops services this way and deletes
+    /// their logs after `log_retention`.
+    pub fn remove_record_keep_log(&self, scope: &str, name: &str) -> io::Result<()> {
+        validate_ident("scope", scope).map_err(io::Error::other)?;
+        validate_ident("name", name).map_err(io::Error::other)?;
+        for path in [
+            self.record_path(scope, name),
+            self.op_path(scope, name),
+            self.claims_path(scope, name),
+        ] {
+            remove_file_and_empty_parent(&path)?;
+        }
+        Ok(())
+    }
+
     /// Deletes the record and log of `scope/name`. Both paths are derived
     /// from validated identifiers under the state root, never from the
     /// record's contents, so nothing outside `$TABA_HOME` can be touched.
@@ -298,6 +466,7 @@ impl Store {
             self.record_path(scope, name),
             self.log_path(scope, name),
             self.op_path(scope, name),
+            self.claims_path(scope, name),
         ] {
             remove_file_and_empty_parent(&path)?;
         }
@@ -347,7 +516,7 @@ impl Store {
     }
 }
 
-fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
+pub(crate) fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
     match fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .map(Some)
@@ -359,14 +528,14 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<Option<T
 
 /// Writes to a temporary file and renames it, so lock-free readers see the
 /// old or the new content, never a partial one.
-fn write_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
+pub(crate) fn write_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     fs::create_dir_all(path.parent().expect("record has parent"))?;
     let tmp = path.with_extension("json.tmp");
     fs::write(&tmp, serde_json::to_vec_pretty(value)?)?;
     fs::rename(tmp, path)
 }
 
-fn remove_file_and_empty_parent(path: &Path) -> io::Result<()> {
+pub(crate) fn remove_file_and_empty_parent(path: &Path) -> io::Result<()> {
     match fs::remove_file(path) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}

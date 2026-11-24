@@ -144,6 +144,41 @@ pub fn listeners(port: u16) -> Vec<super::Listener> {
     res
 }
 
+/// Every TCP socket in LISTEN state owned by the current user, via lsof.
+pub fn all_listeners() -> Vec<super::Socket> {
+    let uid = unsafe { libc::getuid() }.to_string();
+    let out = Command::new("lsof")
+        .args(["-nP", "-a", "-u", &uid, "-iTCP", "-sTCP:LISTEN", "-Fpn"])
+        .stderr(Stdio::null())
+        .output();
+    let Ok(out) = out else { return Vec::new() };
+    let mut res = Vec::new();
+    let mut cur: Option<i32> = None;
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if let Some(p) = line.strip_prefix('p') {
+            cur = p.parse().ok();
+        } else if let (Some(n), Some(pid)) = (line.strip_prefix('n'), cur)
+            && let Some((address, port)) = super::split_host_port(n)
+        {
+            res.push(super::Socket { port, address, pid });
+        }
+    }
+    res
+}
+
+/// Current working directory of `pid`, via lsof.
+pub fn cwd(pid: i32) -> Option<std::path::PathBuf> {
+    let out = Command::new("lsof")
+        .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix('n'))
+        .map(std::path::PathBuf::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_argv;

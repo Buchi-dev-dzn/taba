@@ -34,6 +34,7 @@ pub struct Caller {
     pub branch: Option<String>,
     /// `--agent`, else `$TABA_AGENT`, else `human`.
     pub agent: String,
+    pub agent_pid: Option<(i32, u64)>,
     pub cwd: PathBuf,
 }
 
@@ -66,6 +67,14 @@ pub fn resolve(scope_flag: Option<String>, agent_flag: Option<String>) -> Result
     let cwd = std::env::current_dir()
         .and_then(|d| crate::util::canonicalize(&d))
         .map_err(|e| TabaError::state(format!("cannot resolve current directory: {e}")))?;
+    resolve_at(cwd, scope_flag, agent_flag)
+}
+
+pub fn resolve_at(
+    cwd: PathBuf,
+    scope_flag: Option<String>,
+    agent_flag: Option<String>,
+) -> Result<Caller> {
     let agent = resolve_agent(agent_flag)?;
     let worktree = find_worktree(&cwd);
     let branch = worktree.as_deref().and_then(read_branch);
@@ -88,6 +97,9 @@ pub fn resolve(scope_flag: Option<String>, agent_flag: Option<String>) -> Result
         source,
         worktree,
         branch,
+        agent_pid: (agent != "human")
+            .then(crate::lease::agent_pid_from_env)
+            .flatten(),
         agent,
         cwd,
     })
@@ -102,14 +114,19 @@ fn resolve_agent(flag: Option<String>) -> Result<String> {
         .or_else(|| std::env::var("TABA_AGENT").ok())
         .filter(|a| !a.is_empty())
         .unwrap_or_else(|| "human".to_string());
-    let ok = agent.len() <= 128 && agent.chars().all(|c| c.is_ascii_graphic());
+    validate_agent(&agent)?;
+    Ok(agent)
+}
+
+pub fn validate_agent(agent: &str) -> Result<()> {
+    let ok = !agent.is_empty() && agent.len() <= 128 && agent.chars().all(|c| c.is_ascii_graphic());
     if !ok {
         return Err(TabaError::new(
             "E_INVALID_IDENT",
             format!("invalid agent {agent:?}: use at most 128 printable characters, no spaces"),
         ));
     }
-    Ok(agent)
+    Ok(())
 }
 
 /// Nearest ancestor of `dir` (itself included) that contains a `.git` file

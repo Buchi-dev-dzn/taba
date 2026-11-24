@@ -180,8 +180,8 @@ taba is meant for AI coding agents as much as for people:
   this, for orchestrators that want task-named scopes. Run `taba whoami` to
   see which scope applies.
 - **Errors are machine-readable.** With `--json` (or `TABA_OUTPUT=json`),
-  `run`, `stop` and `whoami` print one JSON document for success and
-  failure. A failure has `error.code`, `error.message`, `error.details` and
+  every command prints one JSON document on stdout for success and failure,
+  and nothing on stderr. A failure has `error.code`, `error.message`, `error.details` and
   `error.next`, a list of allowed next steps, most preferred first. `next`
   never suggests `kill` or `--force`; when only a person can resolve the
   error, it ends with "ask the human". See [Errors](#errors).
@@ -190,7 +190,9 @@ taba is meant for AI coding agents as much as for people:
 
   ```console
   $ taba ps --scope login-fix --json
-  [
+  {
+    "ok": true,
+    "services": [
     {
       "service": "login-fix/web",
       "scope": "login-fix",
@@ -212,8 +214,13 @@ taba is meant for AI coding agents as much as for people:
       "log_path": "/Users/Shared/demo/taba-home/logs/login-fix/web.log",
       "instance": "72306-1795509874101287"
     }
-  ]
+    ],
+    "warnings": []
+  }
   ```
+- **Use `taba ps --all`** to see every port you have open, whether taba
+  started it or not, with its directory and git branch. It never stops or
+  changes anything.
 - Each started process gets `TABA_SCOPE` and `TABA_SERVICE` in its environment.
 
 ### Agent skill
@@ -232,6 +239,35 @@ mkdir -p ~/.claude/skills && ln -s "$PWD/skills/taba" ~/.claude/skills/taba
 # or for one project (Claude Code: .claude/skills, other agents: .agents/skills)
 mkdir -p .claude/skills && cp -R /path/to/taba/skills/taba .claude/skills/
 ```
+
+### Optional tool hooks
+
+Add the following to Claude Code's project or user settings to set the
+session identity, guard common shell stop commands and mark the lease ended
+when the session ends:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{"hooks": [{"type": "command", "command": "taba hook claude-code session-start"}]}],
+    "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "taba hook claude-code pre-tool-use"}]}],
+    "SessionEnd": [{"hooks": [{"type": "command", "command": "taba hook claude-code session-end"}]}]
+  }
+}
+```
+
+For Codex CLI, configure the `Bash` PreToolUse matcher with
+`taba hook codex pre-tool-use`, then review and trust it in `/hooks`. Set
+`TABA_AGENT=codex:<session_id>` so CLI calls and the hook use the same
+identity. Claude Code asks for confirmation on `taba … --force` for every
+hooked agent; it cannot distinguish a coordinator from a worker. Codex
+[does not support that hook decision](https://developers.openai.com/codex/hooks#pretooluse),
+so taba denies the forced tool call and directs the agent to a human.
+
+These are best-effort checks for common Bash commands, not a security
+boundary. They do not execute the commands or intercept native PowerShell
+stop commands. A command the hook does not understand falls back to the
+harness's normal permissions.
 
 ### AGENTS.md / CLAUDE.md snippet
 
@@ -319,7 +355,8 @@ that. Measurements against Docker are in [docs/benchmarks.md](docs/benchmarks.md
 | `taba run [--scope S] --name N [--port P \| auto \| auto:START] [--wait[=SECS]] [--ready CHECK] [--json] -- CMD...` | Start `CMD` detached as service `S/N`, in its own process group, with output appended to its log. `{port}` in `CMD` is replaced by the port, and `PORT` is set. |
 | `taba whoami [--scope S] [--json]` | Show the scope taba uses here, its source (`flag`, `env`, `git`), worktree, branch, agent and services. |
 | `taba ps [--scope S] [--running] [--json]` | List services with status `running`, `starting`, `stopping` or `exited`, plus URL and directory (`~` for your home; absolute in `--json`). `--running` hides exited ones. |
-| `taba logs [-f] S/N` (or `N` in your scope) | Print the log. Add `-f` to follow it until the service exits. |
+| `taba ps --all [--json]` | List every listening TCP port of your user, managed by taba or not: address, pid, command, directory, git worktree and branch, and the taba service if there is one. Read-only. |
+| `taba logs [-f] S/N` (or `N` in your scope) | Print the log. Add `-f` to follow it until the service exits. With `--json`, the log text is in `log` (not with `-f`). |
 | `taba stop S/N` (or `N` in your scope) | Stop one service of your own scope. |
 | `taba stop --scope S` | Stop every service in scope `S`. |
 | `taba stop ... --timeout SECS` | Seconds to wait between SIGTERM and SIGKILL (Windows: Ctrl+Break and job termination; default 5). |
@@ -334,11 +371,18 @@ flags.
 
 ### Errors
 
-With `--json` or `TABA_OUTPUT=json`, `run`, `stop` and `whoami` print
-`{"ok": true, ..., "warnings": [...]}` or
-`{"ok": false, "error": {"code", "message", "details", "next"}, ...}`.
-Without it, the message and the next steps go to stderr. The exit status
-follows the code:
+With `--json` or `TABA_OUTPUT=json`, every command prints one JSON document
+on stdout, `{"ok": true, ..., "warnings": [...]}` or
+`{"ok": false, "error": {"code", "message", "details", "next"}, ...}`, and
+nothing on stderr. `ps` lists its rows under `services`, `ps --all` under
+`listeners`, and `stop` and `rm` report each service under `results`. A
+stopped service's `signal` is `TERM` or `KILL` on every platform;
+`platform_action` says what was done (`sigterm`, `sigkill`, or on Windows
+`ctrl_break`, `terminate_job_object`).
+Without `--json`, the message and the next steps go to stderr. Commands in
+`next` are quoted for the shell of the platform: POSIX `sh` on macOS and
+Linux, PowerShell on Windows (in cmd.exe, use double quotes where they show
+single quotes). The exit status follows the code:
 
 | Code | Exit | Meaning |
 | --- | --- | --- |
@@ -358,13 +402,63 @@ follows the code:
 `stop --scope` reports each service in `results` (`stopped`, `killed`,
 `not_running`, or `refused` with its error) and exits 3 if any was refused.
 
+### Agent leases and cleanup
+
+Set `TABA_AGENT` to a distinct session name and `TABA_AGENT_PID` to the
+long-lived agent's PID, then run `taba whoami`. A live holder prevents other
+agents from mutating the scope, even if they pass its name with `--scope`.
+If the holder exits, ends its lease, or passes its TTL, the next caller in
+that scope can take over without restarting services. These identifiers
+prevent accidents; they are not credentials.
+
+- `taba renew [--ttl DURATION]` renews the lease. The default is `4h` for
+  agents and `none` for humans; `--ttl`, `TABA_TTL`, and `lease_ttl` in
+  `$TABA_HOME/config.toml` override the default in that order.
+- `taba lease end` marks the caller's leases expired without stopping anything.
+- `taba claim S/N` queues for another scope's service; `--cancel` withdraws
+  the claim. `taba disown S/N` hands it to the first eligible claimant now.
+- `taba gc --dry-run` previews cleanup. `taba gc` hands over claimed services
+  after `claim_grace` and drops unclaimed expired services after `gc_grace`.
+  `run` and `whoami` also perform bounded cleanup outside the caller's scope.
+- `run --service-ttl DURATION` sets an independent service timeout.
+  `taba keep --reason TEXT` pins the scope; `taba keep --off` clears it.
+
+### Handing services over
+
+A successor in the same scope takes over after the old lease ends. For a
+planned hand-off, the holder can use `taba move --to AGENT`. The recipient
+should run `taba whoami` with its agent ID and PID to bind the new lease to
+its process. `taba move --take` takes an expired lease explicitly; taking
+one that is still live requires an audited `--force --reason TEXT`.
+
+Use `taba move S/N --to SCOPE` to transfer just one service to an existing
+scope. Its process, instance and URL stay the same. The receiving scope's
+borrow ends, and other borrows follow the same instance to its new name.
+
+### Borrowing a service
+
+Use `taba borrow S/N` to record that your scope uses another scope's service.
+The reply identifies the instance and its URL. `taba borrow --check ID`
+checks that same instance; `taba release ID` ends the borrow. A borrow ends
+when its own TTL or the borrower's lease ends. The owner cannot stop a
+borrowed service without an audited force override, which makes the borrow
+dangling.
+
+Use `taba borrow --mut S/N -- COMMAND` for exclusive maintenance. The child
+gets `TABA_BORROWED_URL`; the lock is released when the command exits and
+becomes stale if its coordinating taba process dies. Use `--wait-lock SECS`
+if another exclusive borrow is active. Without a command, the lock defaults
+to 15 minutes or until released. An expired owner's service goes to the
+first eligible explicit claimant, then to a live borrower; neither transfer
+restarts the process.
+
 ### Environment variables
 
 | Variable | Meaning |
 | --- | --- |
 | `TABA_SCOPE` | The caller's scope when `--scope` is not given; beats the git worktree. |
 | `TABA_AGENT` | Name of the acting agent, recorded with services and `--force` events (default `human`). |
-| `TABA_OUTPUT` | `json` makes `run`, `stop`, `whoami` and `ps` print JSON. |
+| `TABA_OUTPUT` | `json` makes every command print JSON (except `logs -f`, which streams text). |
 | `TABA_HOME` | State directory (default `~/.taba`). |
 | `TABA_SCOPE`, `TABA_SERVICE`, `PORT` | Set *inside* each started process: its scope, its service name and (with `--port`) its port. |
 

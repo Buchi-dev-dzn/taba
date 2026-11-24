@@ -15,10 +15,14 @@ taba whoami [--json]
 taba run [--scope S] --name N [--port P | --port auto | --port auto:START]
          [--wait[=SECS]] [--ready tcp|http:PATH|log:REGEX] [--json] -- CMD...
 taba ps [--scope S] [--running] [--json]
-taba logs [-f] S/N | N
+taba ps --all [--json]
+taba logs [-f] S/N | N [--json]
 taba stop S/N | N | --scope S [--timeout SECS] [--json]
-taba rm S/N | N | --scope S
+taba rm S/N | N | --scope S [--json]
 ```
+
+Every command takes `--json` (or `TABA_OUTPUT=json` in the environment) and
+then prints exactly one JSON document with `"ok"`, for success and failure.
 
 ## Procedure
 
@@ -26,9 +30,15 @@ taba rm S/N | N | --scope S
    comes from (`scope_source`: `flag`, `env` or `git`) and the `services`
    that already exist in it. If `scope` is `null`, you are outside a git
    worktree: `cd` into the worktree you work in, or pass `--scope`.
+   If a live lease belongs to another agent, wait for it to end or ask the
+   coordinator. Do not use `--scope` or `--agent` to impersonate the holder.
+   On `W_TOOK_OVER`, reuse the services you inherited.
 2. **Reuse before you start.** If a service you need is listed, check it with
-   `taba ps --scope <scope> --json`. If it has `"status": "running"`, use its
-   `url` and don't start another.
+   `taba ps --scope <scope> --json` (rows are under `services`). If it has
+   `"status": "running"`, use its `url` and don't start another. To see
+   what holds a port, including processes taba didn't start, use
+   `taba ps --all --json` (rows under `listeners`, with `managed`,
+   `directory` and `git.branch`). It is read-only.
 3. **Start with `--port auto --wait --json`** and put `{port}` where the app
    takes its port:
 
@@ -50,8 +60,10 @@ taba rm S/N | N | --scope S
    or a process taba didn't start. Start on another port with `--port auto`,
    or ask the human, who can stop it themselves.
 5. **Stay inside your own scope.** Never stop or `rm` another scope's
-   services. taba refuses it with `E_NOT_OWNER` (exit 3), and `--force` is
-   for the human only.
+   services. taba refuses it with `E_NOT_OWNER` (exit 3). Do not use raw
+   stop commands or `--force` to circumvent that refusal. Optional hooks
+   can reject unsafe shell actions. Claude Code asks the human before
+   a forced tool call; Codex denies it because that hook cannot ask.
 6. **Finish:** stop and clean up your scope, unless the human needs a server
    (see "Hand-off").
 
@@ -88,6 +100,15 @@ taba logs login-fix-3f9a/web -f   # follow until the service exits
 `-f` blocks until the service exits. In a non-interactive tool call, prefer
 the plain form, or pipe it through `tail`. The log path is also in
 `taba ps --json` (`log_path`). Logs of any scope are readable.
+`taba logs web --json` returns the text in `log` (not with `-f`).
+
+## Borrowing another scope's service
+
+Use `taba borrow S/N --json` for the URL and borrow ID. Check that ID with
+`taba borrow --check ID --json` before a long test run, and release it when
+finished. For maintenance use `taba borrow --mut S/N -- COMMAND`; the
+command gets `TABA_BORROWED_URL`. If stop reports `E_BORROWED`, consider
+`taba disown S/N` instead of forcing it. It hands over the live instance.
 
 ## Stopping and cleaning up
 
@@ -106,6 +127,13 @@ human may still want the logs.
 
 ## Hand-off
 
+A successor in the same scope can take over after your lease ends. Use
+`taba claim S/N` if you need a service after another scope's lease ends;
+check for `W_HANDED_OVER` rather than assuming the service transferred. If you
+know the next agent, give it the scope with `taba move --to AGENT`. Use
+`taba move S/N --to SCOPE` when transferring just one service. Neither
+command restarts the service.
+
 When you hand work back, or may be cut off (usage limits), report each
 service you started, for example:
 
@@ -120,4 +148,6 @@ By default, stop what you no longer need and clean up:
 taba stop --scope <scope> && taba rm --scope <scope>
 ```
 
-Leave a service running only when the human will use it, and say so.
+Leave a service running only when the human will use it, and say so. Use
+`taba keep --reason TEXT` when it must survive lease expiry. `taba lease end`
+marks your leases expired without stopping anything immediately.
