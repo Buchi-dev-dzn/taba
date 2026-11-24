@@ -1,6 +1,6 @@
 [package]
 name = "taba"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "MIT"
 
@@ -9,6 +9,20 @@ clap = { version = "4.6.9", features = ["derive"] }
 regex = { version = "1.13.2", default-features = false, features = ["std", "unicode-perl"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-webpki-roots"] }
+semver = "1"
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+flate2 = "1"
+sha2 = "0.10"
+tar = "0.4"
+tempfile = "3"
+
+[dev-dependencies]
+flate2 = "1"
+sha2 = "0.10"
+tar = "0.4"
+tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.191"

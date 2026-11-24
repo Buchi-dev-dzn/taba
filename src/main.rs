@@ -14,6 +14,7 @@ mod proc;
 mod ready;
 mod scope;
 mod state;
+mod update;
 mod util;
 
 use clap::{Parser, Subcommand};
@@ -268,6 +269,14 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Check for or install a newer stable release from official GitHub Releases
+    Update {
+        /// Only report whether a newer stable release exists; change nothing
+        #[arg(long)]
+        check: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Inspect agent hook input on stdin
     Hook {
         harness: hooks::Harness,
@@ -453,6 +462,7 @@ fn main() -> ExitCode {
                 borrows::release(store, &scope::resolve(scope, agent)?, &target)
             }),
         ),
+        Cmd::Update { check, json } => (json || env_json(), update::command(check).map(Some)),
         Cmd::Hook { harness, event } => {
             return match hooks::run(harness, event) {
                 Ok(value) => {
