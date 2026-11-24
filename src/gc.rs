@@ -19,6 +19,10 @@ pub fn collect(
     protected: Option<&str>,
 ) -> Result<Output> {
     let now = now_secs();
+    if !dry && limit == usize::MAX {
+        let _lock = store.lock()?;
+        crate::borrows::sweep(store)?;
+    }
     let mut moved = Vec::new();
     let mut dropped = Vec::new();
     let mut kept = Vec::new();
@@ -85,6 +89,10 @@ pub fn collect(
             let Some(reason) = reason else {
                 continue;
             };
+            if !crate::borrows::live(store, &svc)?.is_empty() {
+                kept.push(json!({"service":svc.id(),"reason":"borrowed"}));
+                continue;
+            }
             budget -= 1;
             if dry {
                 services.push(svc.id());

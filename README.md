@@ -394,6 +394,23 @@ prevent accidents; they are not credentials.
 - `run --service-ttl DURATION` sets an independent service timeout.
   `taba keep --reason TEXT` pins the scope; `taba keep --off` clears it.
 
+### Borrowing a service
+
+Use `taba borrow S/N` to record that your scope uses another scope's service.
+The reply identifies the instance and its URL. `taba borrow --check ID`
+checks that same instance; `taba release ID` ends the borrow. A borrow ends
+when its own TTL or the borrower's lease ends. The owner cannot stop a
+borrowed service without an audited force override, which makes the borrow
+dangling.
+
+Use `taba borrow --mut S/N -- COMMAND` for exclusive maintenance. The child
+gets `TABA_BORROWED_URL`; the lock is released when the command exits and
+becomes stale if its coordinating taba process dies. Use `--wait-lock SECS`
+if another exclusive borrow is active. Without a command, the lock defaults
+to 15 minutes or until released. An expired owner's service goes to the
+first eligible explicit claimant, then to a live borrower; neither transfer
+restarts the process.
+
 ### Environment variables
 
 | Variable | Meaning |
