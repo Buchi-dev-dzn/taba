@@ -145,12 +145,12 @@ fn install_interrupt_handler() {
     }
 }
 
-/// Unix: whether stdout is a pipe or socket whose reader has gone away, so
-/// an idle stream ends without waiting for the next change. Elsewhere (and
-/// for terminals and files) a closed stdout shows up on the next write.
+/// Whether stdout is a pipe (or socket) whose reader has gone away, so an
+/// idle stream ends within a tick instead of at its next write. Terminals
+/// and files are never "closed" here; a failed write still ends the stream.
 #[cfg(unix)]
 fn stdout_closed() -> bool {
-    // SAFETY: fstat and poll on fd 1 with valid pointers to local values.
+    // SAFETY: fstat on fd 1 with a pointer to a local value.
     unsafe {
         let mut st: libc::stat = std::mem::zeroed();
         if libc::fstat(1, &mut st) != 0 {
@@ -160,18 +160,80 @@ fn stdout_closed() -> bool {
         if kind != libc::S_IFIFO && kind != libc::S_IFSOCK {
             return false;
         }
-        let mut fd = libc::pollfd {
-            fd: 1,
-            events: 0,
-            revents: 0,
+    }
+    reader_gone()
+}
+
+/// Linux: `poll` reports `POLLERR` (pipe) or `POLLHUP` (socket) on the
+/// write end once the reader is gone.
+#[cfg(target_os = "linux")]
+fn reader_gone() -> bool {
+    let mut fd = libc::pollfd {
+        fd: 1,
+        events: 0,
+        revents: 0,
+    };
+    // SAFETY: poll on one valid, local pollfd.
+    let n = unsafe { libc::poll(&mut fd, 1, 0) };
+    n > 0 && fd.revents & (libc::POLLERR | libc::POLLHUP) != 0
+}
+
+/// macOS: `poll` does not report a vanished pipe reader, but a kqueue
+/// `EVFILT_WRITE` filter does, with `EV_EOF`.
+#[cfg(target_os = "macos")]
+fn reader_gone() -> bool {
+    // SAFETY: a private kqueue, one change and one event in local memory,
+    // a zero timeout, and the queue closed again.
+    unsafe {
+        let kq = libc::kqueue();
+        if kq < 0 {
+            return false;
+        }
+        let mut change: libc::kevent = std::mem::zeroed();
+        change.ident = 1;
+        change.filter = libc::EVFILT_WRITE;
+        change.flags = libc::EV_ADD;
+        let mut event: libc::kevent = std::mem::zeroed();
+        let zero = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
         };
-        libc::poll(&mut fd, 1, 0) > 0 && fd.revents & (libc::POLLERR | libc::POLLHUP) != 0
+        let n = libc::kevent(kq, &change, 1, &mut event, 1, &zero);
+        libc::close(kq);
+        n > 0 && event.flags & libc::EV_EOF != 0
     }
 }
 
-#[cfg(not(unix))]
+/// Windows: the pipe's state turns to "closing" once the reader's end is
+/// closed (`NtQueryInformationFile`, `FilePipeLocalInformation`); querying
+/// it writes nothing to the pipe.
+#[cfg(windows)]
 fn stdout_closed() -> bool {
-    false
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FILE_PIPE_CLOSING_STATE, FILE_PIPE_LOCAL_INFORMATION, FilePipeLocalInformation,
+        NtQueryInformationFile,
+    };
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_PIPE, GetFileType};
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_OUTPUT_HANDLE};
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+    // SAFETY: queries the process's own stdout handle into local values.
+    unsafe {
+        let h = GetStdHandle(STD_OUTPUT_HANDLE);
+        if h.is_null() || h == INVALID_HANDLE_VALUE || GetFileType(h) != FILE_TYPE_PIPE {
+            return false;
+        }
+        let mut iosb: IO_STATUS_BLOCK = std::mem::zeroed();
+        let mut info: FILE_PIPE_LOCAL_INFORMATION = std::mem::zeroed();
+        let status = NtQueryInformationFile(
+            h,
+            &mut iosb,
+            (&raw mut info).cast(),
+            std::mem::size_of::<FILE_PIPE_LOCAL_INFORMATION>() as u32,
+            FilePipeLocalInformation,
+        );
+        status >= 0 && info.NamedPipeState == FILE_PIPE_CLOSING_STATE
+    }
 }
 
 #[cfg(test)]
