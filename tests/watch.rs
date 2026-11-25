@@ -171,6 +171,56 @@ fn streams_full_snapshots_only_on_change() {
     assert_eq!(w.interrupt_and_wait(), 0);
 }
 
+/// Expiry is a state transition, not a clock display: watching stays quiet
+/// before and after it, then emits one stable snapshot when a service TTL
+/// becomes eligible for lazy collection. Watching itself never runs cleanup.
+#[test]
+fn service_ttl_expiry_is_stable_and_visible_without_cleanup() {
+    let fx = Fixture::new("watch_service_ttl");
+    let out = fx.taba(
+        &fx.wt_a,
+        &[
+            "run",
+            "--name",
+            "s",
+            "--service-ttl",
+            "2s",
+            "--json",
+            "--",
+            PY,
+            "-c",
+            SLEEP_30,
+        ],
+    );
+    assert_eq!(exit(&out), 0, "{}", text(&out));
+
+    let w = Watch::start(&fx, &fx.outside, &[]);
+    let mut before = w.next();
+    let row = &before["services"][0];
+    assert_eq!(row["service_ttl"], "2s");
+    assert!(row["service_expires_at"].is_string());
+    assert!(row["pending_gc"].is_null());
+    assert!(w.quiet(Duration::from_millis(500)), "clock caused churn");
+
+    w.until(&mut before, "expired service TTL", |v| {
+        v["services"][0]["pending_gc"] == "service_ttl_expired"
+    });
+    assert!(
+        w.quiet(Duration::from_millis(800)),
+        "expired row kept churning"
+    );
+    // The process and record remain: observation is read-only and cleanup is lazy.
+    assert_eq!(before["services"][0]["status"], "running");
+    assert_eq!(w.interrupt_and_wait(), 0);
+    let text_ps = fx.taba(&fx.outside, &["ps"]);
+    assert_eq!(exit(&text_ps), 0, "{}", text(&text_ps));
+    assert!(
+        String::from_utf8_lossy(&text_ps.stdout).contains("service_ttl_expired"),
+        "{}",
+        text(&text_ps)
+    );
+}
+
 #[test]
 fn filters_by_scope_and_running() {
     let fx = Fixture::new("watch_filters");

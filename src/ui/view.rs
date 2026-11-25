@@ -356,6 +356,14 @@ fn tree_lines(app: &App, colors: Colors, width: u16) -> (Vec<Line<'static>>, Opt
                     colors.dim(),
                 ));
             }
+            if let Some(reason) = &r.pending_gc {
+                spans.push(Span::styled(
+                    format!("   pending GC: {reason}"),
+                    colors.orange(),
+                ));
+            } else if r.lease_expired {
+                spans.push(Span::styled("   lease expired", colors.orange()));
+            }
             lines.push(selectable(spans, is_cursor, width));
             if let Some(reason) = app.reasons.get(&r.id()) {
                 let indent = "       ";

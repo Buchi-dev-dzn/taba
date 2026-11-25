@@ -142,3 +142,37 @@ fn collection_offers_borrowed_service_without_restarting() {
         true
     );
 }
+
+/// A past service TTL is still reported, but a live borrower means collection
+/// is not a certain next step. This is a pure `ps` observation: it must not
+/// end the borrow or stop the instance.
+#[test]
+fn borrowed_service_ttl_is_expired_without_promising_gc() {
+    let f = Fixture::new("borrow_ttl_visibility");
+    let service = call(
+        &f,
+        &f.wt_a,
+        &[
+            "run",
+            "--name",
+            "db",
+            "--service-ttl",
+            "1s",
+            "--json",
+            "--",
+            PY,
+            "-c",
+            SLEEP_30,
+        ],
+    );
+    let target = service["service"].as_str().unwrap();
+    let borrow = call(&f, &f.wt_b, &["borrow", target]);
+    assert_eq!(borrow["ok"], true, "{borrow}");
+
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    let row = &f.ps(&[])[0];
+    assert_eq!(row["service_ttl"], "1s");
+    assert!(row["service_expires_at"].is_string());
+    assert!(row["pending_gc"].is_null(), "{row}");
+    assert_eq!(row["borrows"]["shared"], 1, "{row}");
+}

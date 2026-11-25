@@ -643,6 +643,16 @@ prevent accidents; they are not credentials.
 - `run --service-ttl DURATION` sets an independent service timeout.
   `taba keep --reason TEXT` pins the scope; `taba keep --off` clears it.
 
+### Lazy expiry
+
+There is no resident taba daemon. A lease or `--service-ttl` passing is visible
+immediately in `taba ps --json` (`lease`, `service_expires_at`, and, when a
+service is eligible to be dropped, `pending_gc`); it does not stop the process
+at that clock time. Cleanup happens on a later `taba gc`, `run`, or `whoami`.
+An expired lease may hand a service to a claimant or live borrower instead of
+dropping it, and a live borrow protects an expired service TTL, so those cases
+are shown as expiry facts rather than a promised pending collection.
+
 ### Handing services over
 
 A successor in the same scope takes over after the old lease ends. For a
