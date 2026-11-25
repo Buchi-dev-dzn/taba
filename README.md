@@ -186,7 +186,11 @@ taba ps                     # SERVICE / STATUS / URL / DIRECTORY (running and ex
 taba ps --running           # running services only
 taba ps --scope billing     # one scope only
 taba ps --json              # every field with absolute paths, for scripts and agents
+taba ps --watch --json      # keep running: one JSON snapshot per line, on every change
 ```
+
+`ps --watch --json` is a stream for other programs (editors, dashboards,
+orchestrators): see [Watching for changes](#watching-for-changes).
 
 **Port conflicts are reported before anything starts.** If the port is in use,
 taba names the owner (with its command line, for a process taba didn't start),
@@ -441,6 +445,7 @@ that. Measurements against Docker are in [docs/benchmarks.md](docs/benchmarks.md
 | `taba run [--scope S] --name N [--port P \| auto \| auto:START] [--wait[=SECS]] [--ready CHECK] [--json] -- CMD...` | Start `CMD` detached as service `S/N`, in its own process group, with output appended to its log. `{port}` in `CMD` is replaced by the port, and `PORT` is set. |
 | `taba whoami [--scope S] [--json]` | Show the scope taba uses here, its source (`flag`, `env`, `git`), worktree, branch, agent and services. |
 | `taba ps [--scope S] [--running] [--json]` | List services with status `running`, `starting`, `stopping` or `exited`, plus URL and directory (`~` for your home; absolute in `--json`). `--running` hides exited ones. |
+| `taba ps --watch --json [--scope S] [--running] [--interval DURATION]` | Keep running and print the `ps --json` document as one line (NDJSON) at once and again whenever it changes, until interrupted. Read-only. See [Watching for changes](#watching-for-changes). |
 | `taba ps --all [--json]` | List every listening TCP port of your user, managed by taba or not: address, pid, command, directory, git worktree and branch, and the taba service if there is one. Read-only. |
 | `taba logs [-f] S/N` (or `N` in your scope) | Print the log. Add `-f` to follow it until the service exits. With `--json`, the log text is in `log` (not with `-f`). |
 | `taba stop S/N` (or `N` in your scope) | Stop one service of your own scope. |
@@ -462,7 +467,8 @@ flags.
 With `--json` or `TABA_OUTPUT=json`, every command prints one JSON document
 on stdout, `{"ok": true, ..., "warnings": [...]}` or
 `{"ok": false, "error": {"code", "message", "details", "next"}, ...}`, and
-nothing on stderr. `ps` lists its rows under `services`, `ps --all` under
+nothing on stderr (`ps --watch --json` prints one document per line; see
+[Watching for changes](#watching-for-changes)). `ps` lists its rows under `services`, `ps --all` under
 `listeners`, and `stop` and `rm` report each service under `results`. A
 stopped service's `signal` is `TERM` or `KILL` on every platform;
 `platform_action` says what was done (`sigterm`, `sigkill`, or on Windows
@@ -493,6 +499,40 @@ single quotes). The exit status follows the code:
 
 `stop --scope` reports each service in `results` (`stopped`, `killed`,
 `not_running`, or `refused` with its error) and exits 3 if any was refused.
+
+### Watching for changes
+
+`taba ps --watch --json` keeps running and prints newline-delimited JSON
+(NDJSON): one complete document per line, never pretty-printed.
+
+- **The first line** is a full snapshot with the same fields as
+  `taba ps --json`: `{"ok": true, "services": [...], "warnings": []}`.
+- **After that, a new full snapshot** is printed only when a row changed: a
+  status, port, PID, lease, borrow, claim, or a service added or removed.
+  Every line is a complete snapshot, not a diff, so a consumer can simply
+  replace what it shows with the latest line.
+- **State is re-read every second.** `--interval` changes that: seconds
+  (`2`, `0.5`) or a number with `ms` or `s` (`500ms`), at least `250ms`.
+- **The same filters as `ps`:** `--scope S` and `--running`. `--all` cannot
+  be watched.
+- **It ends with exit 0** on Ctrl+C (SIGINT; on Windows also Ctrl+Break) and
+  when its stdout is closed, for example when the reading program exits.
+  On Unix an idle stream notices a closed pipe within a fraction of a
+  second; elsewhere it notices at the next change it tries to print.
+- **Read-only.** Unlike `ps`, watching never renews the caller's lease or
+  writes any state.
+- **Errors** are one line too, `{"ok": false, "error": {...}, "warnings": []}`,
+  after which the stream exits with the error's exit status (for example 1
+  for `E_STATE`, 2 for an invalid `--scope`).
+- **`--watch` needs `--json`** (or `TABA_OUTPUT=json`) for now; without it,
+  taba exits with `E_USAGE` (exit 2).
+
+```console
+$ taba ps --watch --json --scope login-fix
+{"ok":true,"services":[{"service":"login-fix/web","status":"running",...}],"warnings":[]}
+{"ok":true,"services":[{"service":"login-fix/web","status":"stopping",...}],"warnings":[]}
+{"ok":true,"services":[{"service":"login-fix/web","status":"exited",...}],"warnings":[]}
+```
 
 ### Agent leases and cleanup
 

@@ -16,6 +16,7 @@ taba run [--scope S] --name N [--port P | --port auto | --port auto:START]
          [--wait[=SECS]] [--ready tcp|http:PATH|log:REGEX] [--json] -- CMD...
 taba ps [--scope S] [--running] [--json]
 taba ps --all [--json]
+taba ps --watch --json [--scope S] [--running] [--interval DURATION]
 taba logs [-f] S/N | N [--json]
 taba stop S/N | N | --scope S [--timeout SECS] [--json]
 taba rm S/N | N | --scope S [--json]
@@ -23,6 +24,11 @@ taba rm S/N | N | --scope S [--json]
 
 Every command takes `--json` (or `TABA_OUTPUT=json` in the environment) and
 then prints exactly one JSON document with `"ok"`, for success and failure.
+The one exception is `taba ps --watch --json`: it never ends on its own and
+prints one `ps --json` document per line, first at once and then on every
+change. Use it only from a program that reads the stream (it exits 0 on
+Ctrl+C or when its stdout is closed), never in a one-shot tool call; there,
+use `taba ps --json`.
 
 ## Procedure
 

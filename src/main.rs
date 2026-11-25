@@ -16,6 +16,7 @@ mod scope;
 mod state;
 mod update;
 mod util;
+mod watch;
 
 use clap::{Parser, Subcommand};
 use error::{Next, Output, Result, TabaError, Warning, emit};
@@ -105,6 +106,15 @@ enum Cmd {
         /// Print JSON instead of a table (paths are absolute; also: TABA_OUTPUT=json)
         #[arg(long)]
         json: bool,
+        /// Keep running and print a full `--json` snapshot, one per line
+        /// (NDJSON), first at once and then whenever it changes (needs --json)
+        #[arg(long, conflicts_with = "all")]
+        watch: bool,
+        /// How often --watch re-reads state: SECS, or a number with ms or s
+        /// (default 1s, minimum 250ms)
+        #[arg(long, requires = "watch", value_parser = watch::parse_interval,
+              value_name = "DURATION")]
+        interval: Option<Duration>,
     },
     /// Print a service's log
     Logs {
@@ -537,8 +547,13 @@ fn main() -> ExitCode {
             running,
             all,
             json,
+            watch,
+            interval,
         } => {
             let json = json || env_json();
+            if watch {
+                return ExitCode::from(watch::run(json, scope, running, interval));
+            }
             let res = if all {
                 listing::cmd_ps_all()
             } else {
@@ -1156,25 +1171,34 @@ fn status_of(store: &Store, s: &Service) -> &'static str {
     }
 }
 
-fn cmd_ps(scope: Option<String>, running_only: bool) -> Result<Output> {
-    if let Some(s) = &scope {
-        check_ident("scope", s)?;
-    }
-    let store = Store::open()?;
-    let mut services = store.list(scope.as_deref())?;
+/// What `ps` lists: the services (sorted by scope and name), their statuses
+/// and their `--json` rows. Building it only reads state.
+pub(crate) struct Snapshot {
+    pub services: Vec<Service>,
+    pub statuses: Vec<&'static str>,
+    pub rows: Vec<Value>,
+}
+
+/// Reads the `ps` rows of every service, or of one scope, optionally only
+/// the running ones. Shared by `ps`, `ps --watch` and `ui`; it never changes
+/// state.
+pub(crate) fn ps_snapshot(
+    store: &Store,
+    scope: Option<&str>,
+    running_only: bool,
+) -> Result<Snapshot> {
+    let mut services = store.list(scope)?;
     if running_only {
         services.retain(|s| s.is_running());
     }
-    let caller = scope::resolve(None, None)?;
-    let touched = peek_scope(&store, &caller)?;
-    let statuses: Vec<&str> = services.iter().map(|s| status_of(&store, s)).collect();
+    let statuses: Vec<&'static str> = services.iter().map(|s| status_of(store, s)).collect();
 
     let mut rows = Vec::new();
     for (s, status) in services.iter().zip(&statuses) {
         let now = util::now_secs();
         let rec = store.get_scope(&s.scope)?;
         let queue = store.get_claims(&s.scope, &s.name)?;
-        let borrows = borrows::live(&store, s)?;
+        let borrows = borrows::live(store, s)?;
         let exclusive = borrows.iter().find(|b| b.exclusive);
         rows.push(json!({
             "service": s.id(),
@@ -1194,11 +1218,30 @@ fn cmd_ps(scope: Option<String>, running_only: bool) -> Result<Output> {
             "lease": rec.as_ref().map(|r| r.lease_json(now)),
             "keep": rec.as_ref().is_some_and(|r| r.keep),
             "keep_reason": rec.as_ref().and_then(|r| r.keep_reason.as_deref()),
-            "claims": claims::rows(&store, &queue)?,
+            "claims": claims::rows(store, &queue)?,
             "borrows": { "shared": borrows.iter().filter(|b| !b.exclusive).count(), "exclusive": usize::from(exclusive.is_some()) },
             "locked_by": exclusive.map(|b| &b.scope),
         }));
     }
+    Ok(Snapshot {
+        services,
+        statuses,
+        rows,
+    })
+}
+
+fn cmd_ps(scope: Option<String>, running_only: bool) -> Result<Output> {
+    if let Some(s) = &scope {
+        check_ident("scope", s)?;
+    }
+    let store = Store::open()?;
+    let caller = scope::resolve(None, None)?;
+    let touched = peek_scope(&store, &caller)?;
+    let Snapshot {
+        services,
+        statuses,
+        rows,
+    } = ps_snapshot(&store, scope.as_deref(), running_only)?;
 
     let mut table = vec![[
         "SERVICE".to_string(),
