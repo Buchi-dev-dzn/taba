@@ -705,6 +705,14 @@ $TABA_HOME (default ~/.taba)
 └── lock                           # serialises changes to the state
 ```
 
+On macOS and Linux the state directory and every directory under it are
+owner-only (0700), and the files taba creates are owner-only (0600): records
+hold command lines and working directories, and logs often hold tokens or
+database URLs. An existing `$TABA_HOME` that others can read (one created by
+an older taba) is tightened to 0700 the next time taba opens it, if you own
+it. On Windows the state inherits the permissions of its parent folder (your
+user profile by default).
+
 State written by taba 0.1 is read unchanged.
 
 ## Platforms

@@ -26,7 +26,7 @@ use ready::{Outcome, ReadySpec};
 use scope::{Caller, ScopeSource, check_ident};
 use serde_json::{Value, json};
 use state::{OpLock, Service, Store};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::process::{Command, ExitCode, Stdio};
 use std::thread;
@@ -1031,9 +1031,8 @@ fn cmd_run(a: RunArgs) -> Result<Output> {
     };
 
     let log_path = store.log_path(&scope, &name);
-    std::fs::create_dir_all(log_path.parent().expect("log has parent"))?;
-    let mut log = OpenOptions::new()
-        .create(true)
+    state::create_private_dir_all(log_path.parent().expect("log has parent"))?;
+    let mut log = state::private_file()
         .append(true)
         .open(&log_path)
         .map_err(|e| TabaError::state(format!("cannot open log {}: {e}", log_path.display())))?;
