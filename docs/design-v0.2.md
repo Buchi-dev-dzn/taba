@@ -1091,7 +1091,13 @@ backend: macOS, Linux and Windows terminals). Design and decisions: issue
 - **Header:** the logo (`docs/logo/taba-icon.svg`) in block characters,
   brackets `#FF5533` and dots `#FFE0BF`; 24-bit color when the terminal
   advertises it, else the nearest 256-color values (203 and 223), none with
-  `NO_COLOR`; below 40 columns a one-line `[⋮] taba vX.Y.Z`.
+  `NO_COLOR` or `TERM=dumb`; below 40 columns a one-line `[⋮] taba vX.Y.Z`.
+- **Colors:** restrained and theme-adaptive. Orange only in the logo and
+  the `(current)` mark; status dots in ANSI green / yellow / bright black
+  (the terminal theme's own), status words default (exited: dim); scope
+  names bold default, counts and notes dim, errors ANSI red. The cursor row
+  is reverse video across the full width with all colors removed, so no
+  cell is filled with a status color.
 - **Tests:** the state and key handling (`ui/app.rs`) and the drawing
   (`ui/view.rs`, rendered to ratatui's `TestBackend` at fixed sizes) are
   unit-tested, and the `x` rules run against a temporary state directory
