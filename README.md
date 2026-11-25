@@ -32,13 +32,13 @@ belongs to which task, and only that task can stop its processes.
 
 Download an archive and `SHA256SUMS` from [GitHub Releases](https://github.com/Buchi-dev-dzn/taba/releases). Pick the archive for your OS and CPU:
 
-| Platform | v0.2.1 archive |
+| Platform | v0.2.2 archive |
 | --- | --- |
-| macOS Apple Silicon | `taba-v0.2.1-aarch64-apple-darwin.tar.gz` |
-| macOS Intel | `taba-v0.2.1-x86_64-apple-darwin.tar.gz` |
-| Windows x86_64 | `taba-v0.2.1-x86_64-pc-windows-msvc.zip` |
-| Linux x86_64 (GNU/glibc) | `taba-v0.2.1-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux arm64 (GNU/glibc) | `taba-v0.2.1-aarch64-unknown-linux-gnu.tar.gz` |
+| macOS Apple Silicon | `taba-v0.2.2-aarch64-apple-darwin.tar.gz` |
+| macOS Intel | `taba-v0.2.2-x86_64-apple-darwin.tar.gz` |
+| Windows x86_64 | `taba-v0.2.2-x86_64-pc-windows-msvc.zip` |
+| Linux x86_64 (GNU/glibc) | `taba-v0.2.2-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux arm64 (GNU/glibc) | `taba-v0.2.2-aarch64-unknown-linux-gnu.tar.gz` |
 
 Compare the archive's SHA-256 with the matching line in `SHA256SUMS`: use
 `shasum -a 256 FILE` on macOS, `sha256sum FILE` on Linux, or
@@ -54,10 +54,10 @@ bump the minor version.
 To build the released version from Git with Rust and Cargo:
 
 ```sh
-cargo install --locked --git https://github.com/Buchi-dev-dzn/taba.git --tag v0.2.1 taba
+cargo install --locked --git https://github.com/Buchi-dev-dzn/taba.git --tag v0.2.2 taba
 ```
 
-The pinned command requires the published `v0.2.1` tag. To build a local
+The pinned command requires the published `v0.2.2` tag. To build a local
 checkout instead:
 
 ```sh
