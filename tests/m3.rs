@@ -216,6 +216,12 @@ fn lazy_cleanup_does_not_wait_out_or_force_a_slow_service() {
     assert!(f.ps(&[]).iter().any(|r| r["service"] == service.as_str()));
     assert!(gc_drop(&f, &service).is_none());
     wait_until("graceful exit", || dir.join("stopped").exists());
+    // The marker is written just before the interpreter exits.
+    wait_until("service exited", || {
+        f.ps(&[])
+            .iter()
+            .any(|r| r["service"] == service.as_str() && r["status"] == "exited")
+    });
     other.call(&f, &f.wt_b, "other", &["whoami"]);
     assert!(!f.ps(&[]).iter().any(|r| r["service"] == service.as_str()));
     assert!(gc_drop(&f, &service).unwrap()["signal"].is_null());
