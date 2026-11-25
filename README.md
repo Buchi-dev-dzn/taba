@@ -113,7 +113,8 @@ alone.
   `taba update` fails with `E_UPDATE_FAILED`.
 - **Everywhere else, `taba update` only reports the new version** and points
   you to a manual upgrade (status `manual_update`). That covers Cargo and
-  source builds (`cargo install ...` again) and package-manager installs
+  source builds (`cargo install ...` again), including a build of a version
+  that has no GitHub release yet, and package-manager installs
   (Homebrew included). On Windows, `taba update`
   is check-only: taba does not replace its own running `.exe`. To upgrade on
   Windows, wait for running `taba` commands to finish, then replace `taba.exe`
