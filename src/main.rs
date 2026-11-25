@@ -69,8 +69,12 @@ enum Cmd {
         #[arg(long, value_parser = ready::parse_ready_spec, requires = "wait",
               value_name = "tcp|http:PATH|log:REGEX")]
         ready: Option<ReadySpec>,
+        /// Lease TTL for the caller's scope: a duration such as 4h, or none
+        /// (default: $TABA_TTL, then lease_ttl in config.toml, then 4h for agents)
         #[arg(long, value_parser = config::parse_ttl_flag)]
         ttl: Option<config::Ttl>,
+        /// Stop this service once the duration has passed (renewed by an
+        /// already_running re-run), independent of the lease
         #[arg(long, value_parser = config::parse_service_ttl_flag)]
         service_ttl: Option<u64>,
         /// Print one JSON document (also: TABA_OUTPUT=json)
@@ -180,12 +184,16 @@ enum Cmd {
     },
     /// Renew the current scope's lease
     Renew {
+        /// The caller's scope (default: $TABA_SCOPE, else the git worktree)
         #[arg(long)]
         scope: Option<String>,
+        /// Agent acting (default: $TABA_AGENT, else "human")
         #[arg(long)]
         agent: Option<String>,
+        /// New lease TTL: a duration such as 4h, or none
         #[arg(long, value_parser = config::parse_ttl_flag)]
         ttl: Option<config::Ttl>,
+        /// Print one JSON document (also: TABA_OUTPUT=json)
         #[arg(long)]
         json: bool,
     },
@@ -196,93 +204,133 @@ enum Cmd {
     },
     /// Keep the scope's services after its lease ends
     Keep {
+        /// The caller's scope (default: $TABA_SCOPE, else the git worktree)
         #[arg(long)]
         scope: Option<String>,
+        /// Agent acting (default: $TABA_AGENT, else "human")
         #[arg(long)]
         agent: Option<String>,
+        /// Remove the keep mark again
         #[arg(long)]
         off: bool,
+        /// Set the mark without the lease check (needs --reason; recorded)
         #[arg(long)]
         force: bool,
+        /// Why the scope is kept (required for agents; shown in ps and recorded)
         #[arg(long)]
         reason: Option<String>,
+        /// Print one JSON document (also: TABA_OUTPUT=json)
         #[arg(long)]
         json: bool,
     },
     /// Collect services past their lease or TTL
     Gc {
+        /// Show what would be handed over or dropped; change nothing
         #[arg(long)]
         dry_run: bool,
+        /// Print one JSON document (also: TABA_OUTPUT=json)
         #[arg(long)]
         json: bool,
     },
     /// Record a shared or exclusive borrow of another scope's service
     Borrow {
+        /// SCOPE/NAME to borrow, or with --check a borrow ID
         target: String,
+        /// The borrowing scope (default: $TABA_SCOPE, else the git worktree)
         #[arg(long)]
         scope: Option<String>,
+        /// Agent acting (default: $TABA_AGENT, else "human")
         #[arg(long)]
         agent: Option<String>,
+        /// Check that a borrow still points at a running instance
         #[arg(long, conflicts_with_all = ["exclusive", "ttl", "wait_lock", "command"])]
         check: bool,
+        /// Take the exclusive borrow (&mut), which allows stop and re-run of
+        /// that service
         #[arg(long = "mut")]
         exclusive: bool,
+        /// How long the borrow lasts (default: the borrowing scope's lease)
         #[arg(long, value_parser = config::parse_ttl_flag)]
         ttl: Option<config::Ttl>,
+        /// Seconds to wait for another exclusive borrow to end
         #[arg(long, default_value_t = 0.0)]
         wait_lock: f64,
+        /// Print one JSON document (also: TABA_OUTPUT=json)
         #[arg(long)]
         json: bool,
+        /// Command to run while holding an exclusive borrow, after `--`;
+        /// the borrow ends when it exits
         #[arg(last = true)]
         command: Vec<String>,
     },
     /// End a borrow by ID or service
     Release {
+        /// Borrow ID or the borrowed SCOPE/NAME
         target: String,
+        /// The borrowing scope (default: $TABA_SCOPE, else the git worktree)
         #[arg(long)]
         scope: Option<String>,
+        /// Agent acting (default: $TABA_AGENT, else "human")
         #[arg(long)]
         agent: Option<String>,
+        /// Print one JSON document (also: TABA_OUTPUT=json)
         #[arg(long)]
         json: bool,
     },
     /// Transfer a scope lease or move a service without restarting it
     Move {
+        /// SCOPE/NAME to move one service; without it, move the scope lease
         target: Option<String>,
+        /// The caller's scope (default: $TABA_SCOPE, else the git worktree)
         #[arg(long)]
         scope: Option<String>,
+        /// Agent acting (default: $TABA_AGENT, else "human")
         #[arg(long)]
         agent: Option<String>,
+        /// Receiving agent (scope lease) or receiving scope (one service)
         #[arg(long, conflicts_with = "take", required_unless_present = "take")]
         to: Option<String>,
+        /// Take the scope lease; its holder's lease must have ended, or --force
         #[arg(long, conflicts_with = "target")]
         take: bool,
+        /// Override the lease check (needs --reason; recorded)
         #[arg(long)]
         force: bool,
+        /// Why --force is needed (recorded in events.jsonl)
         #[arg(long, requires = "force")]
         reason: Option<String>,
+        /// Print one JSON document (also: TABA_OUTPUT=json)
         #[arg(long)]
         json: bool,
     },
     /// Queue for ownership of another scope's service
     Claim {
+        /// SCOPE/NAME of another scope's service
         target: String,
+        /// The claiming scope (default: $TABA_SCOPE, else the git worktree)
         #[arg(long)]
         scope: Option<String>,
+        /// Agent acting (default: $TABA_AGENT, else "human")
         #[arg(long)]
         agent: Option<String>,
+        /// Leave the claim queue instead of joining it
         #[arg(long)]
         cancel: bool,
+        /// Print one JSON document (also: TABA_OUTPUT=json)
         #[arg(long)]
         json: bool,
     },
     /// Hand a service to its first live claimant
     Disown {
+        /// SCOPE/NAME, or NAME in the caller's scope; without it, use --scope
         target: Option<String>,
+        /// The caller's scope; without a target, disown all its services
         #[arg(long)]
         scope: Option<String>,
+        /// Agent acting (default: $TABA_AGENT, else "human")
         #[arg(long)]
         agent: Option<String>,
+        /// Print one JSON document (also: TABA_OUTPUT=json)
         #[arg(long)]
         json: bool,
     },
@@ -291,12 +339,15 @@ enum Cmd {
         /// Only report whether a newer stable release exists; change nothing
         #[arg(long)]
         check: bool,
+        /// Print one JSON document (also: TABA_OUTPUT=json)
         #[arg(long)]
         json: bool,
     },
     /// Inspect agent hook input on stdin
     Hook {
+        /// The agent harness whose hook input is read
         harness: hooks::Harness,
+        /// The hook event being handled
         event: hooks::Event,
     },
     /// Internal (Windows): send Ctrl+Break to console process group PGID,
@@ -310,10 +361,13 @@ enum Cmd {
 enum LeaseCmd {
     /// End leases without immediately stopping services
     End {
+        /// End only the agent's lease of this scope (default: all its leases)
         #[arg(long, conflicts_with = "agent")]
         scope: Option<String>,
+        /// Agent whose leases end (default: $TABA_AGENT, else "human")
         #[arg(long)]
         agent: Option<String>,
+        /// Print one JSON document (also: TABA_OUTPUT=json)
         #[arg(long)]
         json: bool,
     },
@@ -341,6 +395,83 @@ fn json_requested_raw() -> bool {
             .any(|a| a == "--json")
 }
 
+/// The subcommand path a raw argument list names, such as `taba lease end`;
+/// `taba` when it names none.
+fn command_path(args: &[String]) -> String {
+    use clap::CommandFactory;
+    let mut cmd = Cli::command();
+    let mut path = vec!["taba".to_string()];
+    for a in args.iter().take_while(|a| a.as_str() != "--") {
+        if a.starts_with('-') {
+            continue;
+        }
+        let Some(sub) = cmd.find_subcommand(a).filter(|s| !s.is_hide_set()).cloned() else {
+            break;
+        };
+        path.push(sub.get_name().to_string());
+        cmd = sub;
+        if !cmd.has_subcommands() {
+            break;
+        }
+    }
+    path.join(" ")
+}
+
+/// A clap parse error as a complete `E_USAGE`: the whole message (not just
+/// its first line), the offending arguments and usage in `details`, and the
+/// help of the actual subcommand in `next`.
+fn usage_error(e: &clap::Error, args: &[String]) -> TabaError {
+    use clap::error::{ContextKind, ContextValue};
+    let rendered = e.render().to_string();
+    let message = rendered
+        .lines()
+        .take_while(|l| !l.starts_with("Usage:"))
+        .map(|l| l.trim().trim_start_matches("error:").trim())
+        .filter(|l| !l.is_empty() && !l.starts_with("For more information"))
+        .fold(String::new(), |acc, l| {
+            match (acc.is_empty(), l.starts_with("tip:")) {
+                (true, _) => l.to_string(),
+                (false, true) => format!("{acc}; {l}"),
+                (false, false) => format!("{acc} {l}"),
+            }
+        });
+    let message = if message.is_empty() {
+        "invalid arguments".to_string()
+    } else {
+        message
+    };
+    let strings = |kind| match e.get(kind) {
+        Some(ContextValue::String(s)) => vec![s.clone()],
+        Some(ContextValue::Strings(v)) => v.clone(),
+        _ => Vec::new(),
+    };
+    let mut details = serde_json::Map::new();
+    let invalid = strings(ContextKind::InvalidArg);
+    if !invalid.is_empty() {
+        details.insert("arguments".into(), json!(invalid));
+    }
+    if let Some(value) = strings(ContextKind::InvalidValue)
+        .first()
+        .filter(|v| !v.is_empty())
+    {
+        details.insert("value".into(), json!(value));
+    }
+    if let Some(sub) = strings(ContextKind::InvalidSubcommand).first() {
+        details.insert("subcommand".into(), json!(sub));
+    }
+    if let Some(usage) = rendered.lines().find_map(|l| l.strip_prefix("Usage:")) {
+        // The binary may be `taba.exe` or a path; name it as the docs do.
+        let rest = usage.trim().split_once(' ').map_or("", |(_, r)| r);
+        details.insert("usage".into(), json!(format!("taba {rest}").trim_end()));
+    }
+    let help = format!("{} --help", command_path(args));
+    let mut err = TabaError::usage(message).next(Next::run("see the usage", help));
+    if !details.is_empty() {
+        err = err.details(Value::Object(details));
+    }
+    err
+}
+
 fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
@@ -355,16 +486,8 @@ fn main() -> ExitCode {
             if informational || !json_requested_raw() {
                 e.exit();
             }
-            let rendered = e.render().to_string();
-            let msg = rendered
-                .lines()
-                .next()
-                .unwrap_or("invalid arguments")
-                .trim_start_matches("error: ")
-                .to_string();
-            let err =
-                TabaError::usage(msg).next(Next::run("see the usage", "taba <command> --help"));
-            return ExitCode::from(emit(true, Err(err)));
+            let args: Vec<String> = std::env::args().skip(1).collect();
+            return ExitCode::from(emit(true, Err(usage_error(&e, &args))));
         }
     };
 
@@ -1848,4 +1971,34 @@ pub(crate) fn rm_services(
         ));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    fn walk(cmd: &clap::Command, path: &str, missing: &mut Vec<String>) {
+        for a in cmd.get_arguments() {
+            if a.is_hide_set() || matches!(a.get_id().as_str(), "help" | "version") {
+                continue;
+            }
+            if a.get_help().is_none_or(|h| h.to_string().trim().is_empty()) {
+                missing.push(format!("{path} {}", a.get_id()));
+            }
+        }
+        for sub in cmd.get_subcommands() {
+            if sub.is_hide_set() {
+                continue;
+            }
+            walk(sub, &format!("{path} {}", sub.get_name()), missing);
+        }
+    }
+
+    #[test]
+    fn every_flag_has_help() {
+        let mut missing = Vec::new();
+        walk(&Cli::command(), "taba", &mut missing);
+        assert!(missing.is_empty(), "arguments without help: {missing:?}");
+    }
 }

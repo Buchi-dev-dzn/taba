@@ -552,7 +552,7 @@ single quotes). The exit status follows the code:
 
 | Code | Exit | Meaning |
 | --- | --- | --- |
-| `E_USAGE`, `E_INVALID_IDENT`, `E_FORCE_NEEDS_REASON` | 2 | Bad flags or names; `--force` without `--reason`. |
+| `E_USAGE`, `E_INVALID_IDENT`, `E_FORCE_NEEDS_REASON` | 2 | Bad flags or names (an argument error names the flag in `details.arguments` and points `next` at that command's `--help`); `--force` without `--reason`. |
 | `E_NO_SCOPE` | 2 | No `--scope`, no `$TABA_SCOPE`, and not inside a git worktree. |
 | `E_NOT_OWNER` | 3 | The service belongs to another scope. |
 | `E_BUSY` | 3 | Another `stop` or starting `run` of that service is in progress. |
