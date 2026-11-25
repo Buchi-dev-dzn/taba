@@ -14,6 +14,18 @@ fn one_document(out: &std::process::Output) -> Value {
     json(out)
 }
 
+fn stopped_log(f: &Fixture) -> String {
+    let a = &f.wt_a;
+    let service = one_document(&f.taba(
+        a,
+        &["run", "--name", "web", "--json", "--", PY, "-c", SLEEP_30],
+    ));
+    assert_eq!(service["ok"], true, "{service}");
+    let stopped = one_document(&f.taba(a, &["stop", "web", "--json"]));
+    assert_eq!(stopped["ok"], true, "{stopped}");
+    service["log_path"].as_str().unwrap().to_owned()
+}
+
 /// M2.1: every command with `--json` prints exactly one JSON document on
 /// stdout, for success and failure, and stderr is empty.
 #[test]
@@ -75,6 +87,80 @@ fn m2_01_json_everywhere() {
         .output()
         .unwrap();
     assert_eq!(one_document(&out)["error"]["code"], "E_NOT_FOUND");
+}
+
+#[test]
+fn logs_tail_preserves_line_endings_and_raw_bytes() {
+    let f = Fixture::new("logs-tail");
+    let a = &f.wt_a;
+    let path = &stopped_log(&f);
+
+    let log = b"first\r\n\r\nlast\xff";
+    std::fs::write(path, log).unwrap();
+    for (args, expected) in [
+        (&[][..], &log[..]),
+        (&["--tail", "2"][..], &b"\r\nlast\xff"[..]),
+        (&["--tail", "200"][..], &log[..]),
+        (&["--tail", "0"][..], &b""[..]),
+    ] {
+        let out = f.taba(a, &[["logs", "web"].as_slice(), args].concat());
+        assert_eq!(exit(&out), 0, "{}", text(&out));
+        assert_eq!(out.stdout, expected);
+    }
+
+    std::fs::write(path, b"first\r\n\r\nlast\r\n").unwrap();
+    let out = f.taba(a, &["logs", "web", "--tail", "1", "-f"]);
+    assert_eq!(exit(&out), 0, "{}", text(&out));
+    assert_eq!(out.stdout, b"last\r\n");
+
+    let out = f.taba(a, &["logs", "web", "--tail", "-1", "--json"]);
+    assert_eq!(exit(&out), 2);
+    assert_eq!(one_document(&out)["error"]["code"], "E_USAGE");
+
+    std::fs::write(path, b"").unwrap();
+    let out = f.taba(a, &["logs", "web", "--tail", "1", "--json"]);
+    assert_eq!(exit(&out), 0, "{}", text(&out));
+    let reply = one_document(&out);
+    assert_eq!(reply["log"], "");
+    assert_eq!(reply["truncated"], false);
+    assert_eq!(reply["bytes_total"], 0);
+}
+
+#[test]
+fn logs_json_bounds_large_logs_even_when_a_line_needs_escaping() {
+    let f = Fixture::new("logs-cap");
+    let a = &f.wt_a;
+    let path = stopped_log(&f);
+
+    let mut log = vec![0; 2 * 1024 * 1024];
+    log.extend_from_slice(b"\nlast\n");
+    std::fs::write(&path, &log).unwrap();
+
+    for tail in [&[][..], &["--tail", "100"][..]] {
+        let args = [["logs", "web", "--json"].as_slice(), tail].concat();
+        let out = f.taba(a, &args);
+        assert_eq!(exit(&out), 0, "{}", text(&out));
+        assert!(out.stdout.len() < 100 * 1024, "JSON output exceeds 100 KiB");
+        let reply = one_document(&out);
+        assert_eq!(reply["log_path"], path);
+        assert_eq!(reply["truncated"], true);
+        assert_eq!(reply["bytes_total"], log.len());
+        assert_eq!(
+            reply["log"],
+            String::from_utf8_lossy(&log[log.len() - 16 * 1024..]).as_ref()
+        );
+    }
+
+    let out = f
+        .cmd(a, &["logs", "web", "--tail", "1"])
+        .env("TABA_OUTPUT", "json")
+        .output()
+        .unwrap();
+    assert_eq!(exit(&out), 0, "{}", text(&out));
+    let reply = one_document(&out);
+    assert_eq!(reply["log"], "last\n");
+    assert_eq!(reply["truncated"], true);
+    assert_eq!(reply["bytes_total"], log.len());
 }
 
 /// Starts an unmanaged `python3 -m http.server PORT` in `dir`, detached the

@@ -17,7 +17,7 @@ taba run [--scope S] --name N [--port P | --port auto | --port auto:START]
 taba ps [--scope S] [--running] [--json]
 taba ps --all [--json]
 taba ps --watch --json [--scope S] [--running] [--interval DURATION]
-taba logs [-f] S/N | N [--json]
+taba logs S/N | N [--tail N] [-f] [--json]
 taba stop S/N | N | --scope S [--timeout SECS] [--json]
 taba rm S/N | N | --scope S [--json]
 ```
@@ -81,8 +81,8 @@ it (it needs a terminal and waits for keys). Point the human to it instead.
 | --- | --- | --- |
 | `E_NO_SCOPE` | No `--scope`, no `$TABA_SCOPE`, not in a git worktree. | `cd` into your worktree or pass `--scope`. |
 | `E_PORT_IN_USE`, `E_PORT_CLAIMED` | The port is taken. Nothing was started. | `--port auto` (the command is in `next`); never kill the holder. |
-| `E_START_FAILED` | The process exited before it was ready. | Read `error.details.log_tail` or `taba logs <name>`, fix, re-run. |
-| `E_NOT_READY` | `--wait` timed out; the process still runs. | `taba logs <name>`; `taba stop <name>` if it is stuck. |
+| `E_START_FAILED` | The process exited before it was ready. | Read `error.details.log_tail` or `taba logs <name> --tail 100 --json`, fix, re-run. |
+| `E_NOT_READY` | `--wait` timed out; the process still runs. | `taba logs <name> --tail 100 --json`; `taba stop <name>` if it is stuck. |
 | `E_CONFLICT` | The name already runs with another command, directory or port. | `taba stop <name>` and run again, or use another `--name`. |
 | `E_NOT_OWNER` | The service belongs to another scope. | Use its URL read-only, or ask the human. |
 | `E_BUSY` | Someone else is stopping or starting that service right now. | Wait, then `taba ps --scope <scope> --json`. |
@@ -101,14 +101,16 @@ it (it needs a terminal and waits for keys). Point the human to it instead.
 ## Logs
 
 ```sh
-taba logs web            # whole log so far (stdout + stderr), in your scope
-taba logs login-fix-3f9a/web -f   # follow until the service exits
+taba logs web --tail 100 --json       # recent output (stdout + stderr) in your scope
+taba logs login-fix-3f9a/web --tail 20 -f  # show recent lines, then follow until exit
 ```
 
-`-f` blocks until the service exits. In a non-interactive tool call, prefer
-the plain form, or pipe it through `tail`. The log path is also in
-`taba ps --json` (`log_path`). Logs of any scope are readable.
-`taba logs web --json` returns the text in `log` (not with `-f`).
+Use `--tail 100 --json` for one-shot calls; `-f` blocks until the service
+exits and is incompatible with `--json`. The `log` field contains up to 16 KiB
+of source data, possibly starting mid-line. `truncated` is true if earlier
+data was omitted, and `bytes_total` is the original log size in bytes. The
+file is available at `log_path`, also listed by `taba ps --json`. Logs of any
+scope are readable.
 
 ## Borrowing another scope's service
 

@@ -1107,14 +1107,23 @@ backend: macOS, Linux and Windows terminals). Design and decisions: issue
   with real processes. Raw-mode input and the real terminal are not
   automated.
 
-### `taba logs` (unchanged, plus JSON errors)
+### `taba logs`
 
 ```sh
-taba logs [-f] S/N        # or N with $TABA_SCOPE / derived scope
+taba logs S/N [--tail N] [-f] [--json]  # or a bare name in the caller's scope
 ```
 
-Output is the raw log, as in v0.1. With `--json`, errors use the envelope.
+Text output is the raw log. `--tail N` limits the initial output to the last
+`N` lines, counting an unterminated final line. `-f` then streams appended
+bytes until the service exits. `--tail 0 -f` starts at the end of the file.
 Logs are readable by any scope (shared borrow without a record).
+
+With `--json` (or `TABA_OUTPUT=json`), `log` contains at most the last
+16 KiB of source data, subject to any smaller `--tail` limit. The byte cap
+can start the result mid-line. `bytes_total` is the log size in bytes at the
+start of the read, and `truncated` is true if either limit omitted earlier
+data. Errors use the JSON envelope. `-f` conflicts with `--json` and ignores
+`TABA_OUTPUT=json`.
 
 Errors: `E_NOT_FOUND, E_INVALID_IDENT, E_NO_SCOPE` (bare `NAME` without a
 scope), `E_STATE`.

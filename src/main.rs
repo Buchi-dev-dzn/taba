@@ -127,7 +127,10 @@ enum Cmd {
         /// Keep printing new output until the service exits
         #[arg(short, long, conflicts_with = "json")]
         follow: bool,
-        /// Print one JSON document with the log text (also: TABA_OUTPUT=json)
+        /// Show only the last N existing lines (0 starts at the end with --follow)
+        #[arg(long, value_name = "N")]
+        tail: Option<u64>,
+        /// Print JSON with up to 16 KiB of log data (also: TABA_OUTPUT=json)
         #[arg(long)]
         json: bool,
     },
@@ -572,11 +575,12 @@ fn main() -> ExitCode {
         Cmd::Logs {
             target,
             follow,
+            tail,
             json,
         } => {
             // `-f` streams raw text; TABA_OUTPUT=json does not apply to it.
             let json = json || (env_json() && !follow);
-            (json, cmd_logs(&target, follow, json))
+            (json, cmd_logs(&target, follow, tail, json))
         }
         Cmd::Stop {
             target,
@@ -1310,7 +1314,36 @@ fn peek_scope(store: &Store, caller: &Caller) -> Result<lease::Touched> {
 
 // ---------------------------------------------------------------- logs
 
-fn cmd_logs(target: &str, follow: bool, json: bool) -> Result<Option<Output>> {
+const LOG_JSON_MAX_BYTES: u64 = 16 * 1024;
+
+/// Find the start of the last `lines` lines by scanning backwards in blocks.
+/// `min` limits the scan to the byte window that can be returned.
+fn log_tail_start(file: &mut File, min: u64, end: u64, mut lines: u64) -> io::Result<u64> {
+    if lines == 0 {
+        return Ok(end);
+    }
+    let mut offset = end;
+    let mut block = [0; 8192];
+    while offset > min {
+        let len = (offset - min).min(block.len() as u64) as usize;
+        offset -= len as u64;
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(&mut block[..len])?;
+        for (index, &byte) in block[..len].iter().enumerate().rev() {
+            let next = offset + index as u64 + 1;
+            // A final newline terminates the last line.
+            if byte == b'\n' && next != end {
+                lines -= 1;
+                if lines == 0 {
+                    return Ok(next);
+                }
+            }
+        }
+    }
+    Ok(min)
+}
+
+fn cmd_logs(target: &str, follow: bool, tail: Option<u64>, json: bool) -> Result<Option<Output>> {
     let caller = scope::resolve(None, None)?;
     let (scope, name) = resolve_target(target, &caller)?;
     let store = Store::open()?;
@@ -1320,25 +1353,43 @@ fn cmd_logs(target: &str, follow: bool, json: bool) -> Result<Option<Output>> {
     let peek = peek_scope(&store, &caller)?;
     let mut file = File::open(&svc.log_path)
         .map_err(|e| TabaError::state(format!("cannot open {}: {e}", svc.log_path.display())))?;
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf)?;
+    let end = file.metadata()?.len();
+    let min = if json {
+        end.saturating_sub(LOG_JSON_MAX_BYTES)
+    } else {
+        0
+    };
+    let start = match tail {
+        Some(lines) => log_tail_start(&mut file, min, end, lines)?,
+        None => min,
+    };
+    file.seek(SeekFrom::Start(start))?;
     if json {
+        let mut buf = Vec::new();
+        file.take(end - start).read_to_end(&mut buf)?;
         let body = json!({
             "service": svc.id(),
             "log_path": svc.log_path,
             "log": String::from_utf8_lossy(&buf),
+            "truncated": start > 0,
+            "bytes_total": end,
         });
         let mut out = Output::new(body, String::new());
         out.warnings = peek.warnings;
         return Ok(Some(out));
     }
     let mut stdout = io::stdout().lock();
-    stdout.write_all(&buf)?;
+    if tail.is_some() {
+        io::copy(&mut (&mut file).take(end - start), &mut stdout)?;
+    } else {
+        io::copy(&mut file, &mut stdout)?;
+    }
     stdout.flush()?;
     if !follow {
         return Ok(None);
     }
     let mut pos = file.stream_position()?;
+    let mut buf = Vec::new();
     loop {
         let running = svc.is_running();
         file.seek(SeekFrom::Start(pos))?;
