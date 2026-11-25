@@ -1458,7 +1458,11 @@ fn peek_scope(store: &Store, caller: &Caller) -> Result<lease::Touched> {
         return Ok(lease::Touched::default());
     };
     let cfg = config::Config::load(store.root())?;
-    let _lock = store.lock()?;
+    // `ps` and `logs` read without waiting (design §2 rule 2): the lease
+    // renewal is skipped while another process holds the state lock.
+    let Some(_lock) = store.try_lock()? else {
+        return Ok(lease::Touched::default());
+    };
     lease::touch(store, &cfg, caller, scope, lease::Access::Peek, None)
 }
 

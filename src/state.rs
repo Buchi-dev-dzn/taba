@@ -9,6 +9,7 @@
 //! events.jsonl                    append-only audit log
 //! version                         state schema version
 //! lock                            global lock (flock / LockFileEx)
+//! lock.holder                     pid of the last process that took the global lock
 //! btime/                          Linux boot-time cache and recovery copies
 //! ```
 //!
@@ -20,9 +21,10 @@
 
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 /// Which state file could not be read, for the error's next step.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,6 +227,71 @@ pub struct Lock {
     _file: File,
 }
 
+/// Default wait for the global lock before `E_BUSY`.
+const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long to wait before saying so on a terminal.
+const LOCK_NOTICE_AFTER: Duration = Duration::from_millis(500);
+const LOCK_POLL: Duration = Duration::from_millis(25);
+
+/// The global lock stayed busy for the whole timeout.
+#[derive(Debug)]
+pub struct LockBusy {
+    pub path: PathBuf,
+    /// The pid that last took the lock, if it recorded one.
+    pub holder_pid: Option<u32>,
+    pub waited: Duration,
+}
+
+impl std::fmt::Display for LockBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the state lock is held by another taba process")?;
+        if let Some(pid) = self.holder_pid {
+            write!(f, " (pid {pid})")?;
+        }
+        write!(f, "; gave up after {:.1}s", self.waited.as_secs_f64())
+    }
+}
+
+impl std::error::Error for LockBusy {}
+
+/// The `LockBusy` behind an I/O error, if that is what it is.
+pub fn lock_busy(e: &io::Error) -> Option<&LockBusy> {
+    e.get_ref()?.downcast_ref()
+}
+
+/// `$TABA_LOCK_TIMEOUT` in seconds (0 = try once), or the default.
+fn lock_timeout() -> io::Result<Duration> {
+    let Some(v) = std::env::var_os("TABA_LOCK_TIMEOUT").filter(|v| !v.is_empty()) else {
+        return Ok(LOCK_TIMEOUT);
+    };
+    v.to_str()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|s| s.is_finite() && (0.0..=86400.0).contains(s))
+        .map(Duration::from_secs_f64)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                BadLockTimeout(v.to_string_lossy().into_owned()),
+            )
+        })
+}
+
+/// `$TABA_LOCK_TIMEOUT` is not a number of seconds in range (`E_CONFIG`).
+#[derive(Debug)]
+pub struct BadLockTimeout(pub String);
+
+impl std::fmt::Display for BadLockTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "TABA_LOCK_TIMEOUT: invalid value {:?}: use seconds between 0 and 86400",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for BadLockTimeout {}
+
 pub fn validate_ident(kind: &str, s: &str) -> Result<(), String> {
     let ok = !s.is_empty()
         && s.len() <= 64
@@ -297,15 +364,74 @@ impl Store {
         fs::rename(tmp, path)
     }
 
+    /// Takes the global lock, retrying until `$TABA_LOCK_TIMEOUT` (default
+    /// 10 seconds) passes. On a terminal, says once that it is waiting. A
+    /// timeout is an error carrying `LockBusy` (`E_BUSY`).
     pub fn lock(&self) -> io::Result<Lock> {
+        let timeout = lock_timeout()?;
+        let start = Instant::now();
+        let mut told = false;
+        loop {
+            if let Some(lock) = self.try_lock()? {
+                return Ok(lock);
+            }
+            let waited = start.elapsed();
+            if waited >= timeout {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    LockBusy {
+                        path: self.root.join("lock"),
+                        holder_pid: self.lock_holder(),
+                        waited,
+                    },
+                ));
+            }
+            if !told && waited >= LOCK_NOTICE_AFTER && io::stderr().is_terminal() {
+                let holder = self
+                    .lock_holder()
+                    .map(|p| format!(" (held by pid {p})"))
+                    .unwrap_or_default();
+                eprintln!(
+                    "taba: waiting for state lock{holder}, up to {}s",
+                    timeout.as_secs_f64()
+                );
+                told = true;
+            }
+            std::thread::sleep(LOCK_POLL.min(timeout - waited));
+        }
+    }
+
+    /// Takes the global lock if it is free right now; `None` if another
+    /// process holds it.
+    pub fn try_lock(&self) -> io::Result<Option<Lock>> {
         let file = private_file()
             .truncate(false)
             .write(true)
             .open(self.root.join("lock"))?;
         // flock(LOCK_EX) on Unix, LockFileEx on Windows; released when the
         // file is closed, also if taba dies.
-        file.lock()?;
-        Ok(Lock { _file: file })
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => return Ok(None),
+            Err(fs::TryLockError::Error(e)) => return Err(e),
+        }
+        // Best effort, for the `E_BUSY` of whoever waits next. A separate
+        // file, because Windows does not let others read a locked range.
+        let _ = private_file()
+            .write(true)
+            .truncate(true)
+            .open(self.root.join("lock.holder"))
+            .and_then(|mut holder| writeln!(holder, "{}", std::process::id()));
+        Ok(Some(Lock { _file: file }))
+    }
+
+    /// The pid recorded by the last process that took the global lock.
+    fn lock_holder(&self) -> Option<u32> {
+        fs::read_to_string(self.root.join("lock.holder"))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
     }
 
     fn record_path(&self, scope: &str, name: &str) -> PathBuf {
@@ -753,6 +879,23 @@ pub(crate) fn remove_file_and_empty_parent(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn try_lock_is_none_while_held_and_records_the_holder() {
+        let dir = std::env::temp_dir().join(format!("taba-lock-{}", std::process::id()));
+        let store = Store::at(dir.clone());
+        let held = store.try_lock().unwrap().expect("free lock");
+        assert_eq!(store.lock_holder(), Some(std::process::id()));
+        assert!(store.try_lock().unwrap().is_none());
+        drop(held);
+        // Another test's fork can briefly share the descriptor before exec.
+        assert!(crate::proc::wait_for(
+            Duration::from_secs(5),
+            Duration::from_millis(10),
+            || store.try_lock().unwrap().is_some()
+        ));
+        let _ = fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn missing_is_none_but_empty_or_damaged_is_unreadable() {

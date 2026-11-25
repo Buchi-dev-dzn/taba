@@ -99,7 +99,8 @@ impl Fixture {
             .env("PYTHONPATH", python_path())
             .env_remove("TABA_SCOPE")
             .env_remove("TABA_AGENT")
-            .env_remove("TABA_OUTPUT");
+            .env_remove("TABA_OUTPUT")
+            .env_remove("TABA_LOCK_TIMEOUT");
         c
     }
 

@@ -167,6 +167,7 @@ fn state_directory_and_files_are_private() {
         home.join("events.jsonl"),
         home.join("version"),
         home.join("lock"),
+        home.join("lock.holder"),
     ] {
         assert_eq!(mode(&file), 0o600, "{}", file.display());
     }
