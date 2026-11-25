@@ -29,11 +29,13 @@ impl Colors {
         Colors::from_env(|k| std::env::var(k).ok())
     }
 
-    /// `NO_COLOR` (non-empty) turns colors off. 24-bit color is used when
+    /// `NO_COLOR` (non-empty) or `TERM=dumb` turns colors off. 24-bit color is used when
     /// `COLORTERM` says so, in Windows Terminal (`WT_SESSION`), and in
     /// iTerm2, WezTerm and VS Code; elsewhere the 256-color palette.
     pub fn from_env(get: impl Fn(&str) -> Option<String>) -> Colors {
-        if get("NO_COLOR").is_some_and(|v| !v.is_empty()) {
+        if get("NO_COLOR").is_some_and(|v| !v.is_empty())
+            || get("TERM").is_some_and(|t| t == "dumb")
+        {
             return Colors::Off;
         }
         let colorterm = get("COLORTERM").unwrap_or_default().to_lowercase();
@@ -74,11 +76,22 @@ impl Colors {
         self.rgb(0xFF, 0xE0, 0xBF)
     }
 
-    fn status(self, status: &str) -> Style {
+    /// The status dot: the terminal theme's green, yellow or gray, so it
+    /// adapts to dark and light themes. It is the only colored part of a
+    /// running row.
+    fn dot(self, status: &str) -> Style {
         match status {
             "running" => self.basic(Color::Green),
             "exited" => self.basic(Color::DarkGray),
             _ => self.basic(Color::Yellow),
+        }
+    }
+
+    /// The status word: default text, dim when exited.
+    fn word(self, status: &str) -> Style {
+        match status {
+            "exited" => self.dim(),
+            _ => Style::default(),
         }
     }
 
@@ -226,6 +239,35 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     out
 }
 
+/// A tree line; the cursor's line is one neutral highlight across the whole
+/// width: reverse video with every color removed, so no cell is filled with
+/// a status color and it reads the same on dark and light themes (and with
+/// `NO_COLOR`).
+fn selectable(spans: Vec<Span<'static>>, selected: bool, width: u16) -> Line<'static> {
+    if !selected {
+        return Line::from(spans);
+    }
+    let used: usize = spans.iter().map(Span::width).sum();
+    let mut spans: Vec<Span<'static>> = spans
+        .into_iter()
+        .map(|s| {
+            let modifier = s.style.add_modifier;
+            Span::styled(
+                s.content,
+                Style::default()
+                    .add_modifier(modifier | Modifier::REVERSED)
+                    .remove_modifier(Modifier::DIM),
+            )
+        })
+        .collect();
+    let rest = (width as usize).saturating_sub(used);
+    spans.push(Span::styled(
+        " ".repeat(rest),
+        Style::default().add_modifier(Modifier::REVERSED),
+    ));
+    Line::from(spans)
+}
+
 /// Most lines of a refusal reason shown under its row.
 const REASON_LINES: usize = 3;
 
@@ -256,7 +298,6 @@ fn tree_lines(app: &App, colors: Colors, width: u16) -> (Vec<Line<'static>>, Opt
 
     let mut lines = Vec::new();
     let mut cursor_line = None;
-    let selected = Style::default().add_modifier(Modifier::REVERSED);
     for (scope, rows) in &tree {
         let is_cursor = app.cursor == Some(Item::Scope(scope.to_string()));
         if is_cursor {
@@ -275,7 +316,9 @@ fn tree_lines(app: &App, colors: Colors, width: u16) -> (Vec<Line<'static>>, Opt
             ),
         ];
         if app.current.as_deref() == Some(*scope) {
-            left.push(Span::styled("  (current)", colors.dim()));
+            // The logo's orange as a small accent.
+            left.push(Span::raw("  "));
+            left.push(Span::styled("(current)", colors.orange()));
         }
         let right = scope_counts(rows);
         let left_w: usize = left.iter().map(Span::width).sum();
@@ -283,12 +326,8 @@ fn tree_lines(app: &App, colors: Colors, width: u16) -> (Vec<Line<'static>>, Opt
             .saturating_sub(left_w + right.chars().count() + 1)
             .max(2);
         left.push(Span::raw(" ".repeat(pad)));
-        left.push(Span::raw(right));
-        let mut line = Line::from(left);
-        if is_cursor {
-            line = line.style(selected);
-        }
-        lines.push(line);
+        left.push(Span::styled(right, colors.dim()));
+        lines.push(selectable(left, is_cursor, width));
         if !app.is_expanded(scope) {
             continue;
         }
@@ -299,9 +338,9 @@ fn tree_lines(app: &App, colors: Colors, width: u16) -> (Vec<Line<'static>>, Opt
             }
             let mut spans = vec![
                 Span::raw(if is_cursor { "   > " } else { "     " }),
-                Span::styled("●", colors.status(&r.status)),
+                Span::styled("●", colors.dot(&r.status)),
                 Span::raw(format!(" {:<name_w$}  ", r.name)),
-                Span::styled(format!("{:<8}", r.status), colors.status(&r.status)),
+                Span::styled(format!("{:<8}", r.status), colors.word(&r.status)),
                 Span::raw(format!(
                     "  {:<url_w$}  pid {:<pid_w$}  {:>3}",
                     r.url.as_deref().unwrap_or("-"),
@@ -317,11 +356,7 @@ fn tree_lines(app: &App, colors: Colors, width: u16) -> (Vec<Line<'static>>, Opt
                     colors.dim(),
                 ));
             }
-            let mut line = Line::from(spans);
-            if is_cursor {
-                line = line.style(selected);
-            }
-            lines.push(line);
+            lines.push(selectable(spans, is_cursor, width));
             if let Some(reason) = app.reasons.get(&r.id()) {
                 let indent = "       ";
                 let mut wrapped = wrap(reason, (width as usize).saturating_sub(indent.len() + 3));
@@ -611,6 +646,92 @@ mod tests {
     }
 
     #[test]
+    fn green_is_only_the_dot_and_the_selection_is_neutral() {
+        let mut app = demo();
+        app.handle_key(key(KeyCode::Down)); // login-fix/api, selected
+        let (lines, buf) = screen(&app, Colors::TrueColor, 80, 14);
+        assert!(lines[5].starts_with("   > ● api     running"));
+        // Selected row: reverse video across the whole width, no colors.
+        for x in 0..80 {
+            let c = &buf[(x, 5)];
+            assert_eq!((c.fg, c.bg), (Color::Reset, Color::Reset), "x={x}");
+            assert!(c.modifier.contains(Modifier::REVERSED), "x={x}");
+        }
+        // Unselected running row: green dot, default-colored word.
+        assert_eq!(buf[(5, 6)].symbol(), "●");
+        assert_eq!(buf[(5, 6)].fg, Color::Green);
+        assert_eq!(buf[(15, 6)].symbol(), "r");
+        assert_eq!(buf[(15, 6)].fg, Color::Reset);
+        // Scope header: bold name in the default color, dim counts.
+        assert_eq!(buf[(3, 7)].fg, Color::Reset);
+        assert!(buf[(3, 7)].modifier.contains(Modifier::BOLD));
+        assert_eq!(buf[(78, 7)].fg, Color::DarkGray);
+        // "(current)" is the only orange outside the logo.
+        assert_eq!(buf[(16, 4)].fg, Color::Rgb(0xFF, 0x55, 0x33));
+        let orange = (0..14)
+            .flat_map(|y| (0..80).map(move |x| (x, y)))
+            .filter(|&p| buf[p].fg == Color::Rgb(0xFF, 0x55, 0x33) && p.1 >= 3)
+            .count();
+        assert_eq!(orange, "(current)".len());
+    }
+
+    /// With `NO_COLOR` (or `TERM=dumb`) the screen has no color at all,
+    /// down to the escape sequences sent to the terminal.
+    #[test]
+    fn no_color_means_no_color_codes() {
+        use ratatui::backend::CrosstermBackend;
+        use ratatui::{TerminalOptions, Viewport};
+        let colors = Colors::from_env(|k| (k == "NO_COLOR").then(|| "1".to_string()));
+        assert_eq!(colors, Colors::Off);
+        let mut app = demo();
+        app.handle_key(key(KeyCode::Down));
+        app.reasons.insert("login-fix/api".into(), "refused".into());
+        let (_, buf) = screen(&app, colors, 80, 14);
+        for y in 0..14 {
+            for x in 0..80 {
+                assert_eq!(
+                    (buf[(x, y)].fg, buf[(x, y)].bg),
+                    (Color::Reset, Color::Reset)
+                );
+            }
+        }
+        #[derive(Clone, Default)]
+        struct Sink(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.borrow_mut().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let sink = Sink::default();
+        let mut t = Terminal::with_options(
+            CrosstermBackend::new(sink.clone()),
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, 80, 14)),
+            },
+        )
+        .unwrap();
+        t.draw(|f| render(f, &app, colors)).unwrap();
+        drop(t);
+        let out = String::from_utf8_lossy(&sink.0.borrow()).to_string();
+        assert!(out.contains("login-fix"));
+        for code in ["[38;", "[48;"].into_iter().map(String::from).chain(
+            (30..38)
+                .chain(40..48)
+                .chain(90..98)
+                .map(|n| format!("[{n}m")),
+        ) {
+            assert!(
+                !out.contains(&code),
+                "color code {code:?} in NO_COLOR output"
+            );
+        }
+    }
+
+    #[test]
     fn color_detection() {
         let env = |pairs: &'static [(&'static str, &'static str)]| {
             move |k: &str| {
@@ -642,6 +763,10 @@ mod tests {
             Colors::Off
         );
         assert_eq!(Colors::from_env(env(&[("NO_COLOR", "")])), Colors::Ansi256);
+        assert_eq!(
+            Colors::from_env(env(&[("TERM", "dumb"), ("COLORTERM", "truecolor")])),
+            Colors::Off
+        );
     }
 
     #[test]

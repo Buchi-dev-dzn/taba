@@ -293,8 +293,13 @@ Windows Terminal and PowerShell, and Linux terminals.
 - **The header** draws the taba logo in block characters with the version
   and a live summary. Colors are 24-bit where the terminal says it supports
   them (`COLORTERM=truecolor`, Windows Terminal, iTerm2, WezTerm, VS Code)
-  and 256-color elsewhere, such as macOS Terminal. Set `NO_COLOR` for no
-  colors. Below 40 columns the header shrinks to one line.
+  and 256-color elsewhere, such as macOS Terminal. Below 40 columns the
+  header shrinks to one line.
+- **Colors stay quiet.** The logo's orange appears only in the logo and the
+  `(current)` mark. A service's status dot uses your terminal theme's green,
+  yellow or gray; the rest is default or dim text. The selected row is one
+  reverse-video bar without colors, readable on dark and light themes. Set
+  `NO_COLOR` (or use `TERM=dumb`) for no colors at all.
 - **It needs an interactive terminal.** Programs should read
   `taba ps --watch --json` instead.
 
