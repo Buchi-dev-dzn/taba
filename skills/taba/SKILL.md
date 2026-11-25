@@ -29,6 +29,8 @@ prints one `ps --json` document per line, first at once and then on every
 change. Use it only from a program that reads the stream (it exits 0 on
 Ctrl+C or when its stdout is closed), never in a one-shot tool call; there,
 use `taba ps --json`.
+`taba ui` is an interactive terminal UI for humans; agents should not run
+it (it needs a terminal and waits for keys). Point the human to it instead.
 
 ## Procedure
 

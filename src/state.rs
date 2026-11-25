@@ -178,6 +178,14 @@ impl Store {
         Ok(store)
     }
 
+    /// A store at `root` (tests; the binary uses `TABA_HOME` via `open`).
+    #[cfg(test)]
+    pub fn at(root: PathBuf) -> Store {
+        fs::create_dir_all(root.join("services")).unwrap();
+        fs::create_dir_all(root.join("logs")).unwrap();
+        Store { root }
+    }
+
     /// Fails if the state was written by a newer schema than this binary's.
     fn check_version(&self) -> io::Result<()> {
         match fs::read_to_string(self.root.join("version")) {

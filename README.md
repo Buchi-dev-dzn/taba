@@ -243,6 +243,44 @@ taba rm --scope billing
 The screenshots show real output from `scripts/readme-screenshots.sh`, which
 runs `python3 -m http.server` sample services under a throwaway `TABA_HOME`.
 
+## Terminal UI
+
+`taba ui` shows every scope and its services in one live view, and lets you
+stop, remove, filter and follow logs from the keyboard. It re-reads the same
+state as `taba ps` once a second. It runs in macOS Terminal and iTerm2,
+Windows Terminal and PowerShell, and Linux terminals.
+
+![taba ui: scopes login-fix, billing and docs as a tree, with the cursor on login-fix/api](docs/images/ui.svg)
+
+| Key | What it does |
+| --- | --- |
+| `↑` `↓` (or `k` `j`) | Move over scopes and services. |
+| `←` `→`, `Space` | Fold or unfold a scope. Folding only changes the view; nothing is stopped. |
+| `x` | On a running service: stop it. On a scope line: stop every service of that scope. On an exited service: remove it, like `taba rm`. It asks first: `y` confirms, any other key cancels. |
+| `l` | Follow the selected service's log, like `taba logs -f`. `↑` `↓` `PgUp` `PgDn` scroll, `End` follows again, `Esc` goes back. |
+| `/` | Filter by scope or service name. `Enter` keeps the filter, `Esc` clears it. |
+| `Esc` | Clear the filter and any messages. |
+| `q`, `Ctrl+C` | Quit. Services keep running. |
+
+- **Your scope comes first.** It is resolved like any taba command
+  (`$TABA_SCOPE`, else the git worktree you start `taba ui` in) and starts
+  unfolded; other scopes start folded.
+- **Same rules as the CLI.** `x` runs the same code as `taba stop SCOPE/NAME`
+  and `taba rm SCOPE/NAME`, as you, so leases, borrows and the audit log
+  behave the same. Another scope's service, a borrowed or locked service, or
+  a service that is still running when you remove it is refused, and the row
+  shows the CLI's message. The UI never uses `--force`; that stays a
+  deliberate CLI command with `--reason`.
+- **Watching changes nothing.** Unlike `taba ps`, the UI never renews your
+  lease; only a confirmed `x` changes state.
+- **The header** draws the taba logo in block characters with the version
+  and a live summary. Colors are 24-bit where the terminal says it supports
+  them (`COLORTERM=truecolor`, Windows Terminal, iTerm2, WezTerm, VS Code)
+  and 256-color elsewhere, such as macOS Terminal. Set `NO_COLOR` for no
+  colors. Below 40 columns the header shrinks to one line.
+- **It needs an interactive terminal.** Programs should read
+  `taba ps --watch --json` instead.
+
 ## Use with AI agents
 
 taba is meant for AI coding agents as much as for people:
@@ -397,11 +435,11 @@ macOS. Method, sources and the full table are in
 | Start one command, no config file | yes | yes | no, needs a Procfile | no, needs a YAML file | yes (`dekit spawn`, inside a project) |
 | Same start command twice | reuses the running one | a copy or an error, depending on how you start it | error (overmind) | reports success, then fails on its API port | error |
 | Port already in use | refuses and names the holder | crash-loops | the process exits | the process exits | the process exits |
-| Restarts, TUI, Linux | none of these | all three | overmind: restarts and Linux; foreman: Linux | all three | all three (restarts only for tasks in `dekit.yaml`) |
+| Restarts, TUI, Linux | TUI (`taba ui`, since v0.2.3) and Linux; no restarts | all three | overmind: restarts and Linux; foreman: Linux | all three | all three (restarts only for tasks in `dekit.yaml`) |
 
 taba is the small option: no daemon and no config, and it is safe to run again,
-for dev servers spread over many tasks and checkouts on one Mac. If you need
-restarts, dependencies, a TUI or Linux, use process-compose, dekit or pm2.
+for dev servers spread over many tasks and checkouts on one machine. If you
+need restarts or dependencies, use process-compose, dekit or pm2.
 
 ## When to use Docker instead
 
@@ -448,6 +486,7 @@ that. Measurements against Docker are in [docs/benchmarks.md](docs/benchmarks.md
 | `taba ps [--scope S] [--running] [--json]` | List services with status `running`, `starting`, `stopping` or `exited`, plus URL and directory (`~` for your home; absolute in `--json`). `--running` hides exited ones. |
 | `taba ps --watch --json [--scope S] [--running] [--interval DURATION]` | Keep running and print the `ps --json` document as one line (NDJSON) at once and again whenever it changes, until interrupted. Read-only. See [Watching for changes](#watching-for-changes). |
 | `taba ps --all [--json]` | List every listening TCP port of your user, managed by taba or not: address, pid, command, directory, git worktree and branch, and the taba service if there is one. Read-only. |
+| `taba ui` | Browse every scope's services in a terminal UI; stop, remove, filter and follow logs with the keyboard. See [Terminal UI](#terminal-ui). |
 | `taba logs [-f] S/N` (or `N` in your scope) | Print the log. Add `-f` to follow it until the service exits. With `--json`, the log text is in `log` (not with `-f`). |
 | `taba stop S/N` (or `N` in your scope) | Stop one service of your own scope. |
 | `taba stop --scope S` | Stop every service in scope `S`. |
@@ -671,6 +710,9 @@ taba is an early prototype:
   `taba stop --scope S` acts as `S`. The rules prevent accidents between
   cooperating agents, not deliberate misuse. Agent leases, which tell a live
   holder of a scope from its successor, come in a later milestone.
+- **`taba ui` draws with block and symbol characters** (`█ ▀ ▄ ▾ ▸ ●`).
+  A terminal set to show East Asian ambiguous-width characters as double
+  width misaligns them; use the default (single width).
 - **Self-update is limited.** `taba update` replaces the binary only for
   official standalone Linux and macOS installs. It is check-only on Windows,
   and release checksums are not independent signatures; see

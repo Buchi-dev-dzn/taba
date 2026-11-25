@@ -14,6 +14,7 @@ mod proc;
 mod ready;
 mod scope;
 mod state;
+mod ui;
 mod update;
 mod util;
 mod watch;
@@ -116,6 +117,9 @@ enum Cmd {
               value_name = "DURATION")]
         interval: Option<Duration>,
     },
+    /// Browse every scope's services in a terminal UI; stop, remove,
+    /// follow logs and filter with the keyboard
+    Ui,
     /// Print a service's log
     Logs {
         /// SCOPE/NAME, or NAME with $TABA_SCOPE or the git worktree's scope
@@ -539,6 +543,7 @@ fn main() -> ExitCode {
                 }),
             )
         }
+        Cmd::Ui => (env_json(), ui::command()),
         Cmd::Whoami { scope, agent, json } => {
             (json || env_json(), cmd_whoami(scope, agent).map(Some))
         }
@@ -1177,6 +1182,8 @@ pub(crate) struct Snapshot {
     pub services: Vec<Service>,
     pub statuses: Vec<&'static str>,
     pub rows: Vec<Value>,
+    /// Per service: the scopes holding a live borrow of it (for `ui`).
+    pub borrowers: Vec<Vec<String>>,
 }
 
 /// Reads the `ps` rows of every service, or of one scope, optionally only
@@ -1194,6 +1201,7 @@ pub(crate) fn ps_snapshot(
     let statuses: Vec<&'static str> = services.iter().map(|s| status_of(store, s)).collect();
 
     let mut rows = Vec::new();
+    let mut borrowers = Vec::new();
     for (s, status) in services.iter().zip(&statuses) {
         let now = util::now_secs();
         let rec = store.get_scope(&s.scope)?;
@@ -1222,11 +1230,13 @@ pub(crate) fn ps_snapshot(
             "borrows": { "shared": borrows.iter().filter(|b| !b.exclusive).count(), "exclusive": usize::from(exclusive.is_some()) },
             "locked_by": exclusive.map(|b| &b.scope),
         }));
+        borrowers.push(borrows.iter().map(|b| b.scope.clone()).collect());
     }
     Ok(Snapshot {
         services,
         statuses,
         rows,
+        borrowers,
     })
 }
 
@@ -1241,6 +1251,7 @@ fn cmd_ps(scope: Option<String>, running_only: bool) -> Result<Output> {
         services,
         statuses,
         rows,
+        ..
     } = ps_snapshot(&store, scope.as_deref(), running_only)?;
 
     let mut table = vec![[
@@ -1398,11 +1409,31 @@ fn cmd_stop(
     let caller = scope::resolve(scope_flag, agent)?;
     let store = Store::open()?;
     let (targets, single) = targets(&store, target, scope_flag_given, &caller, "stop")?;
+    stop_services(
+        &store,
+        &caller,
+        &targets,
+        single,
+        timeout,
+        reason.as_deref(),
+    )
+}
 
+/// Stops `targets` as `caller`: the body of `taba stop`, also used by
+/// `taba ui`. With `single`, the first refusal is returned as the error;
+/// otherwise each service is reported under `results`.
+pub(crate) fn stop_services(
+    store: &Store,
+    caller: &Caller,
+    targets: &[(String, String)],
+    single: bool,
+    timeout: Duration,
+    reason: Option<&str>,
+) -> Result<Output> {
     let mut done = Vec::new();
     let mut refused: Vec<(String, TabaError)> = Vec::new();
-    for (s, n) in &targets {
-        match stop_one(&store, &caller, s, n, timeout, reason.as_deref()) {
+    for (s, n) in targets {
+        match stop_one(store, caller, s, n, timeout, reason) {
             Ok(d) => done.push(d),
             Err(e) if single => return Err(e),
             Err(e) => refused.push((format!("{s}/{n}"), e)),
@@ -1601,8 +1632,23 @@ fn cmd_rm(
     let scope_flag_given = scope_flag.is_some();
     let caller = scope::resolve(scope_flag, agent)?;
     let store = Store::open()?;
+    rm_services(&store, &caller, reason, |store| {
+        targets(store, target, scope_flag_given, &caller, "remove")
+    })
+}
+
+/// Removes the services `select` picks (under the global lock) as `caller`:
+/// the body of `taba rm`, also used by `taba ui`. `select` returns the
+/// targets and whether this is a single-target call, whose refusal is
+/// returned as the error.
+pub(crate) fn rm_services(
+    store: &Store,
+    caller: &Caller,
+    reason: Option<String>,
+    select: impl FnOnce(&Store) -> Result<(Vec<(String, String)>, bool)>,
+) -> Result<Output> {
     let _lock = store.lock()?;
-    let (targets, single) = targets(&store, target, scope_flag_given, &caller, "remove")?;
+    let (targets, single) = select(store)?;
 
     let mut lines = Vec::new();
     let mut results: Vec<Value> = Vec::new();
@@ -1612,14 +1658,14 @@ fn cmd_rm(
         let owner = caller.scope.as_deref() == Some(svc.scope.as_str());
         let lease_refusal = if owner && reason.is_none() {
             let cfg = config::Config::load(store.root())?;
-            lease::touch(&store, &cfg, &caller, s, lease::Access::Mutate, None).err()
+            lease::touch(store, &cfg, caller, s, lease::Access::Mutate, None).err()
         } else {
             None
         };
         let refusal = if let Some(e) = lease_refusal {
             Some(e)
         } else if !owner && reason.is_none() {
-            Some(not_owner(&caller, &svc, "rm"))
+            Some(not_owner(caller, &svc, "rm"))
         } else if let Some(op) = store.live_op(s, n)? {
             Some(busy(&svc.id(), &op))
         } else if svc.is_running() {
@@ -1639,7 +1685,7 @@ fn cmd_rm(
                 )),
             )
         } else {
-            borrows::authorise(&store, &svc, &caller, reason.is_some(), false).err()
+            borrows::authorise(store, &svc, caller, reason.is_some(), false).err()
         };
         if let Some(e) = refusal {
             if single {
@@ -1653,9 +1699,9 @@ fn cmd_rm(
         }
         if let Some(r) = &reason {
             let overrode: &[&str] = if owner { &[] } else { &["E_NOT_OWNER"] };
-            record_force(&store, "force_rm", &caller, &svc, r, overrode)?;
+            record_force(store, "force_rm", caller, &svc, r, overrode)?;
         }
-        borrows::break_all(&store, &svc, false)?;
+        borrows::break_all(store, &svc, false)?;
         store.remove(&svc.scope, &svc.name)?;
         lines.push(format!("{}: removed (record and log)", svc.id()));
         results.push(json!({ "service": svc.id(), "result": "removed" }));

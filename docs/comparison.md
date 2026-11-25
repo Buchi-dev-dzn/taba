@@ -6,6 +6,10 @@ same job as the local process managers developers already use for dev
 servers. This page compares taba with those tools, says where each one is
 better, and marks how each claim was checked.
 
+> This comparison was made on 2026-11-24 with taba 0.1 on macOS. Since then
+> taba has gained Linux and Windows support (v0.2.0) and a terminal UI,
+> `taba ui` (v0.2.3); the rest still holds.
+
 **Short version.** Most of what taba does, other tools do too. pm2,
 process-compose and dekit (the new name of mprocs) all keep processes running
 after the terminal closes and give a JSON list. dekit can also start a single
