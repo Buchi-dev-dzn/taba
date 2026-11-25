@@ -476,7 +476,10 @@ fn main() -> ExitCode {
                 borrows::release(store, &scope::resolve(scope, agent)?, &target)
             }),
         ),
-        Cmd::Update { check, json } => (json || env_json(), update::command(check).map(Some)),
+        Cmd::Update { check, json } => {
+            let json = json || env_json();
+            (json, update::command(check, json).map(Some))
+        }
         Cmd::Hook { harness, event } => {
             return match hooks::run(harness, event) {
                 Ok(value) => {

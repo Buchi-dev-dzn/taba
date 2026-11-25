@@ -19,10 +19,21 @@ pub(super) fn verified_binary(
     let sums = download_asset(fetch, release, "SHA256SUMS", SUM_LIMIT)?;
     let expected = checksum_for(&sums, &name)?;
     let archive = download_asset(fetch, release, &name, ARCHIVE_LIMIT)?;
-    if !format!("{:x}", Sha256::digest(&archive)).eq_ignore_ascii_case(expected) {
+    let checked = verify(&archive, expected, &name, target);
+    if let Some(p) = fetch.progress() {
+        p.verified(
+            &format!("{name} (SHA256SUMS, archive contents)"),
+            checked.is_ok(),
+        );
+    }
+    checked
+}
+
+fn verify(archive: &[u8], expected: &str, name: &str, target: Target) -> Result<Vec<u8>> {
+    if !format!("{:x}", Sha256::digest(archive)).eq_ignore_ascii_case(expected) {
         return Err(failure(format!("SHA-256 mismatch for {name}")));
     }
-    let executable = executable_from_tar_gz(&archive)?;
+    let executable = executable_from_tar_gz(archive)?;
     validate_executable(&executable, target)?;
     Ok(executable)
 }
