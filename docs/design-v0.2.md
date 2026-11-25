@@ -814,7 +814,7 @@ goes. taba therefore does not depend on the old agent doing anything.
 
 | Code | Exit | Meaning | Typical `next` |
 | --- | --- | --- | --- |
-| `E_USAGE` | 2 | Bad flags or arguments. | `taba <cmd> --help` |
+| `E_USAGE` | 2 | Bad flags or arguments. For an argument error, the full message names the argument; `details` has `arguments` (the offending flags), and if any `value`, `subcommand` and `usage`. | the subcommand's help, for example `taba run --help` |
 | `E_NO_SCOPE` | 2 | No scope from `--scope`, `$TABA_SCOPE` or a git worktree. | pass `--scope`, or `cd` into the worktree |
 | `E_INVALID_IDENT` | 2 | Scope or name fails `validate_ident`. | — |
 | `E_NOT_FOUND` | 5 | No such service, scope or borrow. | `taba ps --json` |
