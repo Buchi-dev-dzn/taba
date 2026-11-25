@@ -76,6 +76,23 @@ is an official standalone archive install, replaces the binary. taba never
 checks for updates on its own, and both commands leave services and state
 alone.
 
+When you run `taba update` in a terminal, it shows its progress on stderr: a
+bar for each archive it downloads (bytes so far when the size is unknown)
+and one line per verification with its result:
+
+```text
+Downloading taba-v0.2.4-aarch64-apple-darwin.tar.gz
+[##################------------]  61%  2.1/3.4 MB
+Verifying taba-v0.2.4-aarch64-apple-darwin.tar.gz (SHA256SUMS, archive contents) ... ok
+```
+
+It also downloads and verifies the archive of the version you run, to prove
+the installed binary is official. With `--json`, when stderr is not a
+terminal (pipes, CI, agents) or with `TERM=dumb`, nothing extra is printed;
+stdout and the JSON output are the same either way. `--check` downloads
+nothing and shows no progress. The bar comes from the `taba` doing the
+update, so it first appears when updating from v0.2.3.
+
 - **What counts as newer:** the highest stable SemVer release strictly above
   the running version. Drafts, GitHub prereleases and SemVer prereleases such
   as `v0.3.0-rc.1` are ignored.
