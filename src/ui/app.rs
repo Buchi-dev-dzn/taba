@@ -24,6 +24,11 @@ pub struct Row {
     pub borrowers: Vec<String>,
     /// Scope holding an exclusive borrow, if any.
     pub locked_by: Option<String>,
+    /// Why a future `gc` can collect this instance. A lease expiry is kept
+    /// separate because it may hand the service to a claimant or borrower.
+    pub pending_gc: Option<String>,
+    /// Whether the owning scope's lease is expired.
+    pub lease_expired: bool,
 }
 
 impl Row {
@@ -50,6 +55,8 @@ impl Row {
                 log_path: svc.log_path,
                 borrowers,
                 locked_by: json["locked_by"].as_str().map(str::to_string),
+                pending_gc: json["pending_gc"].as_str().map(str::to_string),
+                lease_expired: json["lease"]["state"].as_str() == Some("expired"),
                 scope: svc.scope,
                 name: svc.name,
             })
@@ -688,6 +695,8 @@ pub(crate) mod tests {
             log_path: PathBuf::from(format!("/logs/{scope}/{name}.log")),
             borrowers: Vec::new(),
             locked_by: None,
+            pending_gc: None,
+            lease_expired: false,
         }
     }
 

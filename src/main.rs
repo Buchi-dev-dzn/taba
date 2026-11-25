@@ -1203,15 +1203,32 @@ pub(crate) fn ps_snapshot(
         services.retain(|s| s.is_running());
     }
     let statuses: Vec<&'static str> = services.iter().map(|s| status_of(store, s)).collect();
+    // One clock reading makes a snapshot internally consistent at an expiry
+    // boundary. It also means a watch changes once when that boundary passes,
+    // rather than producing tick-by-tick clock churn.
+    let now = util::now_secs();
 
     let mut rows = Vec::new();
     let mut borrowers = Vec::new();
     for (s, status) in services.iter().zip(&statuses) {
-        let now = util::now_secs();
         let rec = store.get_scope(&s.scope)?;
         let queue = store.get_claims(&s.scope, &s.name)?;
         let borrows = borrows::live(store, s)?;
         let exclusive = borrows.iter().find(|b| b.exclusive);
+        let service_expired = s
+            .service_expires_at
+            .as_deref()
+            .and_then(util::parse_rfc3339)
+            .is_some_and(|expires| now >= expires);
+        // A service TTL is a direct collection candidate once it expires,
+        // unless a live borrow protects this instance. An expired scope lease
+        // is deliberately *not* a pending drop: claims and borrowers can take
+        // ownership instead, so reporting it as certain cleanup would lie.
+        let pending_gc = if service_expired && borrows.is_empty() {
+            Some("service_ttl_expired")
+        } else {
+            None
+        };
         rows.push(json!({
             "service": s.id(),
             "scope": s.scope,
@@ -1228,6 +1245,9 @@ pub(crate) fn ps_snapshot(
             "instance": s.instance(),
             "holder": rec.as_ref().map(|r| &r.holder.agent),
             "lease": rec.as_ref().map(|r| r.lease_json(now)),
+            "service_ttl": s.service_ttl_secs.map(config::format_duration),
+            "service_expires_at": s.service_expires_at,
+            "pending_gc": pending_gc,
             "keep": rec.as_ref().is_some_and(|r| r.keep),
             "keep_reason": rec.as_ref().and_then(|r| r.keep_reason.as_deref()),
             "claims": claims::rows(store, &queue)?,
@@ -1267,9 +1287,17 @@ fn cmd_ps(scope: Option<String>, running_only: bool) -> Result<Output> {
         "NEXT".to_string(),
     ]];
     for ((s, status), row) in services.iter().zip(&statuses).zip(&rows) {
+        let status = match (
+            row["pending_gc"].as_str(),
+            row["lease"]["state"].as_str() == Some("expired"),
+        ) {
+            (Some(reason), _) => format!("{status} ({reason})"),
+            (None, true) => format!("{status} (lease expired)"),
+            (None, false) => status.to_string(),
+        };
         table.push([
             s.id(),
-            status.to_string(),
+            status,
             s.url().unwrap_or_else(|| "-".into()),
             tilde(&s.cwd),
             row["holder"].as_str().map_or_else(
