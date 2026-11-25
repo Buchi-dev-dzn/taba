@@ -121,3 +121,53 @@ fn unreadable_scope_record_is_kept_until_a_forced_rm() {
     let who = json(&f.taba(&f.outside, &["whoami", "--scope", "zz", "--json"]));
     assert_eq!(who["ok"], true, "{who}");
 }
+
+/// Issue #35: the state directory and everything taba creates in it are
+/// owner-only on Unix, and an existing world-readable home is tightened.
+#[cfg(unix)]
+#[test]
+fn state_directory_and_files_are_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new("private");
+    // A home left 0755 by an older taba.
+    std::fs::create_dir_all(f.home()).unwrap();
+    std::fs::set_permissions(f.home(), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let web = json(&f.taba(&f.wt_a, &run_auto("web")));
+    assert_eq!(web["ok"], true, "{web}");
+    let scope = web["scope"].as_str().unwrap().to_string();
+    // A forced stop writes an event to events.jsonl.
+    let stop = f.taba(
+        &f.wt_b,
+        &[
+            "stop",
+            web["service"].as_str().unwrap(),
+            "--force",
+            "--reason",
+            "test",
+            "--json",
+        ],
+    );
+    assert!(stop.status.success(), "{}", text(&stop));
+
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    let home = f.home();
+    for dir in [
+        home.clone(),
+        home.join("services"),
+        home.join("services").join(&scope),
+        home.join("logs"),
+        home.join("logs").join(&scope),
+    ] {
+        assert_eq!(mode(&dir), 0o700, "{}", dir.display());
+    }
+    for file in [
+        home.join("services").join(&scope).join("web.json"),
+        home.join("logs").join(&scope).join("web.log"),
+        home.join("events.jsonl"),
+        home.join("version"),
+        home.join("lock"),
+    ] {
+        assert_eq!(mode(&file), 0o600, "{}", file.display());
+    }
+}

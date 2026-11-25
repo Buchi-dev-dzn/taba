@@ -12,6 +12,9 @@
 //! btime/                          Linux boot-time cache and recovery copies
 //! ```
 //!
+//! On Unix the directories are created 0700 and the files 0600 (see
+//! `create_private_dir_all` and `private_file`).
+//!
 //! Every field added in v0.2 is optional when reading, so v0.1 records load
 //! unchanged.
 
@@ -247,8 +250,9 @@ pub(crate) fn state_dir() -> Option<PathBuf> {
 impl Store {
     pub fn open() -> io::Result<Store> {
         let root = state_dir().ok_or_else(|| io::Error::other("HOME is not set"))?;
-        fs::create_dir_all(root.join("services"))?;
-        fs::create_dir_all(root.join("logs"))?;
+        create_private_dir_all(&root.join("services"))?;
+        create_private_dir_all(&root.join("logs"))?;
+        make_private(&root);
         let store = Store { root };
         store.check_version()?;
         Ok(store)
@@ -257,8 +261,8 @@ impl Store {
     /// A store at `root` (tests; the binary uses `TABA_HOME` via `open`).
     #[cfg(test)]
     pub fn at(root: PathBuf) -> Store {
-        fs::create_dir_all(root.join("services")).unwrap();
-        fs::create_dir_all(root.join("logs")).unwrap();
+        create_private_dir_all(&root.join("services")).unwrap();
+        create_private_dir_all(&root.join("logs")).unwrap();
         Store { root }
     }
 
@@ -285,13 +289,16 @@ impl Store {
             return Ok(());
         }
         let tmp = path.with_extension("tmp");
-        fs::write(&tmp, format!("{SCHEMA_VERSION}\n"))?;
+        private_file()
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?
+            .write_all(format!("{SCHEMA_VERSION}\n").as_bytes())?;
         fs::rename(tmp, path)
     }
 
     pub fn lock(&self) -> io::Result<Lock> {
-        let file = OpenOptions::new()
-            .create(true)
+        let file = private_file()
             .truncate(false)
             .write(true)
             .open(self.root.join("lock"))?;
@@ -381,8 +388,7 @@ impl Store {
     pub fn append_event(&self, event: &serde_json::Value) -> io::Result<()> {
         let mut line = serde_json::to_vec(event)?;
         line.push(b'\n');
-        let mut f = OpenOptions::new()
-            .create(true)
+        let mut f = private_file()
             .append(true)
             .open(self.root.join("events.jsonl"))?;
         f.write_all(&line)
@@ -483,7 +489,7 @@ impl Store {
     pub fn move_service(&self, from_scope: &str, svc: &Service) -> io::Result<()> {
         let old_log = self.log_path(from_scope, &svc.name);
         let new_log = self.log_path(&svc.scope, &svc.name);
-        fs::create_dir_all(new_log.parent().expect("log has parent"))?;
+        create_private_dir_all(new_log.parent().expect("log has parent"))?;
         if old_log.exists() {
             fs::rename(&old_log, &new_log)?;
         }
@@ -495,7 +501,7 @@ impl Store {
         let old_claims = self.claims_path(from_scope, &svc.name);
         if old_claims.exists() {
             let new_claims = self.claims_path(&svc.scope, &svc.name);
-            fs::create_dir_all(new_claims.parent().expect("claims have parent"))?;
+            create_private_dir_all(new_claims.parent().expect("claims have parent"))?;
             fs::rename(&old_claims, &new_claims)?;
             if let Some(dir) = old_claims.parent() {
                 let _ = fs::remove_dir(dir);
@@ -675,12 +681,50 @@ pub(crate) fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> io::Resu
     }
 }
 
+/// Creates `dir` and any missing parents. On Unix, directories taba creates
+/// are owner-only (0700): records hold command lines and working
+/// directories, logs hold service output that often includes secrets. On
+/// Windows they inherit the ACL of the parent (the user profile).
+pub(crate) fn create_private_dir_all(dir: &Path) -> io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(dir)
+}
+
+/// Open options that create a missing file owner-only (0600 on Unix; the
+/// parent's ACL on Windows). Add `write`/`append` and `truncate` as needed.
+pub(crate) fn private_file() -> OpenOptions {
+    let mut opts = OpenOptions::new();
+    opts.create(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    opts
+}
+
+/// Removes group and other access from an existing state directory (one
+/// created by an older taba, or by hand). Best effort: a directory owned
+/// by someone else is left as is, and the files taba creates in it are
+/// still owner-only.
+fn make_private(_root: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = fs::metadata(_root)
+            && meta.permissions().mode() & 0o077 != 0
+        {
+            let _ = fs::set_permissions(_root, fs::Permissions::from_mode(0o700));
+        }
+    }
+}
+
 /// Writes to a temporary file and renames it, so lock-free readers see the
 /// old or the new content, never a partial one.
 pub(crate) fn write_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
-    fs::create_dir_all(path.parent().expect("record has parent"))?;
+    create_private_dir_all(path.parent().expect("record has parent"))?;
     let tmp = path.with_extension("json.tmp");
-    let mut file = File::create(&tmp)?;
+    let mut file = private_file().write(true).truncate(true).open(&tmp)?;
     file.write_all(&serde_json::to_vec_pretty(value)?)?;
     // Durable before it replaces the old record, so a crash or power loss
     // leaves the old or the new content, not an empty file.
