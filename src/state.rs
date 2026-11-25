@@ -18,6 +18,77 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+/// Which state file could not be read, for the error's next step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StateFile {
+    Service { scope: String, name: String },
+    Scope(String),
+    Other,
+}
+
+/// A state file that exists but can't be parsed: empty or damaged. A missing
+/// file is not this; it means "no record". taba never replaces or rewrites
+/// such a file on its own: commands that need it fail with `E_STATE`, and
+/// listings skip it with `W_STATE_SKIPPED`.
+#[derive(Debug)]
+pub struct Unreadable {
+    pub path: PathBuf,
+    pub file: StateFile,
+    pub error: String,
+}
+
+impl std::fmt::Display for Unreadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.path.display(), self.error)
+    }
+}
+
+impl std::error::Error for Unreadable {}
+
+/// The `Unreadable` behind an I/O error, if that is what it is.
+pub fn unreadable(e: &io::Error) -> Option<&Unreadable> {
+    e.get_ref()?.downcast_ref()
+}
+
+/// Names the file an `Unreadable` error is about.
+fn tag(e: io::Error, file: StateFile) -> io::Error {
+    if unreadable(&e).is_none() {
+        return e;
+    }
+    match e.into_inner().map(|i| i.downcast::<Unreadable>()) {
+        Some(Ok(mut u)) => {
+            u.file = file;
+            io::Error::new(io::ErrorKind::InvalidData, *u)
+        }
+        _ => io::Error::other("unreadable state file"),
+    }
+}
+
+/// Unreadable files skipped by listings in this process, reported as
+/// `W_STATE_SKIPPED` warnings instead of on stderr.
+static SKIPPED: Mutex<std::collections::BTreeSet<String>> =
+    Mutex::new(std::collections::BTreeSet::new());
+
+fn note_skipped(u: &Unreadable) {
+    let what = match &u.file {
+        StateFile::Service { scope, name } => format!("service record {scope}/{name}"),
+        StateFile::Scope(scope) => format!("scope record {scope}"),
+        StateFile::Other => "state file".into(),
+    };
+    if let Ok(mut set) = SKIPPED.lock() {
+        set.insert(format!("skipped unreadable {what} ({u})"));
+    }
+}
+
+/// Drains the skipped-file messages collected so far.
+pub fn take_skipped() -> Vec<String> {
+    SKIPPED
+        .lock()
+        .map(|mut set| std::mem::take(&mut *set).into_iter().collect())
+        .unwrap_or_default()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Service {
@@ -251,7 +322,15 @@ impl Store {
     }
 
     pub fn get(&self, scope: &str, name: &str) -> io::Result<Option<Service>> {
-        read_json(&self.record_path(scope, name))
+        read_json(&self.record_path(scope, name)).map_err(|e| {
+            tag(
+                e,
+                StateFile::Service {
+                    scope: scope.into(),
+                    name: name.into(),
+                },
+            )
+        })
     }
 
     pub fn put(&self, svc: &Service) -> io::Result<()> {
@@ -319,7 +398,7 @@ impl Store {
     }
 
     pub fn get_scope(&self, scope: &str) -> io::Result<Option<crate::lease::ScopeRecord>> {
-        read_json(&self.scope_path(scope))
+        read_json(&self.scope_path(scope)).map_err(|e| tag(e, StateFile::Scope(scope.into())))
     }
 
     pub fn put_scope(&self, rec: &crate::lease::ScopeRecord) -> io::Result<()> {
@@ -344,8 +423,18 @@ impl Store {
             if path.extension().and_then(|x| x.to_str()) != Some("json") {
                 continue;
             }
-            if let Ok(Some(rec)) = read_json(&path) {
-                out.push(rec);
+            let scope = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            match read_json(&path) {
+                Ok(Some(rec)) => out.push(rec),
+                Ok(None) => {}
+                Err(e) => {
+                    if let Some(u) = unreadable(&tag(e, StateFile::Scope(scope))) {
+                        note_skipped(u);
+                    }
+                }
             }
         }
         out.sort_by(|a: &crate::lease::ScopeRecord, b| a.scope.cmp(&b.scope));
@@ -486,7 +575,26 @@ impl Store {
     }
 
     /// All records, optionally limited to one scope, sorted by scope/name.
+    /// Unreadable records are skipped and reported as `W_STATE_SKIPPED`.
     pub fn list(&self, scope: Option<&str>) -> io::Result<Vec<Service>> {
+        let (out, skipped) = self.scan(scope)?;
+        skipped.iter().for_each(note_skipped);
+        Ok(out)
+    }
+
+    /// Names of the unreadable records in `scope`.
+    pub fn unreadable_records(&self, scope: &str) -> io::Result<Vec<String>> {
+        let (_, skipped) = self.scan(Some(scope))?;
+        Ok(skipped
+            .into_iter()
+            .filter_map(|u| match u.file {
+                StateFile::Service { name, .. } => Some(name),
+                _ => None,
+            })
+            .collect())
+    }
+
+    fn scan(&self, scope: Option<&str>) -> io::Result<(Vec<Service>, Vec<Unreadable>)> {
         let services_dir = self.root.join("services");
         let scopes: Vec<String> = match scope {
             Some(s) => vec![s.to_string()],
@@ -502,6 +610,7 @@ impl Store {
             }
         };
         let mut out = Vec::new();
+        let mut skipped = Vec::new();
         for s in scopes {
             let dir = services_dir.join(&s);
             let entries = match fs::read_dir(&dir) {
@@ -514,25 +623,52 @@ impl Store {
                 if path.extension().and_then(|x| x.to_str()) != Some("json") {
                     continue;
                 }
-                let bytes = fs::read(&path)?;
-                match serde_json::from_slice::<Service>(&bytes) {
-                    Ok(svc) => out.push(svc),
-                    Err(err) => {
-                        eprintln!("taba: skipping unreadable record {}: {err}", path.display())
+                let name = path
+                    .file_stem()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                match read_json::<Service>(&path) {
+                    Ok(Some(svc)) => out.push(svc),
+                    Ok(None) => {}
+                    Err(e) => {
+                        let file = StateFile::Service {
+                            scope: s.clone(),
+                            name,
+                        };
+                        match tag(e, file)
+                            .into_inner()
+                            .map(|i| i.downcast::<Unreadable>())
+                        {
+                            Some(Ok(u)) => skipped.push(*u),
+                            Some(Err(inner)) => return Err(io::Error::other(inner)),
+                            None => return Err(io::Error::other("cannot read a service record")),
+                        }
                     }
                 }
             }
         }
         out.sort_by(|a, b| (&a.scope, &a.name).cmp(&(&b.scope, &b.name)));
-        Ok(out)
+        Ok((out, skipped))
     }
 }
 
 pub(crate) fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
     match fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map(Some)
-            .map_err(|e| io::Error::other(format!("{}: {e}", path.display()))),
+        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|e| {
+            let error = if bytes.iter().all(u8::is_ascii_whitespace) {
+                "empty file".to_string()
+            } else {
+                e.to_string()
+            };
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                Unreadable {
+                    path: path.to_path_buf(),
+                    file: StateFile::Other,
+                    error,
+                },
+            )
+        }),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     }
@@ -543,8 +679,18 @@ pub(crate) fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> io::Resu
 pub(crate) fn write_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     fs::create_dir_all(path.parent().expect("record has parent"))?;
     let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, serde_json::to_vec_pretty(value)?)?;
-    fs::rename(tmp, path)
+    let mut file = File::create(&tmp)?;
+    file.write_all(&serde_json::to_vec_pretty(value)?)?;
+    // Durable before it replaces the old record, so a crash or power loss
+    // leaves the old or the new content, not an empty file.
+    file.sync_all()?;
+    drop(file);
+    fs::rename(tmp, path)?;
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        File::open(dir)?.sync_all()?;
+    }
+    Ok(())
 }
 
 pub(crate) fn remove_file_and_empty_parent(path: &Path) -> io::Result<()> {
@@ -557,4 +703,60 @@ pub(crate) fn remove_file_and_empty_parent(path: &Path) -> io::Result<()> {
         let _ = fs::remove_dir(dir); // only succeeds when empty
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_is_none_but_empty_or_damaged_is_unreadable() {
+        let dir = std::env::temp_dir().join(format!("taba-unreadable-{}", std::process::id()));
+        let store = Store::at(dir.clone());
+        assert!(store.get("s", "n").unwrap().is_none());
+        assert!(store.get_scope("s").unwrap().is_none());
+        for (bytes, cause) in [
+            (&b""[..], "empty file"),
+            (b"  \n", "empty file"),
+            (b"{\"scope\":", "EOF"),
+        ] {
+            let record = dir.join("services").join("s").join("n.json");
+            fs::create_dir_all(record.parent().unwrap()).unwrap();
+            fs::write(&record, bytes).unwrap();
+            let e = store.get("s", "n").unwrap_err();
+            let u = unreadable(&e).expect("typed error");
+            assert_eq!(
+                u.file,
+                StateFile::Service {
+                    scope: "s".into(),
+                    name: "n".into()
+                }
+            );
+            assert!(u.error.contains(cause), "{}", u.error);
+            let (services, skipped) = store.scan(None).unwrap();
+            assert!(services.is_empty());
+            assert_eq!(skipped.len(), 1);
+            assert_eq!(fs::read(&record).unwrap(), bytes, "left as it was");
+        }
+        let scope = dir.join("scopes").join("z.json");
+        fs::create_dir_all(scope.parent().unwrap()).unwrap();
+        fs::write(&scope, b"").unwrap();
+        let e = store.get_scope("z").unwrap_err();
+        assert_eq!(unreadable(&e).unwrap().file, StateFile::Scope("z".into()));
+        assert!(store.list_scopes().unwrap().is_empty());
+        assert!(take_skipped().iter().any(|m| m.contains("scope record z")));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_json_replaces_atomically() {
+        let dir = std::env::temp_dir().join(format!("taba-write-{}", std::process::id()));
+        let path = dir.join("a").join("b.json");
+        write_json(&path, &serde_json::json!({"x": 1})).unwrap();
+        write_json(&path, &serde_json::json!({"x": 2})).unwrap();
+        let v: serde_json::Value = read_json(&path).unwrap().unwrap();
+        assert_eq!(v["x"], 2);
+        assert!(!path.with_extension("json.tmp").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

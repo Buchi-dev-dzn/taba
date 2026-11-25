@@ -837,7 +837,7 @@ goes. taba therefore does not depend on the old agent doing anything.
 | `E_SIGNAL_FAILED` | 1 | `kill` on the process group failed. | — |
 | `E_FORCE_NEEDS_REASON` | 2 | `--force` without `--reason`. | — |
 | `E_CONFIG` | 1 | `$TABA_HOME/config.toml` or `$TABA_TTL` is unreadable or has an invalid value. Details name the source and key. | fix or remove the value |
-| `E_STATE` | 1 | State directory unreadable, or the schema is too new. | — |
+| `E_STATE` | 1 | State directory unreadable, or the schema is too new. An empty or damaged service or scope record (a missing one just means "no record") gives `details.reason: "unreadable"` with the `path`; taba never replaces or rewrites it on its own. | `taba rm S/N --force --reason …` (unreadable service record, and its log) or `taba rm --scope S --force --reason …` (the scope's unreadable records and its unreadable scope record) |
 
 Warnings (`warnings[]`, never fatal): `W_BRANCH_CHANGED`,
 `W_LEASE_RENEWED`, `W_TOOK_OVER` (this call took over a scope whose holder
@@ -849,7 +849,9 @@ ended and the hand-over has not happened yet, for example because every
 claimant has a name conflict; includes the `taba move S/N --to <this
 scope>` command), `W_FORCED` (a `--force`
 override happened in this scope), `W_UNMANAGED_PORT` (an unmanaged process
-listens on a port in this worktree).
+listens on a port in this worktree), `W_STATE_SKIPPED` (a listing such
+as `ps` or `gc` skipped an empty or damaged service or scope record; names
+the record and its file).
 
 ### `taba whoami` (new)
 

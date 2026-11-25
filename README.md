@@ -557,7 +557,7 @@ single quotes). The exit status follows the code:
 | `E_START_FAILED` | 4 | The process exited before it was ready; `details.log_tail` has its last lines. |
 | `E_NOT_READY` | 4 | `--wait` timed out; the process is still running. |
 | `E_NOT_FOUND` | 5 | No such service. |
-| `E_STATE`, `E_SIGNAL_FAILED` | 1 | State directory unreadable or too new; a signal failed. |
+| `E_STATE`, `E_SIGNAL_FAILED` | 1 | State directory or a record unreadable, or too new; a signal failed. |
 | `E_UPDATE_FAILED` | 1 | `taba update` could not reach, read or verify the release. The installed binary is unchanged. |
 
 `taba update --json` reports `status`: `up_to_date`, `update_available`
@@ -565,6 +565,17 @@ single quotes). The exit status follows the code:
 
 `stop --scope` reports each service in `results` (`stopped`, `killed`,
 `not_running`, or `refused` with its error) and exits 3 if any was refused.
+
+An empty or damaged service or scope record is never replaced or rewritten
+by taba. Listings such as `ps` and `gc` skip it and report
+`W_STATE_SKIPPED` in `warnings` (on stderr without `--json`). Commands that
+need it fail with `E_STATE`, `details.reason: "unreadable"` and the file's
+`path`. `next` names the command that removes it: `taba rm S/N --force
+--reason TEXT` for a service record (also its log; a process it started is
+no longer tracked), or `taba rm --scope S --force --reason TEXT` for the
+scope's unreadable records and scope record. Records are written to a
+temporary file, flushed to disk and then renamed, so a crash leaves the old
+or the new content.
 
 ### Watching for changes
 
