@@ -10,6 +10,8 @@ use std::{cmp::Ordering, io::Read, time::Duration};
 mod archive;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod install;
+mod progress;
+pub use progress::Progress;
 #[cfg(test)]
 mod tests;
 
@@ -184,12 +186,21 @@ fn asset_redirect(url: &Url) -> bool {
 
 trait Fetch {
     fn get(&self, kind: Download, url: Url, limit: usize) -> Result<Vec<u8>>;
+
+    /// Where download and verification progress is shown, if anywhere.
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos", test)),
+        allow(dead_code)
+    )]
+    fn progress(&self) -> Option<&Progress> {
+        None
+    }
 }
 
-struct GitHub(Client);
+struct GitHub(Client, Progress);
 
 impl GitHub {
-    fn new() -> Result<Self> {
+    fn new(progress: Progress) -> Result<Self> {
         Client::builder()
             .redirect(Policy::none())
             .no_proxy()
@@ -197,13 +208,18 @@ impl GitHub {
             .timeout(Duration::from_secs(120))
             .user_agent(concat!("taba/", env!("CARGO_PKG_VERSION")))
             .build()
-            .map(Self)
+            .map(|client| Self(client, progress))
             .map_err(|_| failure("could not initialize GitHub HTTPS client"))
     }
 }
 
 impl Fetch for GitHub {
+    fn progress(&self) -> Option<&Progress> {
+        Some(&self.1)
+    }
+
     fn get(&self, kind: Download, mut url: Url, limit: usize) -> Result<Vec<u8>> {
+        let bar_name = bar_name(kind, &url);
         // Initial URLs are constructed above; no metadata, proxies, or user config select an origin.
         for hop in 0..=1 {
             let mut request = self
@@ -247,7 +263,13 @@ impl Fetch for GitHub {
             if response.content_length().is_some_and(|n| n > limit as u64) {
                 return Err(failure("GitHub release response exceeded its size limit"));
             }
-            return read_bounded(response, limit);
+            let total = response.content_length();
+            return match bar_name {
+                Some(name) if self.1.is_enabled() => {
+                    read_with_progress(response, limit, total, &self.1, &name)
+                }
+                _ => read_bounded(response, limit),
+            };
         }
         unreachable!("each request either returns or takes one redirect")
     }
@@ -262,6 +284,48 @@ fn read_bounded(reader: impl Read, limit: usize) -> Result<Vec<u8>> {
     if bytes.len() > limit {
         return Err(failure("update data exceeded its size limit"));
     }
+    Ok(bytes)
+}
+
+/// The asset name to draw a download bar for: archives get one; metadata
+/// and SHA256SUMS are small.
+fn bar_name(kind: Download, url: &Url) -> Option<String> {
+    url.path_segments()
+        .and_then(|mut s| s.next_back())
+        .filter(|n| matches!(kind, Download::Asset) && *n != "SHA256SUMS")
+        .map(str::to_string)
+}
+
+/// `read_bounded` that also draws a download bar for `name`.
+fn read_with_progress(
+    mut reader: impl Read,
+    limit: usize,
+    total: Option<u64>,
+    progress: &Progress,
+    name: &str,
+) -> Result<Vec<u8>> {
+    progress.start(name, total);
+    let mut bytes = Vec::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                bytes.extend_from_slice(&buf[..n]);
+                if bytes.len() > limit {
+                    progress.abandon();
+                    return Err(failure("update data exceeded its size limit"));
+                }
+                progress.advance(bytes.len() as u64);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => {
+                progress.abandon();
+                return Err(failure(format!("could not read update data: {e}")));
+            }
+        }
+    }
+    progress.done();
     Ok(bytes)
 }
 
@@ -347,10 +411,16 @@ fn run(
     }
 }
 
-pub(super) fn command(check: bool) -> Result<Output> {
+pub(super) fn command(check: bool, json: bool) -> Result<Output> {
     let current =
         Version::parse(env!("CARGO_PKG_VERSION")).expect("Cargo package version is SemVer");
-    let fetch = GitHub::new()?;
+    // `--check` downloads nothing, so it shows no progress.
+    let progress = if check {
+        Progress::disabled()
+    } else {
+        Progress::for_terminal(json)
+    };
+    let fetch = GitHub::new(progress)?;
     run(
         &fetch,
         check,

@@ -3,7 +3,11 @@ use super::archive::verified_binary;
 use super::*;
 use flate2::{Compression, write::GzEncoder};
 use sha2::{Digest, Sha256};
-use std::{cell::RefCell, collections::HashMap, io::Write};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    io::{Read, Write},
+};
 
 const LINUX: &str = "x86_64-unknown-linux-gnu";
 
@@ -11,6 +15,23 @@ const LINUX: &str = "x86_64-unknown-linux-gnu";
 struct Mock {
     responses: HashMap<String, Vec<u8>>,
     requests: RefCell<Vec<String>>,
+    /// Progress shown as `GitHub` shows it; asset bodies arrive in chunks
+    /// of `chunk` bytes, with their size announced unless `unknown_size`.
+    progress: Option<Progress>,
+    chunk: usize,
+    unknown_size: bool,
+}
+
+/// A reader that returns at most `chunk` bytes per call, like a network.
+struct Chunked<'a>(&'a [u8], usize);
+
+impl Read for Chunked<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.0.len().min(self.1).min(buf.len());
+        buf[..n].copy_from_slice(&self.0[..n]);
+        self.0 = &self.0[n..];
+        Ok(n)
+    }
 }
 
 impl Mock {
@@ -21,14 +42,39 @@ impl Mock {
 }
 
 impl Fetch for Mock {
-    fn get(&self, _kind: Download, url: Url, limit: usize) -> Result<Vec<u8>> {
+    fn get(&self, kind: Download, url: Url, limit: usize) -> Result<Vec<u8>> {
         self.requests.borrow_mut().push(url.to_string());
         let body = self
             .responses
             .get(url.as_str())
             .ok_or_else(|| failure(format!("{HTTP_NOT_FOUND} Not Found ({url})")))?;
-        read_bounded(body.as_slice(), limit)
+        match (&self.progress, bar_name(kind, &url)) {
+            (Some(p), Some(name)) if p.is_enabled() => {
+                let total = (!self.unknown_size).then_some(body.len() as u64);
+                read_with_progress(Chunked(body, self.chunk.max(1)), limit, total, p, &name)
+            }
+            _ => read_bounded(body.as_slice(), limit),
+        }
     }
+
+    fn progress(&self) -> Option<&Progress> {
+        self.progress.as_ref()
+    }
+}
+
+impl Mock {
+    /// Shows progress into a buffer the test can read.
+    fn showing(mut self, chunk: usize, unknown_size: bool) -> (Self, progress::tests::Shared) {
+        let buf = progress::tests::Shared::default();
+        self.progress = Some(Progress::to(Box::new(buf.clone())));
+        self.chunk = chunk;
+        self.unknown_size = unknown_size;
+        (self, buf)
+    }
+}
+
+fn shown(buf: &progress::tests::Shared) -> String {
+    String::from_utf8(buf.0.borrow().clone()).unwrap()
 }
 
 fn release_json(
@@ -377,6 +423,89 @@ fn verify(archive: &[u8]) -> Result<Vec<u8>> {
     );
     let (mock, release) = published(archive, &sums);
     verified_binary(&mock, &release, linux())
+}
+
+#[test]
+fn download_bar_and_verification_line_with_known_size() {
+    let archive = official(&elf(62));
+    let sums = format!(
+        "{}  {ASSET}
+",
+        sha(&archive)
+    );
+    let (mock, release) = published(&archive, &sums);
+    let (mock, buf) = mock.showing(archive.len() / 3 + 1, false);
+    assert_eq!(verified_binary(&mock, &release, linux()).unwrap(), elf(62));
+    let out = shown(&buf);
+    assert!(
+        out.starts_with(&format!(
+            "Downloading {ASSET}
+"
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains("[##########--------------------]  33%"),
+        "{out}"
+    );
+    assert!(
+        out.contains("[##############################] 100%"),
+        "{out}"
+    );
+    assert!(
+        out.ends_with(&format!(
+            "
+Verifying {ASSET} (SHA256SUMS, archive contents) ... ok
+"
+        )),
+        "{out}"
+    );
+    // SHA256SUMS itself gets no bar.
+    assert!(!out.contains("Downloading SHA256SUMS"), "{out}");
+}
+
+#[test]
+fn download_bar_with_unknown_size_and_failed_verification() {
+    let archive = official(&elf(62));
+    let sums = format!(
+        "{}  {ASSET}
+",
+        "0".repeat(64)
+    ); // wrong checksum
+    let (mock, release) = published(&archive, &sums);
+    let (mock, buf) = mock.showing(64 * 1024, true);
+    assert!(verified_binary(&mock, &release, linux()).is_err());
+    let out = shown(&buf);
+    assert!(out.contains(" downloaded"), "{out}");
+    assert!(!out.contains('%'), "{out}");
+    assert!(
+        out.ends_with(&format!(
+            "Verifying {ASSET} (SHA256SUMS, archive contents) ... failed
+"
+        )),
+        "{out}"
+    );
+}
+
+#[test]
+fn an_oversized_download_clears_its_bar() {
+    let p = Progress::to(Box::new(progress::tests::Shared::default()));
+    let data = vec![7u8; 300_000];
+    assert!(read_with_progress(Chunked(&data, 100_000), 200_000, None, &p, "x").is_err());
+    let buf = progress::tests::Shared::default();
+    let p = Progress::to(Box::new(buf.clone()));
+    let _ = read_with_progress(Chunked(&data, 100_000), 200_000, Some(300_000), &p, "x");
+    let out = shown(&buf);
+    let last = out.rsplit('\r').nth(1).unwrap();
+    assert!(last.trim().is_empty(), "bar not cleared: {out:?}");
+}
+
+#[test]
+fn no_progress_without_a_terminal_or_with_json() {
+    // `cargo test` captures stderr, so it is never a terminal here.
+    assert!(!Progress::for_terminal(false).is_enabled());
+    assert!(!Progress::for_terminal(true).is_enabled());
+    assert!(!progress::enabled(true, true, false));
 }
 
 #[test]
@@ -813,6 +942,50 @@ mod linux_install {
     }
 
     #[test]
+    fn progress_leaves_the_result_unchanged() {
+        if is_root() {
+            return;
+        }
+        let (old, mut new) = (elf(62), elf(62));
+        new[100] = 7;
+        let run = |show: bool| {
+            let (mock, release) = fixture(&old, &new);
+            let (mock, buf) = if show {
+                mock.showing(4096, false)
+            } else {
+                (mock, progress::tests::Shared::default())
+            };
+            let (dir, exe) = install_dir();
+            fs::write(&exe, &old).unwrap();
+            fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+            let out = run_update(&mock, &exe, &release).unwrap();
+            // The path differs per temporary directory.
+            let text = out.text.replace(&exe.display().to_string(), "EXE");
+            let mut body = serde_json::Value::Object(out.body);
+            body["path"] = "EXE".into();
+            drop(dir);
+            (text, body, shown(&buf))
+        };
+        let (text, body, quiet) = run(false);
+        let (text2, body2, shown) = run(true);
+        assert_eq!(text, text2);
+        assert_eq!(body, body2);
+        assert!(quiet.is_empty());
+        // Two archives: the running version's (provenance) and the new one.
+        assert_eq!(shown.matches("Downloading ").count(), 2, "{shown}");
+        assert_eq!(
+            shown
+                .matches(
+                    "... ok
+"
+                )
+                .count(),
+            2,
+            "{shown}"
+        );
+    }
+
+    #[test]
     fn non_official_binary_is_left_alone() {
         if is_root() {
             return;
@@ -1245,7 +1418,7 @@ fn macos_end_to_end() {
 #[test]
 #[ignore = "network: reads the official v0.2.0 release from GitHub"]
 fn live_github_v0_2_0_archive_verifies() {
-    let github = GitHub::new().unwrap();
+    let github = GitHub::new(Progress::disabled()).unwrap();
     let bytes = github
         .get(Download::Api, api_tag("v0.2.0"), METADATA_LIMIT)
         .unwrap();
@@ -1280,5 +1453,5 @@ fn only_http_404_counts_as_not_found() {
 
 #[test]
 fn https_client_builds_without_network() {
-    assert!(GitHub::new().is_ok());
+    assert!(GitHub::new(Progress::disabled()).is_ok());
 }
