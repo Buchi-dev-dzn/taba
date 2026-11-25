@@ -1062,6 +1062,40 @@ instead of diffs keep consumers simple; the state is small.
 - `--watch` without `--json` (or `TABA_OUTPUT=json`) is rejected with
   `E_USAGE` for now; `--watch` with `--all` is a usage error.
 
+#### `taba ui` (v0.2.3, issue #15)
+
+A keyboard-driven terminal UI in the same binary (ratatui with the crossterm
+backend: macOS, Linux and Windows terminals). Design and decisions: issue
+#10.
+
+- **Data:** the same `ps_snapshot` code as `ps` and `ps --watch`, called
+  in-process once per second; like `--watch` it skips `ps`'s lease peek,
+  so the UI never renews a lease or writes state on its own.
+- **Tree:** every scope with its services; the caller's scope (resolved as
+  for any command) first and unfolded, other scopes folded. ←/→/Space fold
+  and unfold (view only), ↑/↓ move, `/` filters by scope or service name
+  (unfolding scopes with a matching service), `l` follows a log like
+  `logs -f`, `q` / Ctrl+C quit and leave every service running. The
+  terminal is restored on exit and on panic.
+- **`x`:** after a one-key confirmation (`y`), a running service is stopped
+  with the body of `taba stop SCOPE/NAME` (`stop_services`), an exited one
+  removed with the body of `taba rm SCOPE/NAME` (`rm_services`), and a scope
+  line stops each of its services as `SCOPE/NAME` (not `stop --scope`, which
+  would act *as* that scope). The caller is the UI's own, never forced, so
+  `E_NOT_OWNER`, `E_BORROWED`, `E_LOCKED`, `E_SCOPE_HELD`, `E_BUSY` and
+  `E_STILL_RUNNING` refuse exactly as on the command line; the refused row
+  shows the CLI's message. Actions run on a worker thread so the view keeps
+  refreshing during a stop's timeout (5 s, the CLI default).
+- **Header:** the logo (`docs/logo/taba-icon.svg`) in block characters,
+  brackets `#FF5533` and dots `#FFE0BF`; 24-bit color when the terminal
+  advertises it, else the nearest 256-color values (203 and 223), none with
+  `NO_COLOR`; below 40 columns a one-line `[⋮] taba vX.Y.Z`.
+- **Tests:** the state and key handling (`ui/app.rs`) and the drawing
+  (`ui/view.rs`, rendered to ratatui's `TestBackend` at fixed sizes) are
+  unit-tested, and the `x` rules run against a temporary state directory
+  with real processes. Raw-mode input and the real terminal are not
+  automated.
+
 ### `taba logs` (unchanged, plus JSON errors)
 
 ```sh
@@ -1541,7 +1575,8 @@ was replaced by Antigravity CLI on 2026-06-18, so it is not a v0.2 target.
 - **Database-level locking.** `borrow --mut` is an advisory lock that agents
   take before touching a shared DB. taba does not understand schemas,
   connections or transactions.
-- **Log rotation, a TUI.** Unchanged from v0.1.
+- **Log rotation.** Unchanged from v0.1. (A TUI, `taba ui`, came later in
+  v0.2.3; see [the TUI section](#taba-ui-v023-issue-15).)
 
 ---
 
