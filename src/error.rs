@@ -99,8 +99,47 @@ impl TabaError {
 
 impl From<io::Error> for TabaError {
     fn from(e: io::Error) -> TabaError {
-        TabaError::state(e.to_string())
+        use crate::state::StateFile;
+        let Some(u) = crate::state::unreadable(&e) else {
+            return TabaError::state(e.to_string()).next(Next::just(
+                "check that $TABA_HOME is readable and writable and has free space, then retry",
+            ));
+        };
+        let (what, next) = match &u.file {
+            StateFile::Service { scope, name } => (
+                format!("service record {scope}/{name}"),
+                Next::run(
+                    "remove the unreadable record and its log (a process it started is no longer tracked)",
+                    format!("taba rm {scope}/{name} --force --reason 'unreadable record'"),
+                ),
+            ),
+            StateFile::Scope(scope) => (
+                format!("scope record {scope}"),
+                Next::run(
+                    "remove the unreadable scope record (its lease is lost)",
+                    format!("taba rm --scope {scope} --force --reason 'unreadable scope record'"),
+                ),
+            ),
+            StateFile::Other => (
+                "state file".to_string(),
+                Next::just("inspect or move the file aside; taba does not replace damaged state"),
+            ),
+        };
+        TabaError::state(format!("unreadable {what}: {u}"))
+            .details(json!({ "path": u.path, "reason": "unreadable", "cause": u.error }))
+            .next(next)
     }
+}
+
+/// `W_STATE_SKIPPED` for each unreadable state file a listing skipped.
+pub fn skipped_warnings() -> Vec<Warning> {
+    crate::state::take_skipped()
+        .into_iter()
+        .map(|message| Warning {
+            code: "W_STATE_SKIPPED",
+            message,
+        })
+        .collect()
 }
 
 pub fn exit_code(code: &str) -> u8 {
@@ -160,8 +199,10 @@ impl Output {
 
 /// Prints a finished command and returns its exit status.
 pub fn emit(json_mode: bool, res: Result<Output>) -> u8 {
+    let skipped = skipped_warnings();
     match res {
-        Ok(out) => {
+        Ok(mut out) => {
+            out.warnings.extend(skipped);
             let code = out.failure.as_ref().map_or(0, TabaError::exit_code);
             if json_mode {
                 let mut m = Map::new();
@@ -190,8 +231,15 @@ pub fn emit(json_mode: bool, res: Result<Output>) -> u8 {
         }
         Err(e) => {
             if json_mode {
-                print_json(&json!({ "ok": false, "error": e.to_json(), "warnings": [] }));
+                print_json(&json!({
+                    "ok": false,
+                    "error": e.to_json(),
+                    "warnings": skipped.iter().map(Warning::to_json).collect::<Vec<_>>(),
+                }));
             } else {
+                for w in &skipped {
+                    eprintln!("taba: warning: {}", w.message);
+                }
                 eprintln!("taba: {}", e.message);
                 for n in &e.next {
                     match &n.command {

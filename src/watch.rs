@@ -62,12 +62,16 @@ pub fn run(json: bool, scope: Option<String>, running: bool, interval: Option<Du
             Ok(snap) => Value::Array(snap.rows),
             Err(e) => return fail(&e),
         };
-        if last.as_ref() != Some(&services) {
-            let line = json!({ "ok": true, "services": &services, "warnings": [] });
+        let warnings: Vec<Value> = crate::error::skipped_warnings()
+            .iter()
+            .map(crate::error::Warning::to_json)
+            .collect();
+        let line = json!({ "ok": true, "services": services, "warnings": warnings });
+        if last.as_ref() != Some(&line) {
             if write_line(&line).is_err() {
                 return 0; // the consumer went away
             }
-            last = Some(services);
+            last = Some(line);
         }
         if wait_or_stop(interval) {
             return 0;

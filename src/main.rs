@@ -1636,9 +1636,50 @@ fn cmd_rm(
     let scope_flag_given = scope_flag.is_some();
     let caller = scope::resolve(scope_flag, agent)?;
     let store = Store::open()?;
-    rm_services(&store, &caller, reason, |store| {
-        targets(store, target, scope_flag_given, &caller, "remove")
-    })
+    let forced_scope = caller
+        .scope
+        .clone()
+        .filter(|_| reason.is_some() && target.is_none() && scope_flag_given);
+    let mut out = rm_services(&store, &caller, reason.clone(), |store| {
+        let (mut list, single) = targets(store, target, scope_flag_given, &caller, "remove")?;
+        if let Some(scope) = &forced_scope {
+            // A forced scope-wide rm also removes the scope's unreadable records.
+            list.extend(
+                store
+                    .unreadable_records(scope)?
+                    .into_iter()
+                    .map(|n| (scope.clone(), n)),
+            );
+        }
+        Ok((list, single))
+    })?;
+    if let (Some(scope), Some(reason)) = (forced_scope, reason) {
+        // An unreadable scope record blocks every command for the scope;
+        // only an explicit forced rm removes it, never taba on its own.
+        let _lock = store.lock()?;
+        if let Err(e) = store.get_scope(&scope)
+            && state::unreadable(&e).is_some()
+        {
+            store.append_event(&json!({
+                "at": util::rfc3339_now(),
+                "event": "force_rm_scope_record",
+                "agent": caller.agent,
+                "caller_scope": caller.scope,
+                "cwd": caller.cwd,
+                "target": scope,
+                "reason": reason,
+                "unreadable": true,
+            }))?;
+            store.remove_scope(&scope)?;
+            out.body
+                .insert("scope_record".into(), json!("removed_unreadable"));
+            out.text.push_str(&format!(
+                "
+scope {scope}: removed unreadable scope record"
+            ));
+        }
+    }
+    Ok(out)
 }
 
 /// Removes the services `select` picks (under the global lock) as `caller`:
@@ -1658,7 +1699,34 @@ pub(crate) fn rm_services(
     let mut results: Vec<Value> = Vec::new();
     let mut refusals: Vec<TabaError> = Vec::new();
     for (s, n) in &targets {
-        let svc = store.get(s, n)?.ok_or_else(|| not_found(s, n))?;
+        let svc = match store.get(s, n) {
+            Ok(svc) => svc.ok_or_else(|| not_found(s, n))?,
+            Err(e) if state::unreadable(&e).is_some() && reason.is_some() => {
+                // An unreadable record: nothing in it can be verified, so only
+                // a forced rm removes it, and only when no operation is live.
+                let id = format!("{s}/{n}");
+                if let Some(op) = store.live_op(s, n)? {
+                    return Err(busy(&id, &op));
+                }
+                store.append_event(&json!({
+                    "at": util::rfc3339_now(),
+                    "event": "force_rm",
+                    "agent": caller.agent,
+                    "caller_scope": caller.scope,
+                    "cwd": caller.cwd,
+                    "target": id,
+                    "reason": reason,
+                    "unreadable": true,
+                }))?;
+                store.remove(s, n)?;
+                lines.push(format!(
+                    "{id}: removed unreadable record and its log (a process it started is no longer tracked)"
+                ));
+                results.push(json!({ "service": id, "result": "removed", "unreadable": true }));
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
         let owner = caller.scope.as_deref() == Some(svc.scope.as_str());
         let lease_refusal = if owner && reason.is_none() {
             let cfg = config::Config::load(store.root())?;
