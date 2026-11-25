@@ -9,6 +9,7 @@
 //! events.jsonl                    append-only audit log
 //! version                         state schema version
 //! lock                            global lock (flock / LockFileEx)
+//! btime/                          Linux boot-time cache and recovery copies
 //! ```
 //!
 //! Every field added in v0.2 is optional when reading, so v0.1 records load
@@ -236,16 +237,16 @@ pub fn validate_ident(kind: &str, s: &str) -> Result<(), String> {
     }
 }
 
+pub(crate) fn state_dir() -> Option<PathBuf> {
+    match std::env::var_os("TABA_HOME") {
+        Some(v) if !v.is_empty() => Some(PathBuf::from(v)),
+        _ => crate::util::home_dir().map(|home| home.join(".taba")),
+    }
+}
+
 impl Store {
     pub fn open() -> io::Result<Store> {
-        let root = match std::env::var_os("TABA_HOME") {
-            Some(v) if !v.is_empty() => PathBuf::from(v),
-            _ => {
-                let home =
-                    crate::util::home_dir().ok_or_else(|| io::Error::other("HOME is not set"))?;
-                home.join(".taba")
-            }
-        };
+        let root = state_dir().ok_or_else(|| io::Error::other("HOME is not set"))?;
         fs::create_dir_all(root.join("services"))?;
         fs::create_dir_all(root.join("logs"))?;
         let store = Store { root };

@@ -370,8 +370,8 @@ taba is meant for AI coding agents as much as for people:
   }
   ```
 - **Use `taba ps --all`** to see every port you have open, whether taba
-  started it or not, with its directory and git branch. It never stops or
-  changes anything.
+  started it or not, with its directory and git branch. It leaves services
+  and their records unchanged.
 - Each started process gets `TABA_SCOPE` and `TABA_SERVICE` in its environment.
 
 ### Agent skill
@@ -685,6 +685,7 @@ $TABA_HOME (default ~/.taba)
 ├── ops/<scope>/<name>.json        # in-flight stop or start of that service (operation lock)
 ├── events.jsonl                   # audit log of --force overrides
 ├── version                        # state schema version (2)
+├── btime/                         # Linux boot-time cache and recovery copies
 └── lock                           # serialises changes to the state
 ```
 
@@ -703,6 +704,11 @@ stops processes differs:
 | A service's processes | its process group (new session) | its process group (new session) | its Job Object |
 | `stop` | SIGTERM, then SIGKILL | SIGTERM, then SIGKILL | Ctrl+Break, then terminate the job |
 | State lock | `flock` | `flock` | `LockFileEx` |
+
+On Linux, taba saves a boot-time value by boot ID under `$TABA_HOME/btime/`
+to keep process identities stable across wall-clock changes. Process inspection
+can restore either file of the pair from the other during the same boot. Keep this
+directory with the service records when cleaning up or moving state.
 
 On Windows:
 
