@@ -1035,6 +1035,33 @@ read).
 Errors: `E_STATE`. `lsof` missing or failing gives an empty list with a
 warning, not an error.
 
+#### `taba ps --watch --json` (v0.2.2, issue #14)
+
+```sh
+taba ps --watch --json [--scope S] [--running] [--interval DURATION]
+```
+
+A stream for other UIs (`taba ui`, Orca): newline-delimited JSON, one full
+`ps --json` document per line (`{"ok": true, "services": [...], "warnings":
+[]}`, compact). The first line is printed at once, then a new line only
+when the `services` rows differ from the last line printed (status, port,
+PID, lease, borrows, claims, a service added or removed). Full snapshots
+instead of diffs keep consumers simple; the state is small.
+
+- State is re-read every `--interval` (default 1 s, minimum 250 ms; `SECS`
+  or a number with `ms` / `s`).
+- Read-only: the rows come from the same code as `ps`, but without `ps`'s
+  lease peek, so a watcher never renews a lease, drains notices or writes
+  anything. There is therefore no `takeover` field and `warnings` is empty.
+- Ends with exit 0 on SIGINT / Ctrl+C (Windows: Ctrl+C or Ctrl+Break, via a
+  console control handler) and when stdout is closed: a failed write ends
+  it, and on Unix an idle stream also polls a pipe or socket stdout for
+  `POLLERR` / `POLLHUP`.
+- An error (for example `E_STATE`) is printed as one `{"ok": false, ...}`
+  line and ends the stream with that error's exit status.
+- `--watch` without `--json` (or `TABA_OUTPUT=json`) is rejected with
+  `E_USAGE` for now; `--watch` with `--all` is a usage error.
+
 ### `taba logs` (unchanged, plus JSON errors)
 
 ```sh
