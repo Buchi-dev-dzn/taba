@@ -1,7 +1,7 @@
 //! `taba ps --all`: every listening TCP port of this user, managed or not.
 //!
-//! Read-only: it signals nothing and writes nothing, not even a lease
-//! renewal (design v0.2, section 4, "`taba ps --all`").
+//! It sends no signals and never changes service records or leases. On
+//! Linux, process inspection may initialize or repair the boot-time cache.
 
 use crate::error::{Output, Result, Warning};
 use crate::proc;

@@ -463,6 +463,7 @@ $TABA_HOME (default ~/.taba)
 ├── events.jsonl                      # new: append-only audit log
 ├── config.toml                       # new, optional: lease_ttl, claim_grace, gc_grace, log_retention, stop_timeout
 ├── version                           # new: state schema version ("2")
+├── btime/                            # Linux: boot-time cache and recovery copies
 └── lock                              # unchanged: global flock
 ```
 
@@ -996,8 +997,8 @@ output also has `"takeover": "available"`. `status` gains `starting` and `stoppi
 appear while an operation lock is held. The text table gains an `OWNER`
 column (`holder` with a mark when the lease has expired).
 
-`ps --all` is **read-only** and answers "what is listening on this Mac, and
-whose is it?". It lists every TCP socket in LISTEN state owned by the current
+`ps --all` leaves services, records and leases unchanged. It answers "what is
+listening on this machine, and whose is it?". It lists every TCP socket in LISTEN state owned by the current
 user (via `lsof -nP -iTCP -sTCP:LISTEN`, as v0.1 already uses `lsof` for one
 port), whether or not taba started it. For each it shows the port, bound
 address, pid, command line (`proc::argv`, exists), working directory (macOS
@@ -1804,9 +1805,12 @@ Linux reads `/proc/PID/stat` (process group, state, start time),
 work as on macOS. The start time is the boot time (`btime`) plus the start
 tick (10 ms resolution). The kernel recomputes `btime` from the wall clock,
 which moves when the clock is stepped (NTP, or WSL catching up after the
-host slept), so the first `btime` read in a boot is kept in
-`$TMPDIR/taba-btime-UID-BOOTID` and reused, keeping recorded start times
-comparable.
+host slept), so taba saves the first value by boot ID in `$TABA_HOME/btime/`.
+A private directory lock serializes initialization and repair. Each entry
+is published by atomic rename and read only when regular, owned by the
+effective user, and mode `0600`. Either of the two files can recover the
+other if it is deleted mid-boot. On upgrade, an owner-checked legacy cache
+with no group or world write permissions can seed the new files.
 
 Windows differs where the OS has no equivalent:
 

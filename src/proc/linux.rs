@@ -2,7 +2,10 @@
 //! state and start time, `/proc/PID/cmdline` for argv, and
 //! `/proc/net/tcp{,6}` plus `/proc/PID/fd` for listening sockets.
 
-use std::fs;
+use std::fs::{self, DirBuilder, OpenOptions};
+use std::io::{Read, Write};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::Path;
 use std::sync::OnceLock;
 
 /// Kernel facts about one process.
@@ -20,8 +23,7 @@ pub struct RawInfo {
 /// The kernel derives `btime` from the current wall clock, so it moves when
 /// the clock is stepped (NTP, or WSL catching up after the host slept), and
 /// start times computed from it would no longer match recorded ones. The
-/// first value read in a boot is therefore kept in a per-user file keyed by
-/// the boot id, and every later taba process of that boot uses it.
+/// first value read in a boot is kept in the state directory by boot ID.
 fn clock() -> Option<(u64, u64)> {
     static CLOCK: OnceLock<Option<(u64, u64)>> = OnceLock::new();
     *CLOCK.get_or_init(|| {
@@ -34,43 +36,99 @@ fn clock() -> Option<(u64, u64)> {
 }
 
 fn boot_time() -> Option<u64> {
-    let read_btime = || -> Option<u64> {
-        let stat = fs::read_to_string("/proc/stat").ok()?;
-        stat.lines()
-            .find_map(|l| l.strip_prefix("btime "))?
-            .trim()
-            .parse()
-            .ok()
-    };
-    let Some(boot_id) = fs::read_to_string("/proc/sys/kernel/random/boot_id")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-'))
-    else {
+    let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default();
+    let boot_id = boot_id.trim();
+    if boot_id.is_empty() || !boot_id.bytes().all(|c| c.is_ascii_hexdigit() || c == b'-') {
         return read_btime();
-    };
-    let uid = unsafe { libc::getuid() };
-    let path = std::env::temp_dir().join(format!("taba-btime-{uid}-{boot_id}"));
-    let cached = || fs::read_to_string(&path).ok()?.trim().parse::<u64>().ok();
-    if let Some(b) = cached() {
-        return Some(b);
     }
-    let btime = read_btime()?;
-    // First writer wins; everyone else reads its value.
-    let mut f = match fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-    {
-        Ok(f) => f,
-        Err(_) => return cached().or(Some(btime)),
+    let uid = unsafe { libc::geteuid() };
+    let initial = || {
+        let legacy_uid = unsafe { libc::getuid() };
+        let legacy = std::env::temp_dir().join(format!("taba-btime-{legacy_uid}-{boot_id}"));
+        // Older versions created this file with the user's umask.
+        read_cached_btime(&legacy, uid, |mode| mode & 0o7022 == 0).or_else(read_btime)
     };
-    let _ = std::io::Write::write_all(&mut f, format!("{btime}\n").as_bytes());
+    crate::state::state_dir()
+        .and_then(|root| cached_boot_time(&root.join("btime"), boot_id, uid, initial))
+        .or_else(initial)
+}
+
+fn read_btime() -> Option<u64> {
+    let stat = fs::read_to_string("/proc/stat").ok()?;
+    stat.lines()
+        .find_map(|line| line.strip_prefix("btime "))?
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn read_cached_btime(path: &Path, uid: u32, valid_mode: impl FnOnce(u32) -> bool) -> Option<u64> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.uid() != uid || !valid_mode(metadata.mode() & 0o7777) {
+        return None;
+    }
+    let mut text = String::new();
+    file.take(32).read_to_string(&mut text).ok()?;
+    text.trim().parse().ok()
+}
+
+fn write_cached_btime(path: &Path, dir: &Path, btime: u64) -> std::io::Result<()> {
+    let mut temp = tempfile::NamedTempFile::new_in(dir)?;
+    temp.as_file()
+        .set_permissions(fs::Permissions::from_mode(0o600))?;
+    writeln!(temp, "{btime}")?;
+    temp.persist(path)?;
+    Ok(())
+}
+
+fn cached_boot_time(
+    dir: &Path,
+    boot_id: &str,
+    uid: u32,
+    initial: impl FnOnce() -> Option<u64>,
+) -> Option<u64> {
+    DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .ok()?;
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(dir)
+        .ok()?;
+    let metadata = directory.metadata().ok()?;
+    if metadata.uid() != uid || metadata.mode() & 0o777 != 0o700 {
+        return None;
+    }
+    // Serialize first initialization and repairs independently of the state lock.
+    directory.lock().ok()?;
+    let cache = dir.join(boot_id);
+    let recovery = dir.join(format!("{boot_id}.recovery"));
+    let cached = read_cached_btime(&cache, uid, |mode| mode == 0o600);
+    let saved = read_cached_btime(&recovery, uid, |mode| mode == 0o600);
+    let btime = saved.or(cached).or_else(initial)?;
+    // Keep a recovery copy so deleting the cache mid-boot does not change identities.
+    if saved.is_none() {
+        let _ = write_cached_btime(&recovery, dir, btime);
+    }
+    if cached != Some(btime) {
+        let _ = write_cached_btime(&cache, dir, btime);
+    }
     Some(btime)
 }
 
 /// Reads `/proc/PID/stat`. Returns `None` if no such process is visible.
 pub fn raw_info(pid: i32) -> Option<RawInfo> {
+    raw_info_with_clock(pid, clock)
+}
+
+fn raw_info_with_clock(pid: i32, clock: impl FnOnce() -> Option<(u64, u64)>) -> Option<RawInfo> {
     if pid <= 0 {
         return None;
     }
@@ -86,7 +144,9 @@ pub fn raw_info(pid: i32) -> Option<RawInfo> {
     Some(RawInfo {
         pid,
         pgid,
-        start_time: btime * 1_000_000 + ticks * 1_000_000 / hz,
+        start_time: btime
+            .checked_mul(1_000_000)?
+            .checked_add(ticks.checked_mul(1_000_000)? / hz)?,
         zombie: matches!(*state, "Z" | "X"),
     })
 }
@@ -238,6 +298,84 @@ pub fn cwd(pid: i32) -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn cache_deletion_preserves_live_process_identity() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("btimes");
+        let boot = "abc";
+        let uid = unsafe { libc::geteuid() };
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
+        let pid = std::process::id() as i32;
+        let read_process = |btime| {
+            raw_info_with_clock(pid, || {
+                Some((cached_boot_time(&dir, boot, uid, || Some(btime))?, hz))
+            })
+            .unwrap()
+        };
+        let original = read_process(1_700_000_000);
+
+        for name in [boot, "abc.recovery"] {
+            fs::remove_file(dir.join(name)).unwrap();
+            let after_clock_step = read_process(1_700_000_005);
+            assert_eq!(after_clock_step.start_time, original.start_time);
+            assert!(!after_clock_step.zombie);
+            assert!(dir.join(name).is_file());
+        }
+        assert_eq!(
+            cached_boot_time(&dir, "def", uid, || Some(1_800_000_000)),
+            Some(1_800_000_000)
+        );
+    }
+
+    #[test]
+    fn ignores_insecure_cache_entries() {
+        let dir = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let path = dir.path().join("abc");
+        let target = dir.path().join("other");
+        write_cached_btime(&target, dir.path(), 100).unwrap();
+        assert_eq!(read_cached_btime(&target, uid ^ 1, |_| true), None);
+
+        symlink(&target, &path).unwrap();
+        assert_eq!(read_cached_btime(&path, uid, |_| true), None);
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, "100\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            cached_boot_time(dir.path(), "abc", uid, || Some(200)),
+            Some(200)
+        );
+        assert_eq!(
+            read_cached_btime(&path, uid, |mode| mode == 0o600),
+            Some(200)
+        );
+        assert_eq!(
+            read_cached_btime(&target, uid, |mode| mode == 0o600),
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn concurrent_initializers_use_the_same_btime() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("btimes");
+        let uid = unsafe { libc::geteuid() };
+        let barrier = std::sync::Barrier::new(2);
+        let initialize = |btime| {
+            barrier.wait();
+            cached_boot_time(&dir, "abc", uid, || Some(btime)).unwrap()
+        };
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| initialize(100));
+            let second = initialize(200);
+            assert_eq!(first.join().unwrap(), second);
+        });
+    }
 
     #[test]
     fn reads_own_process() {

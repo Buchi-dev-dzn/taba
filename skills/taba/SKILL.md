@@ -133,6 +133,9 @@ deletes logs or records: stopped services stay in `taba ps` (status
 `exited`). `rm` refuses running services, so stop first, and skip `rm` if the
 human may still want the logs.
 
+On Linux, keep `$TABA_HOME/btime/` with the service records. It holds the
+boot-time values taba uses to verify running processes after clock changes.
+
 ## Hand-off
 
 A successor in the same scope can take over after your lease ends. Use
