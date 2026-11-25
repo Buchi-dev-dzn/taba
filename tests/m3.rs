@@ -132,3 +132,114 @@ fn ttl_expiry_hands_over_even_while_holder_process_survives() {
     assert_eq!(who["holder"], "second");
     assert_eq!(f.ps(&[])[0]["instance"], web["instance"]);
 }
+
+/// A dummy service that exits `delay` seconds after a graceful stop request
+/// (SIGTERM, or Ctrl+Break on Windows), writing `stopped`; a negative delay
+/// ignores the request. It writes `ready` once its handler is installed.
+const SLOW_STOP: &str = r#"
+import pathlib, signal, sys, time
+delay, dir = float(sys.argv[1]), pathlib.Path(sys.argv[2])
+def on_stop(*_):
+    if delay < 0:
+        return
+    time.sleep(delay)
+    (dir / "stopped").write_text("graceful")
+    sys.exit(0)
+for name in ("SIGTERM", "SIGBREAK"):
+    if hasattr(signal, name):
+        signal.signal(getattr(signal, name), on_stop)
+(dir / "ready").write_text("ready")
+while True:
+    time.sleep(0.05)
+"#;
+
+/// Starts the dummy as `first`'s service in `wt_a`, then ends `first`'s lease.
+fn slow_service(f: &Fixture, delay: &str) -> (std::path::PathBuf, String) {
+    let dir = f
+        .root
+        .join(format!("slow-{}", delay.replace(['-', '.'], "_")));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("slow.py");
+    std::fs::write(&script, SLOW_STOP).unwrap();
+    let mut first = Agent::start();
+    let (script, dir_arg) = (script.to_str().unwrap(), dir.to_str().unwrap());
+    let svc = first.call(
+        f,
+        &f.wt_a,
+        "first",
+        &[
+            "run", "--name", "db", "--json", "--", PY, script, delay, dir_arg,
+        ],
+    );
+    assert_eq!(svc["ok"], true, "{svc}");
+    wait_until("handler installed", || dir.join("ready").exists());
+    first.stop();
+    assert_eq!(f.ps(&[])[0]["lease"]["state"], "expired");
+    (dir, svc["service"].as_str().unwrap().to_string())
+}
+
+fn gc_drop(f: &Fixture, service: &str) -> Option<Value> {
+    f.events()
+        .into_iter()
+        .find(|e| e["event"] == "gc_drop" && e["service"] == service)
+}
+
+#[test]
+fn gc_waits_the_configured_stop_timeout_before_forcing() {
+    let f = Fixture::new("gcterm");
+    // stop_timeout defaults to 5 s, like `taba stop`.
+    configure(&f, "gc_grace = \"0s\"\nclaim_grace = \"0s\"\n");
+    let (dir, service) = slow_service(&f, "2");
+    let gc = json(&f.taba(&f.outside, &["gc", "--json"]));
+    assert_eq!(gc["dropped"][0]["services"][0], service.as_str(), "{gc}");
+    assert!(
+        dir.join("stopped").exists(),
+        "the service exited on its own"
+    );
+    assert_eq!(gc_drop(&f, &service).unwrap()["signal"], "TERM");
+}
+
+#[test]
+fn lazy_cleanup_does_not_wait_out_or_force_a_slow_service() {
+    let f = Fixture::new("gclazy");
+    configure(
+        &f,
+        "gc_grace = \"0s\"\nclaim_grace = \"0s\"\nstop_timeout = \"1m\"\n",
+    );
+    let other = Agent::start();
+    let (dir, service) = slow_service(&f, "4");
+    // Another scope's command runs the lazy pass: it asks, waits briefly and
+    // leaves the service running instead of forcing it.
+    let who = other.call(&f, &f.wt_b, "other", &["whoami"]);
+    assert!(who["scope"].is_string(), "{who}");
+    assert!(!dir.join("stopped").exists());
+    assert!(f.ps(&[]).iter().any(|r| r["service"] == service.as_str()));
+    assert!(gc_drop(&f, &service).is_none());
+    wait_until("graceful exit", || dir.join("stopped").exists());
+    other.call(&f, &f.wt_b, "other", &["whoami"]);
+    assert!(!f.ps(&[]).iter().any(|r| r["service"] == service.as_str()));
+    assert!(gc_drop(&f, &service).unwrap()["signal"].is_null());
+}
+
+#[test]
+fn lazy_cleanup_forces_a_service_only_after_its_stop_timeout() {
+    let f = Fixture::new("gcforce");
+    configure(
+        &f,
+        "gc_grace = \"0s\"\nclaim_grace = \"0s\"\nstop_timeout = \"2s\"\n",
+    );
+    let other = Agent::start();
+    // This dummy ignores the graceful request.
+    let (_dir, service) = slow_service(&f, "-1");
+    let started = std::time::Instant::now();
+    other.call(&f, &f.wt_b, "other", &["whoami"]);
+    if started.elapsed() < std::time::Duration::from_secs(2) {
+        other.call(&f, &f.wt_b, "other", &["whoami"]);
+        assert!(f.ps(&[]).iter().any(|r| r["service"] == service.as_str()));
+        assert!(gc_drop(&f, &service).is_none());
+    }
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    other.call(&f, &f.wt_b, "other", &["whoami"]);
+    assert!(!f.ps(&[]).iter().any(|r| r["service"] == service.as_str()));
+    assert_eq!(gc_drop(&f, &service).unwrap()["signal"], "KILL");
+}

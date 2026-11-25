@@ -79,6 +79,15 @@ fn signal_group(pgid: i32, sig: libc::c_int) -> io::Result<()> {
     }
 }
 
+/// Sends SIGTERM to the group and waits up to `wait` for it to exit, without
+/// escalating. Returns whether the group is gone.
+pub fn request_stop(_pid: i32, pgid: i32, _start_time: u64, wait: Duration) -> io::Result<bool> {
+    signal_group(pgid, libc::SIGTERM)?;
+    Ok(wait_for(wait, Duration::from_millis(50), || {
+        !group_exists(pgid)
+    }))
+}
+
 /// Sends SIGTERM to the group, waits up to `timeout`, then SIGKILL.
 pub fn stop_group(
     _pid: i32,

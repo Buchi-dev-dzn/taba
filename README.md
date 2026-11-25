@@ -618,6 +618,11 @@ prevent accidents; they are not credentials.
 - `taba gc --dry-run` previews cleanup. `taba gc` hands over claimed services
   after `claim_grace` and drops unclaimed expired services after `gc_grace`.
   `run` and `whoami` also perform bounded cleanup outside the caller's scope.
+  `taba gc` stops a dropped service like `taba stop`: a graceful request,
+  then a forced stop after `stop_timeout` (default `5s`). The cleanup inside
+  `run` and `whoami` waits at most 1 s per service. It leaves a slower
+  service running and forces it only on a later cleanup, once `stop_timeout`
+  has passed.
 - `run --service-ttl DURATION` sets an independent service timeout.
   `taba keep --reason TEXT` pins the scope; `taba keep --off` clears it.
 

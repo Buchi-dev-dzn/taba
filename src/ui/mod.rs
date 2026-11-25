@@ -300,6 +300,7 @@ mod tests {
                     service_ttl_secs: None,
                     service_expires_at: None,
                     moves: Vec::new(),
+                    stop_requested_at: None,
                 })
                 .unwrap();
         }

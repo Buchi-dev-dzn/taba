@@ -33,15 +33,15 @@ use macos as os;
 pub use os::{all_listeners, all_pids, argv, cwd, listeners};
 #[cfg(unix)]
 pub use unix::{
-    GRACEFUL_ACTION, KILL_ACTION, KILL_SIGNAL, group_is_ours, in_group, info, pgid,
+    GRACEFUL_ACTION, KILL_ACTION, KILL_SIGNAL, group_is_ours, in_group, info, pgid, request_stop,
     resolve_program, spawn_detached, stop_group,
 };
 
 #[cfg(windows)]
 pub use windows::{
     GRACEFUL_ACTION, KILL_ACTION, KILL_SIGNAL, all_listeners, all_pids, argv, ctrl_break_helper,
-    cwd, group_is_ours, in_group, info, listeners, pgid, resolve_program, spawn_detached,
-    stop_group,
+    cwd, group_is_ours, in_group, info, listeners, pgid, request_stop, resolve_program,
+    spawn_detached, stop_group,
 };
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]

@@ -461,7 +461,7 @@ $TABA_HOME (default ~/.taba)
 ├── claims/<scope>/<name>.json        # new: the service's claim queue, in order
 ├── ops/<scope>/<name>.json           # new: in-flight mutation (operation lock)
 ├── events.jsonl                      # new: append-only audit log
-├── config.toml                       # new, optional: lease_ttl, claim_grace, gc_grace, log_retention
+├── config.toml                       # new, optional: lease_ttl, claim_grace, gc_grace, log_retention, stop_timeout
 ├── version                           # new: state schema version ("2")
 └── lock                              # unchanged: global flock
 ```
@@ -642,9 +642,10 @@ lease_ttl     = "4h"    # default lease TTL; "none" = no expiry by time
 claim_grace   = "2m"    # how long a same-folder successor has priority before claim queues are served
 gc_grace      = "10m"   # how long an expired scope waits for a new holder before gc may drop it
 log_retention = "24h"   # how long logs of dropped services are kept
+stop_timeout  = "5s"    # how long gc waits after the graceful stop request before forcing
 ```
 
-`claim_grace`, `gc_grace` and `log_retention` come only from the config
+`claim_grace`, `gc_grace`, `log_retention` and `stop_timeout` come only from the config
 file or the built-in default (no flag or environment variable in v0.2).
 Both graces count from the moment the lease ended. A drop never happens
 before claims have been served, so with `claim_grace` longer than
@@ -1350,7 +1351,15 @@ process is gone, and delete logs of dropped services after `log_retention`
 call: claim queues of scopes whose lease ended more than `claim_grace` ago
 are served, and scopes whose lease ended more than `gc_grace` ago are
 dropped (in `run`, before port
-selection). That
+selection). A drop stops the service as `taba stop` does: SIGTERM (Windows:
+Ctrl+Break), then SIGKILL (Windows: TerminateJobObject) after
+`stop_timeout` (default 5 s). `taba gc` waits out that timeout. The lazy
+pass inside `run` and `whoami` waits at most 1 s per service so that an
+unrelated command is not held up. It leaves a slower service running, records
+when it asked (`stop_requested_at` in the service record), and forces it only
+when a later cleanup finds `stop_timeout` has passed since then. The
+`gc_drop` event records the signal that stopped the service (`TERM`, `KILL`,
+or `null` if it had already exited). That
 releases ports leaked by crashed agents without any daemon. No launchd job
 in v0.2.
 

@@ -108,6 +108,9 @@ pub const DEFAULT_AGENT_TTL: u64 = 4 * 3_600;
 pub const DEFAULT_CLAIM_GRACE: u64 = 2 * 60;
 pub const DEFAULT_GC_GRACE: u64 = 10 * 60;
 pub const DEFAULT_LOG_RETENTION: u64 = 24 * 3_600;
+/// Seconds `gc` waits after the graceful stop request before forcing a
+/// service down, like `taba stop --timeout`.
+pub const DEFAULT_STOP_TIMEOUT: u64 = 5;
 
 /// The settings of `config.toml` (all optional) with defaults applied.
 #[derive(Debug, Clone)]
@@ -118,6 +121,7 @@ pub struct Config {
     pub claim_grace: u64,
     pub gc_grace: u64,
     pub log_retention: u64,
+    pub stop_timeout: u64,
     /// Unknown keys, reported as a warning.
     pub unknown: Vec<String>,
 }
@@ -138,6 +142,7 @@ impl Config {
             claim_grace: DEFAULT_CLAIM_GRACE,
             gc_grace: DEFAULT_GC_GRACE,
             log_retention: DEFAULT_LOG_RETENTION,
+            stop_timeout: DEFAULT_STOP_TIMEOUT,
             unknown: Vec::new(),
         };
         let text = match std::fs::read_to_string(&path) {
@@ -180,6 +185,7 @@ impl Config {
                 "claim_grace" => cfg.claim_grace = dur(value)?,
                 "gc_grace" => cfg.gc_grace = dur(value)?,
                 "log_retention" => cfg.log_retention = dur(value)?,
+                "stop_timeout" => cfg.stop_timeout = dur(value)?,
                 other => cfg.unknown.push(other.to_string()),
             }
         }
@@ -251,12 +257,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("config.toml"),
-            "# comment\nlease_ttl = \"1h\"  # trailing\ngc_grace=\"0s\"\nother = \"x\"\n",
+            "# comment\nlease_ttl = \"1h\"  # trailing\ngc_grace=\"0s\"\nstop_timeout = \"30s\"\nother = \"x\"\n",
         )
         .unwrap();
         let c = Config::load(&dir).unwrap();
         assert_eq!(c.lease_ttl, Some(Ttl::Secs(3600)));
         assert_eq!(c.gc_grace, 0);
+        assert_eq!(c.stop_timeout, 30);
         assert_eq!(c.claim_grace, DEFAULT_CLAIM_GRACE);
         assert_eq!(c.unknown, ["other"]);
         std::fs::write(dir.join("config.toml"), "lease_ttl = \"soon\"\n").unwrap();
