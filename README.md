@@ -418,7 +418,11 @@ so taba denies the forced tool call and directs the agent to a human.
 These are best-effort checks for common Bash commands, not a security
 boundary. They do not execute the commands or intercept native PowerShell
 stop commands. A command the hook does not understand falls back to the
-harness's normal permissions.
+harness's normal permissions and is recorded as `hook_unchecked` in
+`events.jsonl`. The hook looks through common wrappers such as `sudo`,
+`env`, `timeout` and `VAR=value` prefixes, and asks for confirmation before a
+`taba` command that acts as a different agent (`--agent` or `TABA_AGENT=`)
+than the session's own.
 
 ### AGENTS.md / CLAUDE.md snippet
 
