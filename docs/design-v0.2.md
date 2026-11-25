@@ -1055,8 +1055,10 @@ instead of diffs keep consumers simple; the state is small.
   anything. There is therefore no `takeover` field and `warnings` is empty.
 - Ends with exit 0 on SIGINT / Ctrl+C (Windows: Ctrl+C or Ctrl+Break, via a
   console control handler) and when stdout is closed: a failed write ends
-  it, and on Unix an idle stream also polls a pipe or socket stdout for
-  `POLLERR` / `POLLHUP`.
+  it, and an idle stream checks a pipe or socket stdout every 50 ms for a
+  vanished reader without writing to it (Linux: `poll` `POLLERR` /
+  `POLLHUP`; macOS: kqueue `EVFILT_WRITE` `EV_EOF`; Windows:
+  `NtQueryInformationFile` pipe state `FILE_PIPE_CLOSING_STATE`).
 - An error (for example `E_STATE`) is printed as one `{"ok": false, ...}`
   line and ends the stream with that error's exit status.
 - `--watch` without `--json` (or `TABA_OUTPUT=json`) is rejected with

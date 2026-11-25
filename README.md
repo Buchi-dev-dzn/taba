@@ -557,8 +557,8 @@ single quotes). The exit status follows the code:
   be watched.
 - **It ends with exit 0** on Ctrl+C (SIGINT; on Windows also Ctrl+Break) and
   when its stdout is closed, for example when the reading program exits.
-  On Unix an idle stream notices a closed pipe within a fraction of a
-  second; elsewhere it notices at the next change it tries to print.
+  An idle stream notices a closed pipe within a fraction of a second, so
+  `taba ps --watch --json | head -n 1` returns at once.
 - **Read-only.** Unlike `ps`, watching never renews the caller's lease or
   writes any state.
 - **Errors** are one line too, `{"ok": false, "error": {...}, "warnings": []}`,

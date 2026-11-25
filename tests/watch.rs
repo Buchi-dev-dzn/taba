@@ -215,6 +215,28 @@ fn exits_zero_when_stdout_is_closed() {
     assert_eq!(wait_exit(&mut child), 0);
 }
 
+/// `taba ps --watch --json | head -n 1`: nothing changes after the first
+/// line, yet the stream ends soon after its reader closes the pipe.
+#[test]
+fn exits_zero_when_an_idle_streams_reader_goes_away() {
+    let fx = Fixture::new("watch_idle_closed");
+    run_sleeper(&fx, &fx.wt_a, "s");
+    let mut child = spawn_watch(&fx, &fx.outside, &[]);
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    let mut first = String::new();
+    reader.read_line(&mut first).unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&first).unwrap()["ok"], true);
+    let closed = Instant::now();
+    drop(reader);
+    // No state change from here on: only the closed pipe can end it.
+    assert_eq!(wait_exit(&mut child), 0);
+    assert!(
+        closed.elapsed() < Duration::from_secs(5),
+        "took {:?}",
+        closed.elapsed()
+    );
+}
+
 #[test]
 fn rejects_bad_usage() {
     let fx = Fixture::new("watch_usage");
