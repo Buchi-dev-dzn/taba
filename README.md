@@ -220,9 +220,15 @@ holder:
 **Read logs.** stdout and stderr go to one log file per service:
 
 ```sh
-taba logs billing/web       # print the log
-taba logs billing/web -f    # follow it until the service exits
+taba logs billing/web                       # print the whole log
+taba logs billing/web --tail 100 --json     # read recent lines as JSON
+taba logs billing/web --tail 20 -f          # show recent lines, then follow until exit
 ```
+
+JSON returns up to the last 16 KiB of log data, even with `--tail`. The byte
+limit can start the output mid-line. `bytes_total` reports the log's original
+size in bytes, and `truncated` is true whenever the line or byte limit omits
+earlier data. Use `--tail 0 -f` to follow only new output.
 
 ![taba logs printing a service's log](docs/images/logs.svg)
 
@@ -441,7 +447,7 @@ If your agent doesn't load skills, paste this into `AGENTS.md` or `CLAUDE.md`:
   that is already running.
 - On an error, read `error.code` and do the first item of `error.next`. Never
   answer `E_PORT_IN_USE` or `E_NOT_OWNER` with `kill`, `pkill` or `--force`.
-- Read output with `taba logs <name>`.
+- Read recent output with `taba logs <name> --tail 100 --json`.
 - Stop only your own scope: `taba stop --scope <scope>`, then clean up with
   `taba rm --scope <scope>`. Never touch other scopes or processes taba
   didn't start.
@@ -513,7 +519,7 @@ that. Measurements against Docker are in [docs/benchmarks.md](docs/benchmarks.md
 | `taba ps --watch --json [--scope S] [--running] [--interval DURATION]` | Keep running and print the `ps --json` document as one line (NDJSON) at once and again whenever it changes, until interrupted. Read-only. See [Watching for changes](#watching-for-changes). |
 | `taba ps --all [--json]` | List every listening TCP port of your user, managed by taba or not: address, pid, command, directory, git worktree and branch, and the taba service if there is one. Read-only. |
 | `taba ui` | Browse every scope's services in a terminal UI; stop, remove, filter and follow logs with the keyboard. See [Terminal UI](#terminal-ui). |
-| `taba logs [-f] S/N` (or `N` in your scope) | Print the log. Add `-f` to follow it until the service exits. With `--json`, the log text is in `log` (not with `-f`). |
+| `taba logs S/N [--tail N] [-f] [--json]` (or a bare name in your scope) | Print the log, or its last `N` lines. Add `-f` to follow it until the service exits. `--json` returns up to 16 KiB of log data in `log` and is incompatible with `-f`. |
 | `taba stop S/N` (or `N` in your scope) | Stop one service of your own scope. |
 | `taba stop --scope S` | Stop every service in scope `S`. |
 | `taba stop ... --timeout SECS` | Seconds to wait between SIGTERM and SIGKILL (Windows: Ctrl+Break and job termination; default 5). |
