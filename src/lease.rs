@@ -579,3 +579,149 @@ pub fn cmd_keep(
     out.warnings = warnings;
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const T0: u64 = 1_800_000_000;
+
+    /// A record whose holder has no recorded pid, so its state depends only
+    /// on the injected `now` and the lease fields.
+    fn record(ttl: Option<u64>) -> ScopeRecord {
+        let mut r = ScopeRecord {
+            scope: "wt-a-1234".into(),
+            source: Some("git".into()),
+            worktree: None,
+            branch: Some("a".into()),
+            holder: Holder {
+                agent: "a1".into(),
+                pid: None,
+                pid_start_time: None,
+            },
+            lease: LeaseRec {
+                ttl_secs: None,
+                ttl_source: "default".into(),
+                renewed_at: rfc3339(T0),
+                expires_at: None,
+                ended_at: None,
+                end_reason: None,
+            },
+            keep: false,
+            keep_reason: None,
+            created_at: rfc3339(T0),
+            moves: Vec::new(),
+            notices: Vec::new(),
+        };
+        r.set_ttl(Ttl::from_secs(ttl), TtlSource::Config);
+        r.renew(T0);
+        r
+    }
+
+    #[test]
+    fn ttl_lease_is_live_until_expiry_then_expired_since_expiry() {
+        let r = record(Some(60));
+        assert_eq!(
+            r.lease.expires_at.as_deref(),
+            Some(rfc3339(T0 + 60).as_str())
+        );
+        assert_eq!(r.state(T0), LeaseState::Live);
+        assert_eq!(r.state(T0 + 59), LeaseState::Live);
+        let expired = LeaseState::Expired {
+            why: "ttl_expired",
+            since: T0 + 60,
+        };
+        assert_eq!(r.state(T0 + 60), expired);
+        // Grace counts from the expiry, not from when it was noticed.
+        assert_eq!(r.state(T0 + 3_600), expired);
+    }
+
+    #[test]
+    fn no_ttl_lease_never_expires_by_time() {
+        let r = record(None);
+        assert_eq!(r.ttl(), Ttl::None);
+        assert!(r.lease.expires_at.is_none());
+        assert_eq!(r.state(T0 + 10 * 365 * 86_400), LeaseState::Live);
+        assert_eq!(r.lease_json(T0)["ttl"], "none");
+        assert_eq!(r.lease_json(T0)["expires_at"], Value::Null);
+    }
+
+    #[test]
+    fn observe_records_the_end_once_and_renew_clears_it() {
+        let mut r = record(Some(60));
+        assert_eq!(r.observe(T0 + 10), (LeaseState::Live, false));
+        assert!(r.lease.ended_at.is_none());
+
+        let (st, changed) = r.observe(T0 + 100);
+        assert!(changed);
+        assert_eq!(
+            st,
+            LeaseState::Expired {
+                why: "ttl_expired",
+                since: T0 + 60
+            }
+        );
+        assert_eq!(r.lease.ended_at.as_deref(), Some(rfc3339(T0 + 60).as_str()));
+        assert_eq!(r.lease.end_reason.as_deref(), Some("ttl_expired"));
+        // A second observation changes nothing.
+        assert!(!r.observe(T0 + 200).1);
+
+        r.renew(T0 + 300);
+        assert!(r.lease.ended_at.is_none() && r.lease.end_reason.is_none());
+        assert_eq!(r.state(T0 + 300), LeaseState::Live);
+        assert_eq!(
+            r.state(T0 + 360),
+            LeaseState::Expired {
+                why: "ttl_expired",
+                since: T0 + 360
+            }
+        );
+        assert_eq!(r.lease_json(T0 + 300)["state"], "live");
+        assert_eq!(r.lease_json(T0 + 360)["state"], "expired");
+    }
+
+    #[test]
+    fn an_explicit_end_wins_over_the_ttl_and_keeps_its_time() {
+        let mut r = record(Some(3_600));
+        r.lease.ended_at = Some(rfc3339(T0 + 5));
+        r.lease.end_reason = Some("lease_ended".into());
+        let ended = LeaseState::Expired {
+            why: "lease_ended",
+            since: T0 + 5,
+        };
+        assert_eq!(r.state(T0 + 6), ended);
+        assert_eq!(r.state(T0 + 7_200), ended);
+        // An unknown stored reason reads as the holder having gone.
+        r.lease.end_reason = Some("something_else".into());
+        assert!(matches!(
+            r.state(T0 + 6),
+            LeaseState::Expired {
+                why: "holder_pid_gone",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn holder_identity_needs_the_name_and_a_recorded_pid() {
+        let mut r = record(None);
+        let caller = |agent: &str, pid: Option<(i32, u64)>| Caller {
+            scope: Some("wt-a-1234".into()),
+            source: None,
+            worktree: None,
+            branch: None,
+            agent_pid: pid,
+            agent: agent.into(),
+            cwd: PathBuf::from("."),
+        };
+        assert!(r.is_held_by(&caller("a1", None)));
+        assert!(r.is_held_by(&caller("a1", Some((7, 1)))));
+        assert!(!r.is_held_by(&caller("a2", None)));
+        r.holder.pid = Some(7);
+        r.holder.pid_start_time = Some(1);
+        assert!(r.is_held_by(&caller("a1", Some((7, 1)))));
+        assert!(!r.is_held_by(&caller("a1", Some((7, 2)))));
+        assert!(!r.is_held_by(&caller("a1", None)));
+        assert!(!r.is_held_by(&caller("a2", Some((7, 1)))));
+    }
+}
