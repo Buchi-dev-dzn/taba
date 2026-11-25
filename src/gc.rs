@@ -1,7 +1,7 @@
 //! Explicit and bounded lazy cleanup. Never wait while holding the state lock.
 use crate::{
     claims,
-    config::Config,
+    config::{Config, format_duration},
     error::{Output, Result},
     lease::LeaseState,
     proc,
@@ -11,6 +11,20 @@ use crate::{
 use serde_json::json;
 use std::time::Duration;
 
+/// The longest lazy cleanup waits for one service after its graceful stop
+/// request; a slower service is forced by a later cleanup, after `stop_timeout`.
+const LAZY_WAIT: Duration = Duration::from_secs(1);
+/// Seconds past `stop_timeout` after which an earlier stop request is
+/// ignored and a fresh grace period starts.
+const STALE_REQUEST: u64 = 600;
+
+enum Stop {
+    NotRunning,
+    /// Asked to exit; still running.
+    Requested,
+    Done(proc::StopResult),
+}
+
 pub fn collect(
     store: &Store,
     cfg: &Config,
@@ -19,7 +33,9 @@ pub fn collect(
     protected: Option<&str>,
 ) -> Result<Output> {
     let now = now_secs();
-    if !dry && limit == usize::MAX {
+    // `taba gc`, as opposed to the bounded lazy pass inside other commands.
+    let explicit = limit == usize::MAX;
+    if !dry && explicit {
         let _lock = store.lock()?;
         crate::borrows::sweep(store)?;
     }
@@ -87,10 +103,25 @@ pub fn collect(
                 None
             };
             let Some(reason) = reason else {
+                if svc.stop_requested_at.is_some() && !dry {
+                    // No longer due (renewed, moved or kept): forget the request.
+                    let mut current = svc;
+                    current.stop_requested_at = None;
+                    store.put(&current)?;
+                }
                 continue;
             };
             if !crate::borrows::live(store, &svc)?.is_empty() {
                 kept.push(json!({"service":svc.id(),"reason":"borrowed"}));
+                continue;
+            }
+            // A graceful stop request an earlier cleanup sent this instance.
+            let elapsed = svc
+                .stop_requested_at
+                .map(|t| now.saturating_sub(t))
+                .filter(|e| *e <= cfg.stop_timeout.saturating_add(STALE_REQUEST));
+            if !explicit && elapsed.is_some_and(|e| e < cfg.stop_timeout) && svc.is_running() {
+                // Still within its grace period; a later cleanup forces it.
                 continue;
             }
             budget -= 1;
@@ -100,20 +131,58 @@ pub fn collect(
             }
             store.put_op(&svc.scope, &svc.name, &OpLock::mine("stop", "gc"))?;
             drop(lock);
-            let stopped = if svc.is_running() {
-                proc::stop_group(svc.pid, svc.pgid, svc.start_time, Duration::from_secs(1))
-                    .map(|_| ())
+            let grace = Duration::from_secs(cfg.stop_timeout);
+            // Re-verify identity immediately before signalling.
+            let stopped = if !svc.is_running() {
+                Ok(Stop::NotRunning)
+            } else if explicit || elapsed.is_some() {
+                // `taba gc`, or the grace period of an earlier request has
+                // passed: wait out what is left of it, then force.
+                let left = grace.saturating_sub(Duration::from_secs(elapsed.unwrap_or(0)));
+                proc::stop_group(svc.pid, svc.pgid, svc.start_time, left).map(Stop::Done)
             } else {
-                Ok(())
+                // Lazy cleanup inside another command: ask, wait briefly, and
+                // leave a slow service to a later cleanup instead of forcing it.
+                proc::request_stop(svc.pid, svc.pgid, svc.start_time, grace.min(LAZY_WAIT)).map(
+                    |gone| {
+                        if gone {
+                            Stop::Done(proc::StopResult::Terminated)
+                        } else {
+                            Stop::Requested
+                        }
+                    },
+                )
             };
+            if let Ok(Stop::Done(_)) = stopped {
+                // The leader's handle can outlive its job briefly on Windows.
+                proc::wait_for(Duration::from_secs(2), Duration::from_millis(20), || {
+                    !svc.is_running()
+                });
+            }
             let _lock = store.lock()?;
             store.release_op(&svc.scope, &svc.name)?;
-            if stopped.is_ok() && !svc.is_running() {
-                store.remove_record_keep_log(&svc.scope, &svc.name)?;
-                store.append_event(&json!({"at":rfc3339(now_secs()),"event":"gc_drop","service":svc.id(),"reason":reason}))?;
-                services.push(svc.id());
-            } else {
-                errors.push(json!({"service":svc.id(),"message":stopped.err().map_or_else(|| "service still running".into(), |e| e.to_string())}));
+            match stopped {
+                Ok(Stop::Requested) => {
+                    if let Some(mut current) = store.get(&svc.scope, &svc.name)?
+                        && current.instance() == svc.instance()
+                    {
+                        current.stop_requested_at = Some(now_secs());
+                        store.put(&current)?;
+                    }
+                    errors.push(json!({"service":svc.id(),"message":format!("still running after the graceful stop request; forced after {} unless it exits", format_duration(cfg.stop_timeout))}));
+                }
+                Ok(result) if !svc.is_running() => {
+                    let signal = match result {
+                        Stop::Done(proc::StopResult::Terminated) => Some("TERM"),
+                        Stop::Done(proc::StopResult::Killed) => Some("KILL"),
+                        _ => None,
+                    };
+                    store.remove_record_keep_log(&svc.scope, &svc.name)?;
+                    store.append_event(&json!({"at":rfc3339(now_secs()),"event":"gc_drop","service":svc.id(),"reason":reason,"signal":signal}))?;
+                    services.push(svc.id());
+                }
+                Ok(_) => errors.push(json!({"service":svc.id(),"message":"service still running"})),
+                Err(e) => errors.push(json!({"service":svc.id(),"message":e.to_string()})),
             }
         }
         if !services.is_empty() || !errors.is_empty() || (dry && !state.is_live()) {

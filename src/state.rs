@@ -59,6 +59,10 @@ pub struct Service {
     /// Hand-offs of this service between scopes (`service_moved`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub moves: Vec<serde_json::Value>,
+    /// When cleanup sent this instance its graceful stop request (Unix
+    /// seconds); a later cleanup forces it once `stop_timeout` has passed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_requested_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

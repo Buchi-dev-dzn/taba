@@ -563,6 +563,23 @@ pub fn in_group(pid: i32, leader: i32, _pgid: i32, start_time: u64) -> bool {
         .contains(&pid)
 }
 
+/// Asks the service to exit with Ctrl+Break and waits up to `wait`, without
+/// terminating it. Returns whether every process in its job is gone.
+pub fn request_stop(pid: i32, pgid: i32, start_time: u64, wait: Duration) -> io::Result<bool> {
+    let (job, pids) = members(pid, start_time, JOB_OBJECT_QUERY);
+    if pids.is_empty() {
+        return Ok(true);
+    }
+    let remaining = || match &job {
+        Some(j) => job_pids(j),
+        None => members(pid, start_time, JOB_OBJECT_QUERY).1,
+    };
+    pids.iter().take(4).any(|p| send_ctrl_break(*p, pgid));
+    Ok(wait_for(wait, Duration::from_millis(50), || {
+        remaining().is_empty()
+    }))
+}
+
 /// Asks the service to exit with Ctrl+Break, waits up to `timeout`, then
 /// terminates every process in its job.
 pub fn stop_group(

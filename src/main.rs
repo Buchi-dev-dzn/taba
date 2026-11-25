@@ -967,6 +967,7 @@ fn cmd_run(a: RunArgs) -> Result<Output> {
             .service_ttl
             .map(|t| util::rfc3339(util::now_secs().saturating_add(t))),
         moves: Vec::new(),
+        stop_requested_at: None,
     };
     store.put(&svc)?;
     if let Some(borrow) = &delegation {
