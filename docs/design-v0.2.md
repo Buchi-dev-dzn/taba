@@ -663,6 +663,12 @@ Two kinds of lock, with different lifetimes:
    v0.1). It is held only for short read-modify-write steps on the state, and
    never while waiting on a process. v0.1's `run` holds it across the spawn and
    the 200 ms wait. With `--wait` lasting up to minutes, v0.2 must not.
+   Taking it is bounded (issue #46): a command retries for
+   `$TABA_LOCK_TIMEOUT` seconds (default 10), prints `waiting for state lock`
+   on a terminal, and then fails with `E_BUSY` (`details.holder_pid` from
+   `lock.holder`, the pid of the last process that took the lock). `ps` and
+   `logs` only try it once: when it is busy they skip the lease renewal and
+   read without it, so a suspended taba never blocks them.
 2. **Per-service operation lock** (`ops/<scope>/<name>.json`). A record with
    the operation (`stop`, `replace`, `exclusive_borrow`), taba's own pid and
    start time, and an expiry. It is created under the global lock (it is
@@ -829,7 +835,7 @@ goes. taba therefore does not depend on the old agent doing anything.
 | `E_SCOPE_HELD` | 3 | Mutation in the caller's own scope while another agent holds it under a live lease (holder process alive). Names the holder, its pid, last renewal and expiry. | wait: the scope passes automatically once the holder's process ends; ask the coordinator or the human |
 | `E_LEASE_LIVE` | 3 | `move --take` while the lease is live. | wait until the holder ends or `expires_at`; ask the human |
 | `E_LOCKED` | 3 | Another agent holds an exclusive borrow. | retry after `expires_at`, or `--wait-lock SECS` |
-| `E_BUSY` | 3 | Another `stop` or replacing `run` is in flight. | retry; `taba ps S/N` |
+| `E_BUSY` | 3 | Another `stop` or replacing `run` is in flight, or the global state lock stayed held for `$TABA_LOCK_TIMEOUT` (details: `path`, `waited_secs`, `holder_pid` if recorded). | retry; `taba ps S/N` |
 | `E_BORROWED` | 3 | `stop` or `rm` of a service with live borrows from other scopes (decision 3). Details list the borrowers and the claim queue. | `taba disown S/N` (hands it to the first claimant or borrower); `taba move S/N --to <borrower scope>`; ask the human (`--force --reason`) |
 | `E_NO_CLAIMANT` | 3 | `disown` of a service with no live claimant and no borrower. | `taba stop S/N` (nothing depends on it) |
 | `E_DANGLING` | 5 | Borrow's instance is gone (stopped, replaced, or the port now belongs to something else). | `taba borrow S/N` again (new URL in details) |

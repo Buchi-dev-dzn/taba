@@ -99,7 +99,22 @@ impl TabaError {
 
 impl From<io::Error> for TabaError {
     fn from(e: io::Error) -> TabaError {
-        use crate::state::StateFile;
+        use crate::state::{BadLockTimeout, StateFile};
+        if let Some(b) = crate::state::lock_busy(&e) {
+            let mut details = json!({ "path": b.path, "waited_secs": b.waited.as_secs_f64() });
+            if let Some(pid) = b.holder_pid {
+                details["holder_pid"] = json!(pid);
+            }
+            return TabaError::new("E_BUSY", b.to_string())
+                .details(details)
+                .next(Next::just(
+                    "retry; if it stays busy, check that the holder process is not suspended or stuck",
+                ));
+        }
+        if let Some(b) = e.get_ref().and_then(|i| i.downcast_ref::<BadLockTimeout>()) {
+            return TabaError::new("E_CONFIG", b.to_string())
+                .details(json!({ "source": "env", "key": "TABA_LOCK_TIMEOUT", "value": b.0 }));
+        }
         let Some(u) = crate::state::unreadable(&e) else {
             return TabaError::state(e.to_string()).next(Next::just(
                 "check that $TABA_HOME is readable and writable and has free space, then retry",

@@ -555,7 +555,7 @@ single quotes). The exit status follows the code:
 | `E_USAGE`, `E_INVALID_IDENT`, `E_FORCE_NEEDS_REASON` | 2 | Bad flags or names (an argument error names the flag in `details.arguments` and points `next` at that command's `--help`); `--force` without `--reason`. |
 | `E_NO_SCOPE` | 2 | No `--scope`, no `$TABA_SCOPE`, and not inside a git worktree. |
 | `E_NOT_OWNER` | 3 | The service belongs to another scope. |
-| `E_BUSY` | 3 | Another `stop` or starting `run` of that service is in progress. |
+| `E_BUSY` | 3 | Another `stop` or starting `run` of that service is in progress, or another taba process held the state lock for the whole lock timeout (`details.holder_pid` when recorded). |
 | `E_CONFLICT` | 3 | Same name already running with a different command, directory or port. |
 | `E_STILL_RUNNING` | 3 | `rm` of a running service. |
 | `E_PORT_IN_USE`, `E_PORT_CLAIMED` | 4 | The port is held by a process, or reserved by another taba service. |
@@ -690,6 +690,7 @@ restarts the process.
 | `TABA_AGENT` | Name of the acting agent, recorded with services and `--force` events (default `human`). |
 | `TABA_OUTPUT` | `json` makes every command print JSON (except `logs -f`, which streams text). |
 | `TABA_HOME` | State directory (default `~/.taba`). |
+| `TABA_LOCK_TIMEOUT` | Seconds a command waits for the state lock before `E_BUSY` (default `10`, `0` = try once). |
 | `TABA_SCOPE`, `TABA_SERVICE`, `PORT` | Set *inside* each started process: its scope, its service name and (with `--port`) its port. |
 
 ### State and logs
@@ -702,7 +703,8 @@ $TABA_HOME (default ~/.taba)
 ├── events.jsonl                   # audit log of --force overrides
 ├── version                        # state schema version (2)
 ├── btime/                         # Linux boot-time cache and recovery copies
-└── lock                           # serialises changes to the state
+├── lock                           # serialises changes to the state
+└── lock.holder                    # pid of the last taba that took the lock
 ```
 
 On macOS and Linux the state directory and every directory under it are
@@ -712,6 +714,12 @@ database URLs. An existing `$TABA_HOME` that others can read (one created by
 an older taba) is tightened to 0700 the next time taba opens it, if you own
 it. On Windows the state inherits the permissions of its parent folder (your
 user profile by default).
+
+The state lock is held only for short steps. A command that needs it waits
+at most `$TABA_LOCK_TIMEOUT` seconds (default 10; `0` tries once), says
+`waiting for state lock` on a terminal after half a second, and then fails
+with `E_BUSY`, so a suspended or stuck taba cannot hang every agent. `ps`
+and `logs` never wait: when the lock is busy they skip the lease renewal.
 
 State written by taba 0.1 is read unchanged.
 

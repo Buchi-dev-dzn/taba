@@ -85,7 +85,7 @@ it (it needs a terminal and waits for keys). Point the human to it instead.
 | `E_NOT_READY` | `--wait` timed out; the process still runs. | `taba logs <name> --tail 100 --json`; `taba stop <name>` if it is stuck. |
 | `E_CONFLICT` | The name already runs with another command, directory or port. | `taba stop <name>` and run again, or use another `--name`. |
 | `E_NOT_OWNER` | The service belongs to another scope. | Use its URL read-only, or ask the human. |
-| `E_BUSY` | Someone else is stopping or starting that service right now. | Wait, then `taba ps --scope <scope> --json`. |
+| `E_BUSY` | Someone else is stopping or starting that service right now, or another taba held the state lock too long (`details.holder_pid`). | Wait, then `taba ps --scope <scope> --json` and retry. |
 
 ## Choosing a scope
 
