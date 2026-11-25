@@ -179,13 +179,14 @@ fn header(app: &App, colors: Colors, width: u16) -> Vec<Line<'static>> {
         .collect()
 }
 
-/// `45s`, `12m`, `2h`, `3d`; `-` when unknown.
+/// `45s`, `12m`, `2h`, `3d`; `-` when unknown. A start slightly in the
+/// future (clock skew, as under WSL) counts as `0s`.
 pub fn age(now: u64, start_micros: u64) -> String {
     let start = start_micros / 1_000_000;
-    if start == 0 || now < start {
+    if start == 0 || now == 0 {
         return "-".into();
     }
-    let s = now - start;
+    let s = now.saturating_sub(start);
     match s {
         0..60 => format!("{s}s"),
         60..3600 => format!("{}m", s / 60),
@@ -641,6 +642,18 @@ mod tests {
             Colors::Off
         );
         assert_eq!(Colors::from_env(env(&[("NO_COLOR", "")])), Colors::Ansi256);
+    }
+
+    #[test]
+    fn ages() {
+        let now = 1_800_000_000;
+        let at = |s: u64| s * 1_000_000;
+        assert_eq!(age(now, at(now - 45)), "45s");
+        assert_eq!(age(now, at(now - 12 * 60)), "12m");
+        assert_eq!(age(now, at(now - 2 * 3600 - 59)), "2h");
+        assert_eq!(age(now, at(now - 3 * 86400)), "3d");
+        assert_eq!(age(now, at(now + 2)), "0s");
+        assert_eq!(age(now, 0), "-");
     }
 
     #[test]
