@@ -69,6 +69,8 @@ const MANAGED_PARTS: &[&str] = &[
     "/target/release/",
 ];
 
+const NO_CURRENT_RELEASE: &str = "The running version has no matching stable official release.";
+
 pub(super) fn update(
     fetch: &impl Fetch,
     current: &Version,
@@ -107,18 +109,20 @@ pub(super) fn update_at(
         return Ok(manual(version, reason));
     }
     // Provenance: the official archive for the *running* version must contain these exact bytes.
-    let bytes = fetch.get(
+    // A source build of an unreleased version has no release to compare
+    // against (GitHub answers 404): that is a manual update, not a failure.
+    let bytes = match fetch.get(
         super::Download::Api,
         api_tag(&format!("v{current}")),
         METADATA_LIMIT,
-    )?;
+    ) {
+        Err(e) if super::is_not_found(&e) => return Ok(manual(version, NO_CURRENT_RELEASE)),
+        res => res?,
+    };
     let installed: Release =
         serde_json::from_slice(&bytes).map_err(|_| failure("invalid GitHub release metadata"))?;
     if installed.stable_version().as_ref() != Some(current) {
-        return Ok(manual(
-            version,
-            "The running version has no matching stable official release.",
-        ));
+        return Ok(manual(version, NO_CURRENT_RELEASE));
     }
     let official_current = archive::verified_binary(fetch, &installed, target)?;
     let new = archive::verified_binary(fetch, release, target)?;

@@ -26,7 +26,7 @@ impl Fetch for Mock {
         let body = self
             .responses
             .get(url.as_str())
-            .ok_or_else(|| failure(format!("GitHub release request returned HTTP 404 ({url})")))?;
+            .ok_or_else(|| failure(format!("{HTTP_NOT_FOUND} Not Found ({url})")))?;
         read_bounded(body.as_slice(), limit)
     }
 }
@@ -772,8 +772,16 @@ mod linux_install {
     }
 
     fn run_update(mock: &Mock, exe: &std::path::Path, release: &Release) -> Result<Output> {
+        run_update_with(mock, exe, release)
+    }
+
+    fn run_update_with(
+        fetch: &impl Fetch,
+        exe: &std::path::Path,
+        release: &Release,
+    ) -> Result<Output> {
         super::super::install::update_at(
-            mock,
+            fetch,
             exe,
             &v("0.2.1"),
             release,
@@ -847,8 +855,29 @@ mod linux_install {
         let (_, release) = fixture(&elf(62), &elf(62));
         let (_dir, exe) = install_dir();
         fs::write(&exe, elf(62)).unwrap();
-        // No metadata for the running version: the request fails, nothing is touched.
-        assert!(run_update(&Mock::default(), &exe, &release).is_err());
+        // No release for the running version (a source build of an unreleased
+        // version; GitHub answers 404): a manual update, nothing is touched.
+        let out = run_update(&Mock::default(), &exe, &release).unwrap();
+        assert_eq!(out.body["status"], "manual_update");
+        assert_eq!(
+            out.body["reason"],
+            "The running version has no matching stable official release."
+        );
+        assert_eq!(fs::read(&exe).unwrap(), elf(62));
+
+        // Any other failure to read that metadata is still an error.
+        struct Down;
+        impl Fetch for Down {
+            fn get(&self, _: Download, _: Url, _: usize) -> Result<Vec<u8>> {
+                Err(failure(
+                    "GitHub release request returned HTTP 503 Service Unavailable",
+                ))
+            }
+        }
+        match run_update_with(&Down, &exe, &release) {
+            Err(e) => assert_eq!(e.code, "E_UPDATE_FAILED"),
+            Ok(out) => panic!("expected E_UPDATE_FAILED, got {:?}", out.body),
+        }
         assert_eq!(fs::read(&exe).unwrap(), elf(62));
     }
 }
@@ -1230,6 +1259,23 @@ fn live_github_v0_2_0_archive_verifies() {
         binary.len(),
         sha(&binary)
     );
+}
+
+#[test]
+fn only_http_404_counts_as_not_found() {
+    assert!(is_not_found(&failure(format!(
+        "{HTTP_NOT_FOUND} Not Found"
+    ))));
+    assert!(!is_not_found(&failure(
+        "GitHub release request returned HTTP 500 Internal Server Error"
+    )));
+    assert!(!is_not_found(&failure(
+        "GitHub release request failed: timeout"
+    )));
+    assert!(!is_not_found(&TabaError::new(
+        "E_STATE",
+        format!("{HTTP_NOT_FOUND} Not Found")
+    )));
 }
 
 #[test]

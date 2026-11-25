@@ -23,6 +23,15 @@ fn failure(message: impl Into<String>) -> TabaError {
     TabaError::new("E_UPDATE_FAILED", message)
 }
 
+/// How a request that GitHub answered with 404 Not Found fails.
+const HTTP_NOT_FOUND: &str = "GitHub release request returned HTTP 404";
+
+/// Whether `e` is a request failure because the resource does not exist.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn is_not_found(e: &TabaError) -> bool {
+    e.code == "E_UPDATE_FAILED" && e.message.starts_with(HTTP_NOT_FOUND)
+}
+
 fn manual(version: &Version, reason: &str) -> Output {
     Output::new(
         json!({"status": "manual_update", "available": version.to_string(),
@@ -225,6 +234,9 @@ impl Fetch for GitHub {
                     }
                 }
                 return Err(failure("refused unexpected GitHub release redirect"));
+            }
+            if response.status() == reqwest::StatusCode::NOT_FOUND {
+                return Err(failure(format!("{HTTP_NOT_FOUND} Not Found")));
             }
             if response.status() != reqwest::StatusCode::OK {
                 return Err(failure(format!(
