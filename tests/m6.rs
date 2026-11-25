@@ -106,3 +106,81 @@ fn session_hooks_set_identity_and_end_its_lease_without_signalling() {
     assert_eq!(f.ps(&[])[0]["lease"]["state"], "expired");
     assert!(http_ok(port_of(&web)));
 }
+
+/// Command shapes the guard must resolve to the same decision as their plain
+/// forms. The strings are only parsed by the hook, never run.
+#[test]
+fn equivalent_command_shapes_get_the_same_decision() {
+    let f = Fixture::new("shapes");
+    let b = json(&f.taba(&f.wt_b, &run_auto("api")));
+    let (port, pid) = (port_of(&b), b["pid"].clone());
+    let scope = b["scope"].as_str().unwrap().to_string();
+    let other = (21_000..30_000).find(|p| port_free(*p)).unwrap();
+    let run =
+        |harness: &str, command: &str| hook(&f, &f.wt_a, harness, "pre-tool-use", command, None);
+    let unchecked = || {
+        f.events()
+            .iter()
+            .filter(|e| e["event"] == "hook_unchecked")
+            .count()
+    };
+    let denied = [
+        format!("lsof -ti tcp:{port} | xargs kill"),
+        format!("lsof -t -i :{port} | xargs kill"),
+        format!("lsof -ti:{port},{other} | xargs kill"),
+        format!("lsof -ti:{port} | xargs -r kill"),
+        format!("lsof -ti:{port} 2>/dev/null | xargs kill -9"),
+        format!("kill -9 $(lsof -ti:{port})"),
+        format!("kill -9 \"$(lsof -t -i :{port} -sTCP:LISTEN)\""),
+        "kill $(pgrep -f http.server)".to_string(),
+        format!("sudo kill {pid}"),
+        format!("command kill {pid}"),
+        format!("timeout 5 kill {pid}"),
+        format!("env A=1 kill -s TERM {pid}"),
+        format!("A=1 nohup kill -- {pid}"),
+        "pkill -9 -f http.server".to_string(),
+        "pkill --signal TERM -f http.server".to_string(),
+        format!("fuser -k {port}/tcp"),
+        format!("npx -y kill-port --port {port}"),
+    ];
+    for cmd in &denied {
+        let out = run("claude-code", cmd);
+        assert_eq!(decision(&out), "deny", "{cmd}: {out}");
+        // Pattern matches may hit other tests' servers first.
+        if !cmd.contains("http.server") {
+            assert!(out.to_string().contains(&scope), "{cmd}: {out}");
+        }
+    }
+    // Acting as another agent on taba's own stop is confirmed, like --force.
+    for cmd in [
+        format!("TABA_AGENT=claude-code:other taba stop --scope {scope}"),
+        format!("taba stop --scope {scope} --agent claude-code:other"),
+        format!("export TABA_AGENT=human; taba stop --scope {scope}"),
+    ] {
+        assert_eq!(decision(&run("claude-code", &cmd)), "ask", "{cmd}");
+        assert_eq!(decision(&run("codex", &cmd)), "deny", "{cmd}");
+    }
+    // The session's own identity, and read-only commands, need no decision.
+    for cmd in [
+        "TABA_AGENT=claude-code:worker-a taba ps",
+        "taba ps --agent claude-code:other",
+        "cargo test 2>&1 | tail -n 5",
+    ] {
+        let before = unchecked();
+        assert!(decision(&run("claude-code", cmd)).is_null(), "{cmd}");
+        assert_eq!(unchecked(), before, "{cmd}");
+    }
+    // Shapes the guard can't resolve defer to the harness and are recorded.
+    for cmd in [
+        "cat pids.txt | xargs kill",
+        "lsof -ti:$PORT | xargs kill",
+        "kill $(cat server.pid)",
+        "pkill -u nobody python",
+        "sh -c 'kill 1'",
+    ] {
+        let before = unchecked();
+        assert!(decision(&run("claude-code", cmd)).is_null(), "{cmd}");
+        assert_eq!(unchecked(), before + 1, "{cmd}");
+    }
+    assert!(http_ok(port));
+}

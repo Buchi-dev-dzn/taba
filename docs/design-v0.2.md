@@ -1466,12 +1466,22 @@ never rewrites the command (no `updatedInput`), and it is fast: no network,
 one `lsof` at most.
 
 1. Tokenise the command with shell quoting rules and split on `;`, `&&`,
-   `||` and `|`. Find these patterns:
-   - `kill [-SIG] PID…` and `kill -- -PGID`
-   - `kill $(lsof -t -i:PORT …)` and `lsof -ti:PORT | xargs kill`
-   - `fuser -k PORT/tcp` and `npx kill-port PORT`
-   - `pkill [-f] PATTERN` and `killall NAME`
+   `||` and `|`. Drop redirections, parse `$(…)` and backticks (without
+   running them), and strip `NAME=value` prefixes, shell keywords and
+   wrappers (`sudo`, `doas`, `command`, `env`, `exec`, `nohup`, `nice`,
+   `timeout N`, `stdbuf`, `setsid`, `time`) to reach the program that runs.
+   Find these patterns:
+   - `kill [-SIG | -s SIG] PID…` and `kill -- -PGID`
+   - `kill $(lsof -t -i…)`, `kill $(pgrep …)`, and `lsof -t -i… | xargs
+     [OPTIONS] kill` (address forms `:P`, `tcp:P`, `-iTCP:P`, comma lists
+     and short ranges, with `-sTCP:LISTEN`, `-n`, `-P`)
+   - `fuser -k PORT/tcp` and `kill-port PORT` (directly or through `npx`,
+     `pnpx`, `bunx`, `pnpm dlx`, `yarn dlx`)
+   - `pkill [-SIG | -s SIG] [-f] PATTERN` and `killall [-SIG] NAME`
    - `taba … --force` and `taba move … --take --force`
+   - `taba` commands that act as another agent: `--agent X`, a
+     `TABA_AGENT=X` prefix or assignment, `export`, `unset` or `env -i`/`-u`,
+     when X is not the hook's own session identity
 2. Resolve the targets **read-only**: literal pids directly; ports through
    `lsof` (taba runs the `lsof` itself, it does not run the agent's
    pipeline); `pkill` and `killall` patterns by matching `proc::argv` of the
@@ -1491,7 +1501,8 @@ one `lsof` at most.
    | unmanaged process listening on a TCP port, or whose cwd is in another git worktree | **deny** (decision 5), with `next`: `--port auto`, or ask the human, who can stop it themselves |
    | any other unmanaged process | **allow** |
    | `taba … --force` | **ask** (decision 9): the human confirms or rejects the forced command in the agent's permission prompt; the reason names the target and the `--reason` text |
-   | command not parseable (variables, `eval`, scripts, `sh -c "$X"`) | **allow**, and record `hook_unchecked` in `events.jsonl` |
+   | mutating `taba` command acting as another agent (`whoami`, `ps`, `logs` excepted) | **ask**, like `--force` |
+   | command not parseable (variables, `eval`, scripts, `sh -c "$X"`), or a `kill`, `pkill`, `killall`, `fuser`, `kill-port` or `xargs kill` whose targets can't all be resolved (unknown options, PIDs from files or other commands, `lsof` without a numeric port) | **allow**, and record `hook_unchecked` in `events.jsonl` |
 
 5. Explain. A deny uses `hookSpecificOutput.permissionDecision: "deny"` and
    a `permissionDecisionReason`, which Claude sees. The `--force` case uses
