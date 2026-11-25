@@ -874,8 +874,10 @@ mod linux_install {
                 ))
             }
         }
-        let err = run_update_with(&Down, &exe, &release).unwrap_err();
-        assert_eq!(err.code, "E_UPDATE_FAILED");
+        match run_update_with(&Down, &exe, &release) {
+            Err(e) => assert_eq!(e.code, "E_UPDATE_FAILED"),
+            Ok(out) => panic!("expected E_UPDATE_FAILED, got {:?}", out.body),
+        }
         assert_eq!(fs::read(&exe).unwrap(), elf(62));
     }
 }
