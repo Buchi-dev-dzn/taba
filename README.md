@@ -449,14 +449,14 @@ taba run -i --name repl -- python3 -i
 it, as if you ran it in that terminal. `Ctrl+]` stops typing, and `q` (or
 `Ctrl+C`) leaves the log; the service keeps running either way.
 `taba attach S/N` opens the same view already in input mode. In `taba ui`,
-`i` does the same. Watching is free; typing follows the [ownership
-rules](#ownership-model), as `stop` does.
+`i` does the same. Watching is free; each write checks the [ownership
+rules](#ownership-model) again and stays with the instance you attached to.
 
 **From scripts and agents.**
 
 | Command | What it does |
 | --- | --- |
-| `taba reload S/N` | Reload the dev server the best way taba knows. `flutter run`: SIGUSR1 (hot reload; `--restart`: SIGUSR2, hot restart), which needs no stdin. Vite: `r` + Enter (restarts the server; open pages reload). Anything else: `E_NO_RELOAD`. |
+| `taba reload S/N` | Linux only for a verified `flutter run` leader: SIGUSR1 (hot reload; `--restart`: SIGUSR2, hot restart), no stdin needed. On macOS use Flutter's `r` / `R` keys instead. Vite dev: `r` + Enter (restarts the server; open pages reload). Vite preview and unsupported signal targets return `E_NO_RELOAD`. |
 | `taba send S/N TEXT` | Write `TEXT` and a newline to its stdin (`--no-newline` for none). |
 | `taba send S/N --key K` | Write one key: a character such as `r`, or `enter`, `esc`, `tab`, `space`, `backspace`, `ctrl-X`. |
 | `taba signal S/N USR1\|USR2\|HUP` | Signal the service's main process (works without `--interactive`). |
@@ -465,6 +465,20 @@ rules](#ownership-model), as `stop` does.
 
 Notes:
 
+- **Flutter on macOS.** `reload` and `reload --restart` return
+  `E_NO_RELOAD` without sending a signal. Use `taba attach S/N` and press
+  `r` (hot reload) or `R` (hot restart), or run `taba send S/N --key r`
+  or `taba send S/N --key R`.
+- **Unsupported wrappers and older interactive records.** A wrapper that
+  stays as Flutter's process leader is not a supported signal target. If
+  the service still accepts input, use Flutter's keys. If the wrapper was
+  not detected and the service has no input, or an older interactive
+  record fails FIFO verification, run `taba stop S/N`. Then rerun the
+  original `taba run --interactive ...` command with its original service
+  name, options and arguments (add `--interactive` before the service
+  command, replacing `--no-interactive` if present), then attach or send.
+  Restarting with `--interactive` enables manual input; it does not make
+  the wrapper a supported signal target.
 - **Flutter web: wait for the browser.** `flutter run -d chrome` prints
   `Flutter run key commands` before the browser has connected; a reload in
   that gap only recompiles (`No client connected`). If a script reloads
@@ -630,8 +644,9 @@ If your agent doesn't load skills, paste this into `AGENTS.md` or `CLAUDE.md`:
 - On an error, read `error.code` and do the first item of `error.next`. Never
   answer `E_PORT_IN_USE` or `E_NOT_OWNER` with `kill`, `pkill` or `--force`.
 - Read recent output with `taba logs <name> --tail 100 --json`.
-- After editing a Flutter or Vite app, run `taba reload <name>` (Flutter hot
-  restart: `--restart`), not a restart of the service.
+- After editing a Flutter or Vite app, use `taba reload <name>` (Flutter on
+  Linux or Vite dev), not a restart of the service. For Flutter on macOS,
+  use `taba send <name> --key r` (hot restart: `--key R`).
 - Stop only your own scope: `taba stop --scope <scope>`, then clean up with
   `taba rm --scope <scope>`. Never touch other scopes or processes taba
   didn't start.
@@ -710,7 +725,7 @@ that. Measurements against Docker are in [docs/benchmarks.md](docs/benchmarks.md
 | `taba logs S/N [--tail N] [-f] [--json]` (or a bare name in your scope) | Print the log, or its last `N` lines. Add `-f` to follow it until the service exits; for an interactive service on a terminal, `i` types into it. `--json` returns up to 16 KiB of log data in `log` and is incompatible with `-f`. |
 | `taba attach S/N` | Follow an interactive service's log in input mode; `Ctrl+]` stops typing, `q` quits. From a pipe: forward stdin until EOF. |
 | `taba send S/N TEXT \| --key K [--no-newline]` | Write to an interactive service's stdin. |
-| `taba reload S/N [--restart]` | Hot reload `flutter run` (SIGUSR1; `--restart`: SIGUSR2), restart Vite (`r`). |
+| `taba reload S/N [--restart]` | Hot reload a verified `flutter run` leader on Linux (SIGUSR1; `--restart`: SIGUSR2), or restart Vite dev (`r`). On macOS, send Flutter's `r` / `R` keys instead. |
 | `taba signal S/N USR1\|USR2\|HUP` | Signal a service's main process (macOS, Linux). |
 | `taba stop S/N` (or `N` in your scope) | Stop one service of your own scope. |
 | `taba stop --scope S` | Stop every service in scope `S`. |
@@ -769,7 +784,7 @@ single quotes). The exit status follows the code:
 | `E_BUSY` | 3 | Another `stop` or starting `run` of that service is in progress, or another taba process held the state lock for the whole lock timeout (`details.holder_pid` when recorded). |
 | `E_CONFLICT` | 3 | Same name already running with a different command, directory, port or interactive mode. |
 | `E_NO_INPUT` | 3 | `send` or `attach` to a service that is not interactive (or whose input holder is gone). Restart it with `--interactive`. |
-| `E_NO_RELOAD` | 3 | `reload` of something that is not `flutter run` or Vite. Use `taba send S/N --key ...` with its own key. |
+| `E_NO_RELOAD` | 3 | No supported reload method for this service (including Flutter on macOS, an unverified Flutter signal target, or Vite preview). If the service accepts input, send its manual reload key; Flutter uses `r` (hot reload) and `R` (hot restart). |
 | `E_NOT_RUNNING` | 3 | `send`, `attach`, `reload` or `signal` of a service that has exited. |
 | `E_STILL_RUNNING` | 3 | `rm` of a running service. |
 | `E_PORT_IN_USE`, `E_PORT_CLAIMED` | 4 | The port is held by a process, or reserved by another taba service. |

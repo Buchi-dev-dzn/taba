@@ -1223,6 +1223,35 @@ struct RunArgs {
     prompt: bool,
 }
 
+/// Until the service is published, this invocation owns both processes.
+/// Runs before the state lock and pending terminal are dropped on failure.
+struct PendingStart {
+    service: proc::Spawned,
+    holder: Option<(i32, u64)>,
+    published: bool,
+}
+
+impl Drop for PendingStart {
+    fn drop(&mut self) {
+        if self.published {
+            return;
+        }
+        if let Some((pid, start)) = self.holder
+            && proc::is_alive(pid, start)
+        {
+            let _ = proc::stop_group(pid, pid, start, Duration::from_secs(2));
+        }
+        let proc::Spawned {
+            pid,
+            pgid,
+            start_time,
+        } = self.service;
+        if proc::group_is_ours(pid, pgid, start_time) {
+            let _ = proc::stop_group(pid, pgid, start_time, Duration::from_secs(2));
+        }
+    }
+}
+
 fn cmd_run(mut a: RunArgs) -> Result<Output> {
     let command = std::mem::take(&mut a.command);
     let spec = match runform::command_spec(a.shape, command.clone(), &a.raw) {
@@ -1464,7 +1493,7 @@ fn run_service(a: RunArgs, form: runform::RunForm) -> Result<Output> {
     let log_offset = log.metadata()?.len();
     let log_err = log.try_clone()?;
 
-    let terminal = if interactive {
+    let mut terminal = if interactive {
         Some(input::create(&store, &scope, &name)?)
     } else {
         None
@@ -1513,23 +1542,22 @@ fn run_service(a: RunArgs, form: runform::RunForm) -> Result<Output> {
             start_failed(format!("{id} exited immediately; see taba logs {id}"))
         }
     })?;
+    let mut pending = PendingStart {
+        service: spawned,
+        holder: None,
+        published: false,
+    };
     // Interactive: the holder keeps the terminal open and feeds it input.
-    let input = match (terminal, holder_err) {
-        (Some(t), Some(err)) => match input::spawn_holder(t, &spawned, err) {
-            Ok(i) => Some(i),
-            Err(e) => {
-                let _ = proc::stop_group(
-                    spawned.pid,
-                    spawned.pgid,
-                    spawned.start_time,
-                    Duration::from_secs(2),
-                );
-                return Err(e);
-            }
-        },
+    let input = match (terminal.as_ref(), holder_err) {
+        (Some(t), Some(err)) => {
+            let input = input::spawn_holder(t, &spawned, err)?;
+            pending.holder = Some((input.holder_pid, input.holder_start_time));
+            Some(input)
+        }
         _ => None,
     };
     let pid = spawned.pid;
+    let kind = input::detect(&command, &dir);
     let mut svc = Service {
         scope: scope.clone(),
         name: name.clone(),
@@ -1553,13 +1581,31 @@ fn run_service(a: RunArgs, form: runform::RunForm) -> Result<Output> {
         stop_requested_at: None,
         discovered_ports: Vec::new(),
         input,
+        dev_kind: (kind != input::Kind::Other).then_some(kind),
     };
-    store.put(&svc)?;
-    if let Some(borrow) = &delegation {
-        borrows::rebind(&store, borrow, &svc)?;
-    }
     let op = if replacing { "replace" } else { "start" };
-    store.put_op(&scope, &name, &OpLock::mine(op, &caller.agent))?;
+    let publish = || -> Result<()> {
+        store.put_op(&scope, &name, &OpLock::mine(op, &caller.agent))?;
+        store.put(&svc)?;
+        if let (Some(borrow), Some(previous)) = (&delegation, &existing)
+            && let Err(e) = borrows::rebind(&store, borrow, &svc)
+        {
+            let _ = borrows::rebind(&store, borrow, previous);
+            return Err(e);
+        }
+        Ok(())
+    };
+    if let Err(e) = publish() {
+        let restored = store.rollback_start(&svc, existing.as_ref());
+        let _ = store.release_op(&scope, &name);
+        restored?;
+        return Err(e);
+    }
+    pending.published = true;
+    if let Some(t) = &mut terminal {
+        t.keep_fifo();
+    }
+    drop(terminal);
     // The port is reserved by the record now; wait without the global lock.
     drop(lock);
 
@@ -2859,6 +2905,7 @@ mod stop_tests {
                 stop_requested_at: None,
                 discovered_ports: Vec::new(),
                 input: None,
+                dev_kind: None,
             })
             .unwrap();
     }

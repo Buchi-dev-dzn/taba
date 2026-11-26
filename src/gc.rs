@@ -341,6 +341,7 @@ mod tests {
             stop_requested_at: None,
             discovered_ports: Vec::new(),
             input: None,
+            dev_kind: None,
         };
         store.put(&svc).unwrap();
         svc

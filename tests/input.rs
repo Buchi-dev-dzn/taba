@@ -68,14 +68,17 @@ mod unix {
             .to_string()
     }
 
-    /// The holder pid from the service record.
-    fn holder_pid(f: &Fixture, svc: &Value) -> i32 {
-        let rec = f
-            .home()
+    fn record_path(f: &Fixture, svc: &Value) -> std::path::PathBuf {
+        f.home()
             .join("services")
             .join(svc["scope"].as_str().unwrap())
-            .join(format!("{}.json", svc["name"].as_str().unwrap()));
-        let rec: Value = serde_json::from_slice(&std::fs::read(rec).unwrap()).unwrap();
+            .join(format!("{}.json", svc["name"].as_str().unwrap()))
+    }
+
+    /// The holder pid from the service record.
+    fn holder_pid(f: &Fixture, svc: &Value) -> i32 {
+        let rec: Value =
+            serde_json::from_slice(&std::fs::read(record_path(f, svc)).unwrap()).unwrap();
         rec["input"]["holder_pid"].as_i64().expect("holder_pid") as i32
     }
 
@@ -85,13 +88,17 @@ mod unix {
         unsafe { libc::kill(pid, 0) == 0 }
     }
 
-    /// An executable `name` in a fresh bin dir, running the Python `body`.
     fn fake_tool(f: &Fixture, name: &str, body: &str) -> String {
+        script_tool(f, name, "/usr/bin/env python3", body)
+    }
+
+    /// An executable script in the fixture's private bin directory.
+    fn script_tool(f: &Fixture, name: &str, interpreter: &str, body: &str) -> String {
         use std::os::unix::fs::PermissionsExt;
         let dir = f.root.join("bin");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(name);
-        std::fs::write(&path, format!("#!/usr/bin/env python3\n{body}")).unwrap();
+        std::fs::write(&path, format!("#!{interpreter}\n{body}")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path.to_str().unwrap().to_string()
     }
@@ -197,6 +204,91 @@ mod unix {
     }
 
     #[test]
+    fn a_piped_attachment_rechecks_permission_for_each_input() {
+        struct ReleaseOnDrop<'a> {
+            fixture: &'a Fixture,
+            id: &'a str,
+            armed: bool,
+        }
+
+        impl Drop for ReleaseOnDrop<'_> {
+            fn drop(&mut self) {
+                if self.armed {
+                    // Release only this fixture's borrow before its owner stops the service.
+                    let _ = self
+                        .fixture
+                        .cmd(&self.fixture.wt_b, &["release", self.id])
+                        .output();
+                }
+            }
+        }
+
+        let f = Fixture::new("input-attach-permission");
+        let svc = start(&f, &f.wt_a, "echo", true);
+        let id = svc["service"].as_str().unwrap();
+        let mut child = f
+            .cmd(&f.wt_a, &["attach", id])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(b"first line\n").unwrap();
+        wait_log(&f, &f.wt_a, id, "got:first line");
+        let mut cleanup = ReleaseOnDrop {
+            fixture: &f,
+            id,
+            armed: true,
+        };
+        let borrow = f.taba(&f.wt_b, &["borrow", id, "--mut"]);
+        assert_eq!(exit(&borrow), 0, "{}", text(&borrow));
+        stdin.write_all(b"second line\n").unwrap();
+        drop(stdin);
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(exit(&out), 3, "{}", text(&out));
+        assert!(!log(&f, &f.wt_a, id).contains("got:second line"));
+        let release = f.taba(&f.wt_b, &["release", id]);
+        assert_eq!(exit(&release), 0, "{}", text(&release));
+        cleanup.armed = false;
+    }
+
+    fn assert_interactive_restart(out: &std::process::Output, id: &str) {
+        let v = json(out);
+        let next = v["error"]["next"].as_array().unwrap();
+        assert!(
+            next.iter().any(|action| {
+                action["command"] == format!("taba stop {id}")
+                    && action["do"]
+                        .as_str()
+                        .unwrap()
+                        .contains("taba run --interactive")
+            }),
+            "{}",
+            text(out)
+        );
+    }
+
+    #[test]
+    fn legacy_input_is_refused_with_restart_instructions() {
+        let f = Fixture::new("input-legacy");
+        let service = start(&f, &f.wt_a, "echo", true);
+        let id = service["service"].as_str().unwrap();
+        let path = record_path(&f, &service);
+        let mut record: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        record["input"]
+            .as_object_mut()
+            .unwrap()
+            .remove("fifo_identity")
+            .unwrap();
+        std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        let out = f.taba(&f.wt_a, &["send", id, "legacy input", "--json"]);
+        assert_eq!(code(&out), "E_NO_INPUT");
+        assert_interactive_restart(&out, id);
+        assert!(!log(&f, &f.wt_a, id).contains("got:legacy input"));
+    }
+
+    #[test]
     fn a_service_without_input_is_refused() {
         let f = Fixture::new("input-none");
         let svc = start(&f, &f.wt_a, "plain", false);
@@ -277,23 +369,38 @@ mod unix {
         wait_log(&f, &f.wt_a, id, "got:owner");
     }
 
-    /// Like `flutter run`: keys in cbreak mode, hot reload on SIGUSR1 and
-    /// hot restart on SIGUSR2.
+    /// Like Flutter: single-key input and an observable receipt of each signal.
     const FAKE_FLUTTER: &str = r#"
-import os, signal, sys, tty
-signal.signal(signal.SIGUSR1, lambda *a: print("reloaded", flush=True))
-signal.signal(signal.SIGUSR2, lambda *a: print("restarted", flush=True))
-print("args=" + " ".join(sys.argv[1:]), flush=True)
-if sys.stdin.isatty():
-    tty.setcbreak(0)
-print("Flutter run key commands.", flush=True)
-while True:
-    c = os.read(0, 1)
-    if not c:
-        print("EOF", flush=True)
-        signal.pause()
-    print("key:" + c.decode(), flush=True)
+trap 'printf "signal:USR1\n"' USR1
+trap 'printf "signal:USR2\n"' USR2
+printf 'Flutter run key commands.\n'
+if [[ -t 0 ]]; then
+    while :; do
+        if IFS= read -r -n 1 key; then
+            printf 'key:%s\n' "$key"
+        fi
+    done
+else
+    printf 'EOF\n'
+    while :; do /bin/sleep 1; done
+fi
 "#;
+
+    // Use system Bash on both Unix platforms. Preserve Dart's argv layout
+    // without renaming/symlinking a Python executable or depending on PATH.
+    fn flutter_launcher(f: &Fixture) -> String {
+        let flutter = script_tool(
+            f,
+            "flutter",
+            "/bin/bash",
+            r#"
+bin_dir=${0%/*}
+exec -a "$bin_dir/dart" /bin/bash "$bin_dir/flutter_tools.snapshot" "$@"
+"#,
+        );
+        std::fs::write(f.root.join("bin/flutter_tools.snapshot"), FAKE_FLUTTER).unwrap();
+        flutter
+    }
 
     /// Like `vite`: line-based shortcuts.
     const FAKE_VITE: &str = r#"
@@ -305,9 +412,9 @@ for line in sys.stdin:
 "#;
 
     #[test]
-    fn flutter_run_is_interactive_by_default_and_reloads_by_signal() {
+    fn flutter_reload_respects_the_platform_policy() {
         let f = Fixture::new("input-flutter");
-        let flutter = fake_tool(&f, "flutter", FAKE_FLUTTER);
+        let flutter = flutter_launcher(&f);
         let out = f.taba(
             &f.wt_a,
             &[
@@ -335,22 +442,56 @@ for line in sys.stdin:
         assert_eq!(exit(&f.taba(&f.wt_a, &["send", &id, "--key", "r"])), 0);
         wait_log(&f, &f.wt_a, &id, "key:r");
 
-        let out = f.taba(&f.wt_a, &["reload", &id, "--json"]);
-        assert_eq!(exit(&out), 0, "{}", text(&out));
-        let v = json(&out);
-        assert_eq!(v["kind"], "flutter");
-        assert_eq!(v["method"], "SIGUSR1");
-        wait_log(&f, &f.wt_a, &id, "reloaded");
-        let out = f.taba(&f.wt_a, &["reload", &id, "--restart", "--json"]);
-        assert_eq!(exit(&out), 0, "{}", text(&out));
-        assert_eq!(json(&out)["method"], "SIGUSR2");
-        wait_log(&f, &f.wt_a, &id, "restarted");
+        let reload = f.taba(&f.wt_a, &["reload", &id, "--json"]);
+        let restart = f.taba(&f.wt_a, &["reload", &id, "--restart", "--json"]);
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(exit(&reload), 0, "{}", text(&reload));
+            let v = json(&reload);
+            assert_eq!(v["kind"], "flutter");
+            assert_eq!(v["method"], "SIGUSR1");
+            wait_log(&f, &f.wt_a, &id, "signal:USR1");
+            assert_eq!(exit(&restart), 0, "{}", text(&restart));
+            assert_eq!(json(&restart)["method"], "SIGUSR2");
+            wait_log(&f, &f.wt_a, &id, "signal:USR2");
+        }
+        #[cfg(target_os = "macos")]
+        {
+            for (out, key) in [(&reload, "r"), (&restart, "R")] {
+                assert_eq!(exit(out), 3, "{}", text(out));
+                let v = json(out);
+                assert_eq!(v["error"]["code"], "E_NO_RELOAD");
+                assert!(
+                    v["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("taba attach")
+                );
+                assert_eq!(
+                    v["error"]["next"][0]["command"],
+                    format!("taba send {id} --key {key}")
+                );
+            }
+            // Both keys still reach the same live instance. The fixture
+            // logs either signal before consuming the next terminal input.
+            for key in ["r", "R"] {
+                let out = f.taba(&f.wt_a, &["send", &id, "--key", key, "--json"]);
+                assert_eq!(exit(&out), 0, "{}", text(&out));
+                assert_eq!(json(&out)["instance"], row["instance"]);
+            }
+            wait_log(&f, &f.wt_a, &id, "key:R");
+            let log = log(&f, &f.wt_a, &id);
+            assert!(!log.contains("signal:USR"), "{log}");
+            let live = f.ps(&[]).into_iter().find(|r| r["service"] == id).unwrap();
+            assert_eq!(live["status"], "running");
+            assert_eq!(live["instance"], row["instance"]);
+        }
 
         // Another scope may not reload it.
         let out = f.taba(&f.wt_b, &["reload", &id, "--json"]);
         assert_eq!(code(&out), "E_NOT_OWNER");
 
-        // --no-interactive: stdin is /dev/null (EOF), but reload still works.
+        // --no-interactive: stdin is /dev/null (EOF), so manual input is refused.
         let out = f.taba(
             &f.wt_a,
             &[
@@ -371,6 +512,12 @@ for line in sys.stdin:
         assert_eq!(json(&out)["interactive"], false);
         let plain = format!("{}/plain", f.scope_of(&f.wt_a));
         wait_log(&f, &f.wt_a, &plain, "EOF");
+        #[cfg(target_os = "macos")]
+        {
+            let out = f.taba(&f.wt_a, &["reload", &plain, "--json"]);
+            assert_eq!(code(&out), "E_NO_RELOAD");
+            assert_interactive_restart(&out, &plain);
+        }
         let out = f.taba(&f.wt_a, &["send", &plain, "x", "--json"]);
         assert_eq!(code(&out), "E_NO_INPUT");
     }
@@ -412,6 +559,89 @@ for line in sys.stdin:
         );
         assert_eq!(exit(&out), 3, "{}", text(&out));
         assert_eq!(code(&out), "E_NO_RELOAD");
+    }
+
+    #[test]
+    fn preview_is_interactive_but_does_not_offer_reload() {
+        let f = Fixture::new("input-preview");
+        let vite = fake_tool(&f, "vite", FAKE_VITE);
+        let out = f.taba(
+            &f.wt_a,
+            &[
+                "run",
+                "--name",
+                "preview",
+                "--wait",
+                "--ready",
+                "log:VITE ready",
+                "--json",
+                "--",
+                &vite,
+                "preview",
+            ],
+        );
+        assert_eq!(exit(&out), 0, "{}", text(&out));
+        let value = json(&out);
+        assert_eq!(value["interactive"], true);
+        let id = value["service"].as_str().unwrap();
+        let out = f.taba(&f.wt_a, &["reload", id, "--json"]);
+        assert_eq!(code(&out), "E_NO_RELOAD");
+    }
+
+    #[test]
+    fn flutter_reload_refuses_a_non_flutter_wrapper_leader() {
+        let f = Fixture::new("input-flutter-wrapper");
+        let fvm = fake_tool(&f, "fvm", SLEEPER);
+        let out = f.taba(
+            &f.wt_a,
+            &[
+                "run",
+                "--name",
+                "app",
+                "--no-interactive",
+                "--wait",
+                "--ready",
+                "log:ready",
+                "--json",
+                "--",
+                &fvm,
+                "flutter",
+                "run",
+            ],
+        );
+        assert_eq!(exit(&out), 0, "{}", text(&out));
+        let value = json(&out);
+        let id = value["service"].as_str().unwrap();
+        let out = f.taba(&f.wt_a, &["reload", id, "--json"]);
+        assert_eq!(exit(&out), 3, "{}", text(&out));
+        assert_eq!(code(&out), "E_NO_RELOAD");
+        assert_interactive_restart(&out, id);
+        assert!(!log(&f, &f.wt_a, id).contains("usr1"));
+    }
+
+    #[test]
+    fn a_failed_interactive_spawn_does_not_leave_a_fifo() {
+        let f = Fixture::new("input-failed-start");
+        let out = f.taba(
+            &f.wt_a,
+            &[
+                "run",
+                "--name",
+                "broken",
+                "--interactive",
+                "--json",
+                "--",
+                "./missing-program",
+            ],
+        );
+        assert_eq!(code(&out), "E_START_FAILED");
+        let fifo = f
+            .home()
+            .join("inputs")
+            .join(f.scope_of(&f.wt_a))
+            .join("broken.fifo");
+        assert!(!fifo.exists());
+        assert!(f.ps(&[]).is_empty());
     }
 
     /// `logs -f` on a terminal: read-only until `i`, Ctrl+] stops typing,

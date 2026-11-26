@@ -150,6 +150,10 @@ pub struct Service {
     /// forwards it to the service's terminal (see `input.rs`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input: Option<Input>,
+    /// Detected at launch, so editing a package script doesn't change what
+    /// `reload` thinks the running service is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dev_kind: Option<crate::input::Kind>,
 }
 
 /// The input side of an interactive service. Its stdin is a pseudo-terminal;
@@ -161,6 +165,10 @@ pub struct Input {
     pub holder_pid: i32,
     /// Holder start time, in the units of `Service::start_time`.
     pub holder_start_time: u64,
+    /// The FIFO opened by this holder (device and inode). Older records
+    /// cannot prove this identity and must be restarted before taking input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fifo_identity: Option<(u64, u64)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -501,6 +509,26 @@ impl Store {
 
     pub fn put(&self, svc: &Service) -> io::Result<()> {
         write_json(&self.record_path(&svc.scope, &svc.name), svc)
+    }
+
+    /// Roll back a failed publish, including errors after the record rename.
+    /// Leave claims and logs in place. Call under the global lock.
+    pub(crate) fn rollback_start(
+        &self,
+        svc: &Service,
+        previous: Option<&Service>,
+    ) -> io::Result<()> {
+        if self
+            .get(&svc.scope, &svc.name)?
+            .is_some_and(|cur| cur.instance() == svc.instance())
+        {
+            if let Some(previous) = previous {
+                self.put(previous)?;
+            } else {
+                remove_file_and_empty_parent(&self.record_path(&svc.scope, &svc.name))?;
+            }
+        }
+        Ok(())
     }
 
     /// The operation lock of `scope/name`, if a record exists (it may be stale).

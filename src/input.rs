@@ -54,7 +54,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// How long a write waits for a service that does not read its stdin.
-#[cfg(unix)]
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// The byte that leaves input mode (Ctrl+]).
 const DETACH: u8 = 0x1d;
@@ -77,12 +76,15 @@ pub fn unsupported(what: &str) -> TabaError {
 // ------------------------------------------------------------ detection
 
 /// Dev servers taba knows how to drive.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Kind {
     /// `flutter run`: `r` hot reload, `R` hot restart; also SIGUSR1/SIGUSR2.
     Flutter,
-    /// `vite` (dev or preview): `r` + Enter restarts the server.
+    /// `vite` dev: `r` + Enter restarts the server.
     Vite,
+    /// Preview accepts terminal shortcuts, but not `r`.
+    VitePreview,
     Other,
 }
 
@@ -90,7 +92,7 @@ impl Kind {
     pub fn name(self) -> &'static str {
         match self {
             Kind::Flutter => "flutter",
-            Kind::Vite => "vite",
+            Kind::Vite | Kind::VitePreview => "vite",
             Kind::Other => "other",
         }
     }
@@ -101,21 +103,25 @@ impl Kind {
 /// `sh -c '...'`) and one level of package.json scripts (`npm run dev`,
 /// `pnpm dev`, `yarn dev`, `bun run dev`).
 pub fn detect(command: &[String], cwd: &Path) -> Kind {
-    detect_words(&split(command), Some(cwd))
+    detect_words(command, Some(cwd), true)
 }
 
-fn split(command: &[String]) -> Vec<String> {
-    command
-        .iter()
-        .flat_map(|w| w.split_whitespace())
-        .map(|w| w.trim_matches(|c| c == '"' || c == '\'').to_string())
-        .collect()
+/// Only parse strings that really are passed to a shell. Do not try to
+/// predict expansion, redirection or which part of a compound command runs.
+fn simple_shell_words(line: &str) -> Option<Vec<String>> {
+    if line.contains([
+        ';', '&', '|', '(', ')', '<', '>', '`', '$', '\n', '\r', '*', '?', '[', '~',
+    ]) {
+        return None;
+    }
+    shlex::split(line)
 }
 
 /// The program name of `word`: lower case, without directory and without
 /// `.exe`/`.bat`/`.cmd`/`.js`/`.mjs`.
 fn base(word: &str) -> String {
-    let file = word.rsplit(['/', '\\']).next().unwrap_or(word);
+    let separators: &[_] = if cfg!(windows) { &['/', '\\'] } else { &['/'] };
+    let file = word.rsplit(separators).next().unwrap_or(word);
     let file = file.to_ascii_lowercase();
     for ext in [".exe", ".bat", ".cmd", ".js", ".mjs"] {
         if let Some(stem) = file.strip_suffix(ext) {
@@ -125,50 +131,109 @@ fn base(word: &str) -> String {
     file
 }
 
-fn first_arg(words: &[String]) -> Option<&str> {
-    words
-        .iter()
-        .map(String::as_str)
-        .find(|w| !w.starts_with('-'))
+fn flutter_run(args: &[String]) -> bool {
+    args.iter().map(String::as_str).find(|a| {
+        !matches!(
+            *a,
+            "-v" | "--verbose" | "--no-version-check" | "--suppress-analytics"
+        )
+    }) == Some("run")
 }
 
-fn detect_words(words: &[String], cwd: Option<&Path>) -> Kind {
-    for (i, w) in words.iter().enumerate() {
-        let rest = &words[i + 1..];
-        match base(w).as_str() {
-            "flutter" if first_arg(rest) == Some("run") => return Kind::Flutter,
-            "vite" if !matches!(first_arg(rest), Some("build" | "optimize")) => {
-                return Kind::Vite;
+fn vite_kind(args: &[String]) -> Kind {
+    // Skip values of common global/dev options so a value is not mistaken
+    // for the command. For unknown options before a positional, fail closed.
+    let mut args = args.iter().map(String::as_str).peekable();
+    while let Some(arg) = args.next() {
+        match arg {
+            "preview" => return Kind::VitePreview,
+            "build" | "optimize" | "-h" | "--help" | "-v" | "--version" => return Kind::Other,
+            "--" => return Kind::Vite,
+            "--port" | "--config" | "-c" | "--mode" | "-m" | "--base" | "--logLevel" | "-l"
+            | "--filter" | "-f" | "--configLoader" => {
+                args.next();
             }
-            pm @ ("npm" | "pnpm" | "yarn" | "bun") => {
-                if let Some(cwd) = cwd
-                    && let Some(script) = script_name(pm, rest)
-                    && let Some(body) = package_script(cwd, script)
-                {
-                    let kind = detect_words(&split(&[body]), None);
-                    if kind != Kind::Other {
-                        return kind;
-                    }
+            "--host" | "--open" | "--debug" | "-d" => {
+                if args.peek().is_some_and(|next| !next.starts_with('-')) {
+                    args.next();
                 }
             }
-            _ => {}
+            "--strictPort" | "--force" | "--clearScreen" | "--cors" => {}
+            opt if opt.starts_with('-') && opt.contains('=') => {}
+            opt if opt.starts_with('-') => return Kind::Other,
+            // The Vite command or root positional. Later args cannot name the command.
+            _ => return Kind::Vite,
         }
     }
-    Kind::Other
+    Kind::Vite
 }
 
-/// The package.json script a package-manager call runs, if any.
-fn script_name<'a>(pm: &str, rest: &'a [String]) -> Option<&'a str> {
-    let mut args = rest
-        .iter()
-        .map(String::as_str)
-        .filter(|w| !w.starts_with('-'));
-    match (pm, args.next()?) {
-        (_, "run" | "run-script") => args.next(),
-        ("npm", "start") => Some("start"),
-        ("npm", _) => None,
-        (_, script) => Some(script),
+fn detect_words(words: &[String], cwd: Option<&Path>, wrappers: bool) -> Kind {
+    let Some((program, args)) = words.split_first() else {
+        return Kind::Other;
+    };
+    match base(program).as_str() {
+        "flutter" if flutter_run(args) => Kind::Flutter,
+        "vite" => vite_kind(args),
+        "node"
+            if args
+                .first()
+                .is_some_and(|s| matches!(s.rsplit('/').next(), Some("vite.js" | "vite.mjs"))) =>
+        {
+            vite_kind(&args[1..])
+        }
+        "fvm" if args.first().is_some_and(|s| s == "flutter") && flutter_run(&args[1..]) => {
+            Kind::Flutter
+        }
+        "npx" | "bunx" if wrappers => {
+            let args = after_option(args, "--yes");
+            let args = after_option(args, "--");
+            detect_words(args, None, false)
+        }
+        "sh" | "bash" | "zsh" if wrappers && args.first().is_some_and(|s| s == "-c") => args
+            .get(1)
+            .and_then(|s| simple_shell_words(s))
+            .map_or(Kind::Other, |args| {
+                let command = if args.first().is_some_and(|s| s == "exec") {
+                    &args[1..]
+                } else {
+                    &args
+                };
+                detect_words(command, cwd, false)
+            }),
+        pm @ ("npm" | "pnpm" | "yarn" | "bun") => {
+            let Some((script, forwarded)) = script_invocation(pm, args) else {
+                return Kind::Other;
+            };
+            cwd.and_then(|cwd| package_script(cwd, script))
+                .and_then(|body| simple_shell_words(&body))
+                .map_or(Kind::Other, |mut words| {
+                    words.extend_from_slice(after_option(forwarded, "--"));
+                    detect_words(&words, None, true)
+                })
+        }
+        _ => Kind::Other,
     }
+}
+
+fn after_option<'a>(args: &'a [String], option: &str) -> &'a [String] {
+    if args.first().is_some_and(|arg| arg == option) {
+        &args[1..]
+    } else {
+        args
+    }
+}
+
+/// The package.json script and its extra args, not arbitrary tokens beyond it.
+fn script_invocation<'a>(pm: &str, args: &'a [String]) -> Option<(&'a str, &'a [String])> {
+    let (subcommand, rest) = args.split_first()?;
+    let (script, forwarded) = match (pm, subcommand.as_str()) {
+        (_, "run" | "run-script") => rest.split_first()?,
+        ("npm", "start") => (subcommand, rest),
+        ("npm", _) => return None,
+        _ => (subcommand, rest),
+    };
+    (!script.starts_with('-')).then_some((script, forwarded))
 }
 
 fn package_script(cwd: &Path, script: &str) -> Option<String> {
@@ -181,12 +246,32 @@ fn package_script(cwd: &Path, script: &str) -> Option<String> {
 
 /// The terminal of an interactive service being started.
 pub struct Terminal {
-    pub fifo: PathBuf,
+    fifo: PendingFifo,
     /// The PTY slave: the child's stdin.
     pub stdin: File,
     master: File,
     /// The FIFO, opened for reading (and writing, so it never reaches EOF).
     reader: File,
+}
+
+struct PendingFifo {
+    path: PathBuf,
+    keep: bool,
+}
+
+impl Drop for PendingFifo {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = crate::state::remove_file_and_empty_parent(&self.path);
+        }
+    }
+}
+
+impl Terminal {
+    /// The service record now owns cleanup of the FIFO.
+    pub fn keep_fifo(&mut self) {
+        self.fifo.keep = true;
+    }
 }
 
 /// Creates the input FIFO of `scope/name` (replacing a stale one) and a PTY
@@ -211,13 +296,21 @@ pub fn create(store: &Store, scope: &str, name: &str) -> Result<Terminal> {
     if unsafe { libc::mkfifo(c.as_ptr(), 0o600) } != 0 {
         return Err(os("create the input FIFO"));
     }
+    let fifo = PendingFifo { path, keep: false };
     // Read-write: opening does not wait for a writer, and the holder never
     // reads EOF while nobody is sending.
     let reader = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(&path)
-        .map_err(|e| TabaError::state(format!("cannot open {}: {e}", path.display())))?;
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(&fifo.path)
+        .map_err(|e| TabaError::state(format!("cannot open {}: {e}", fifo.path.display())))?;
+    if fifo_identity(&reader).is_none() {
+        return Err(TabaError::state("cannot identify the newly opened FIFO"));
+    }
+    if unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, 0) } == -1 {
+        return Err(os("configure the input FIFO"));
+    }
 
     let fd = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
     if fd < 0 {
@@ -225,8 +318,8 @@ pub fn create(store: &Store, scope: &str, name: &str) -> Result<Terminal> {
     }
     let master = unsafe { File::from_raw_fd(fd) };
     let m = master.as_raw_fd();
-    unsafe {
-        libc::fcntl(m, libc::F_SETFD, libc::FD_CLOEXEC);
+    if unsafe { libc::fcntl(m, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+        return Err(os("configure the pseudo-terminal"));
     }
     if unsafe { libc::grantpt(m) } != 0 || unsafe { libc::unlockpt(m) } != 0 {
         return Err(os("set up the pseudo-terminal"));
@@ -261,7 +354,7 @@ pub fn create(store: &Store, scope: &str, name: &str) -> Result<Terminal> {
         libc::ioctl(m, libc::TIOCSWINSZ, &ws);
     }
     Ok(Terminal {
-        fifo: path,
+        fifo,
         stdin,
         master,
         reader,
@@ -276,12 +369,14 @@ pub fn create(_store: &Store, _scope: &str, _name: &str) -> Result<Terminal> {
 /// Starts the holder of the service `spawned` (see the module docs);
 /// `stderr` is the service's log.
 #[cfg(unix)]
-pub fn spawn_holder(t: Terminal, spawned: &crate::proc::Spawned, stderr: File) -> Result<Input> {
+pub fn spawn_holder(t: &Terminal, spawned: &crate::proc::Spawned, stderr: File) -> Result<Input> {
     use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     let exe = std::env::current_exe()
         .map_err(|e| TabaError::state(format!("cannot find the taba executable: {e}")))?;
+    let identity = fifo_identity(&t.reader)
+        .ok_or_else(|| TabaError::state("cannot identify the input holder's FIFO"))?;
     let (m, r) = (t.master.as_raw_fd(), t.reader.as_raw_fd());
     let mut cmd = Command::new(exe);
     cmd.arg("__hold")
@@ -313,14 +408,19 @@ pub fn spawn_holder(t: Terminal, spawned: &crate::proc::Spawned, stderr: File) -
         )
     })?;
     Ok(Input {
-        fifo: t.fifo,
+        fifo: t.fifo.path.clone(),
         holder_pid: holder.pid,
         holder_start_time: holder.start_time,
+        fifo_identity: Some(identity),
     })
 }
 
 #[cfg(windows)]
-pub fn spawn_holder(_t: Terminal, _spawned: &crate::proc::Spawned, _stderr: File) -> Result<Input> {
+pub fn spawn_holder(
+    _t: &Terminal,
+    _spawned: &crate::proc::Spawned,
+    _stderr: File,
+) -> Result<Input> {
     Err(unsupported("run --interactive"))
 }
 
@@ -341,7 +441,12 @@ pub fn hold(master: i32, fifo: i32, pid: i32, pgid: i32, start_time: u64) -> u8 
         }
     }
     let mut drain = unsafe { File::from_raw_fd(master) };
-    let mut fifo = unsafe { File::from_raw_fd(fifo) };
+    let fifo_pin = unsafe { File::from_raw_fd(fifo) };
+    // Keep the inode pinned even if the forwarding thread exits first.
+    let Ok(mut fifo) = fifo_pin.try_clone() else {
+        eprintln!("taba __hold: cannot duplicate the FIFO");
+        return 1;
+    };
     let Ok(mut to_master) = drain.try_clone() else {
         eprintln!("taba __hold: cannot duplicate the terminal");
         return 1;
@@ -360,6 +465,8 @@ pub fn hold(master: i32, fifo: i32, pid: i32, pgid: i32, start_time: u64) -> u8 
                 Err(_) => break,
             }
         }
+        // Do not keep accepting FIFO writes after forwarding has failed.
+        std::process::exit(1);
     });
     // With echo off this is usually silent; draining keeps a program that
     // writes to its terminal from blocking.
@@ -382,65 +489,66 @@ pub fn hold(master: i32, fifo: i32, pid: i32, pgid: i32, start_time: u64) -> u8 
 
 // ------------------------------------------------------------ writing
 
-/// Writes `bytes` to the service's input without blocking forever on a
-/// service that does not read.
 #[cfg(unix)]
-pub fn write(svc: &Service, input: &Input, bytes: &[u8]) -> Result<()> {
+fn fifo_identity(file: &File) -> Option<(u64, u64)> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let m = file.metadata().ok()?;
+    m.file_type().is_fifo().then(|| (m.dev(), m.ino()))
+}
+
+/// One nonblocking write under the same state lock that authorised `svc`.
+/// Reopen and verify the descriptor before every attempt, not just the path.
+#[cfg(unix)]
+fn try_write(store: &Store, svc: &Service, bytes: &[u8]) -> Result<usize> {
     use std::io::{ErrorKind, Write};
-    use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
-    let path = &input.fifo;
-    let is_fifo = path
+    use std::os::unix::fs::OpenOptionsExt;
+    let input = svc.input.as_ref().ok_or_else(|| no_input(svc))?;
+    let path = store.input_path(&svc.scope, &svc.name);
+    let invalid_fifo = || {
+        TabaError::new(
+            "E_NO_INPUT",
+            format!("{}: cannot verify its input FIFO", svc.id()),
+        )
+        .details(json!({ "service": svc.id(), "path": path }))
+        .next(restart_interactive(svc))
+    };
+    let identity = input.fifo_identity.ok_or_else(invalid_fifo)?;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    if !path
         .symlink_metadata()
-        .is_ok_and(|m| m.file_type().is_fifo());
-    if !is_fifo {
-        return Err(no_input(svc).details(json!({ "service": svc.id(), "path": path })));
+        .is_ok_and(|m| m.file_type().is_fifo() && (m.dev(), m.ino()) == identity)
+    {
+        return Err(invalid_fifo());
     }
     let mut f = std::fs::OpenOptions::new()
         .write(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(path)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(&path)
         .map_err(|e| match e.raw_os_error() {
-            // No reader: the holder is gone.
             Some(libc::ENXIO) if svc.is_running() => holder_gone(svc, input),
             Some(libc::ENXIO) => not_running(svc),
+            Some(libc::ENOENT | libc::ELOOP) => invalid_fifo(),
             _ => TabaError::state(format!("cannot open {}: {e}", path.display())),
         })?;
-    let deadline = std::time::Instant::now() + WRITE_TIMEOUT;
-    let mut rest = bytes;
-    while !rest.is_empty() {
-        match f.write(rest) {
-            Ok(n) => rest = &rest[n..],
-            Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                if std::time::Instant::now() >= deadline {
-                    return Err(TabaError::new(
-                        "E_INPUT_BLOCKED",
-                        format!(
-                            "{} is not reading its input; {} of {} bytes were not written",
-                            svc.id(),
-                            rest.len(),
-                            bytes.len()
-                        ),
-                    )
-                    .details(json!({ "service": svc.id(), "unwritten": rest.len() }))
-                    .next(Next::run(
-                        "check the service",
-                        format!("taba logs {}", svc.id()),
-                    )));
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Err(e) if e.kind() == ErrorKind::Interrupted => {}
-            Err(e) if e.raw_os_error() == Some(libc::EPIPE) => {
-                return Err(holder_gone(svc, input));
-            }
-            Err(e) => return Err(TabaError::state(format!("cannot write input: {e}"))),
-        }
+    if fifo_identity(&f) != Some(identity) {
+        return Err(invalid_fifo());
     }
-    Ok(())
+    if !crate::proc::is_alive(input.holder_pid, input.holder_start_time) {
+        return Err(holder_gone(svc, input));
+    }
+    if !svc.is_running() {
+        return Err(not_running(svc));
+    }
+    match f.write(bytes) {
+        Ok(n) => Ok(n),
+        Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => Ok(0),
+        Err(e) if e.raw_os_error() == Some(libc::EPIPE) => Err(holder_gone(svc, input)),
+        Err(e) => Err(TabaError::state(format!("cannot write input: {e}"))),
+    }
 }
 
 #[cfg(windows)]
-pub fn write(_svc: &Service, _input: &Input, _bytes: &[u8]) -> Result<()> {
+fn try_write(_store: &Store, _svc: &Service, _bytes: &[u8]) -> Result<usize> {
     Err(unsupported("service input"))
 }
 
@@ -457,6 +565,13 @@ fn no_input(svc: &Service) -> TabaError {
         "restart it with --interactive (stop it first)",
         format!("taba stop {}", svc.id()),
     ))
+}
+
+fn restart_interactive(svc: &Service) -> Next {
+    Next::run(
+        "stop the instance, then rerun the original `taba run --interactive ...` command (add --interactive before the service command, replacing --no-interactive if present)",
+        format!("taba stop {}", svc.id()),
+    )
 }
 
 fn holder_gone(svc: &Service, input: &Input) -> TabaError {
@@ -481,62 +596,135 @@ fn not_running(svc: &Service) -> TabaError {
         .next(Next::run("read its log", format!("taba logs {}", svc.id())))
 }
 
-/// The service `target` names, if `caller` may write to or signal it (the
-/// `stop` rules, see the module docs). Records a `--force` override.
-pub(crate) fn authorise(
-    store: &Store,
-    caller: &Caller,
-    target: &str,
-    verb: &str,
-    force_reason: Option<&str>,
-    needs_input: bool,
-) -> Result<Service> {
-    let (scope, name) = crate::resolve_target(target, caller)?;
-    let _lock = store.lock()?;
-    let svc = store
-        .get(&scope, &name)?
-        .ok_or_else(|| crate::not_found(&scope, &name))?;
-    let owner = caller.scope.as_deref() == Some(svc.scope.as_str());
-    if owner && force_reason.is_none() {
-        let cfg = config::Config::load(store.root())?;
-        lease::touch(store, &cfg, caller, &scope, lease::Access::Mutate, None)?;
-    }
-    let live = borrows::live(store, &svc)?;
-    let exclusive = live.iter().find(|b| b.exclusive);
-    let holds_exclusive = exclusive.is_some_and(|b| b.owned(caller));
-    if force_reason.is_none() {
-        if !owner && !holds_exclusive {
-            return Err(crate::not_owner(caller, &svc, verb));
-        }
-        if let Some(b) = exclusive.filter(|_| !holds_exclusive) {
-            return Err(borrows::locked(&svc, b));
-        }
-    }
-    if let Some(op) = store.live_op(&scope, &name)? {
-        return Err(crate::busy(&svc.id(), &op));
-    }
-    if !svc.is_running() {
-        return Err(not_running(&svc));
-    }
-    if needs_input && svc.input.is_none() {
-        return Err(no_input(&svc));
-    }
-    if let Some(reason) = force_reason {
-        let overrode: &[&str] = if owner || holds_exclusive {
-            &[]
-        } else {
-            &["E_NOT_OWNER"]
-        };
-        crate::record_force(
+#[derive(Clone, Copy)]
+struct Access<'a> {
+    store: &'a Store,
+    caller: &'a Caller,
+    target: &'a str,
+    verb: &'a str,
+    force_reason: Option<&'a str>,
+}
+
+impl Access<'_> {
+    /// The current service, under the lock held by the operation. With an
+    /// expected instance, never retarget an attachment or a partial write.
+    fn authorise(
+        &self,
+        _lock: &crate::state::Lock,
+        expected: Option<&Service>,
+        audit: bool,
+    ) -> Result<Service> {
+        let Self {
             store,
-            &format!("force_{verb}"),
             caller,
-            &svc,
-            reason,
-            overrode,
-        )?;
+            target,
+            verb,
+            force_reason,
+        } = *self;
+        let (scope, name) = crate::resolve_target(target, caller)?;
+        let svc = store
+            .get(&scope, &name)?
+            .ok_or_else(|| crate::not_found(&scope, &name))?;
+        if expected.is_some_and(|old| {
+            (old.pid, old.pgid, old.start_time) != (svc.pid, svc.pgid, svc.start_time)
+                || old.instance() != svc.instance()
+                || old.input != svc.input
+        }) {
+            return Err(TabaError::new(
+                "E_CONFLICT",
+                format!("{} changed; attach or send again", svc.id()),
+            ));
+        }
+        let owner = caller.scope.as_deref() == Some(svc.scope.as_str());
+        if owner && force_reason.is_none() {
+            let cfg = config::Config::load(store.root())?;
+            lease::touch(store, &cfg, caller, &scope, lease::Access::Mutate, None)?;
+        }
+        let live = borrows::live(store, &svc)?;
+        let exclusive = live.iter().find(|b| b.exclusive);
+        let holds_exclusive = exclusive.is_some_and(|b| b.owned(caller));
+        if force_reason.is_none() {
+            if !owner && !holds_exclusive {
+                return Err(crate::not_owner(caller, &svc, verb));
+            }
+            if let Some(b) = exclusive.filter(|_| !holds_exclusive) {
+                return Err(borrows::locked(&svc, b));
+            }
+        }
+        if let Some(op) = store.live_op(&scope, &name)? {
+            return Err(crate::busy(&svc.id(), &op));
+        }
+        if !svc.is_running() {
+            return Err(not_running(&svc));
+        }
+        if let Some(reason) = force_reason.filter(|_| audit) {
+            let overrode: &[&str] = if owner || holds_exclusive {
+                &[]
+            } else {
+                &["E_NOT_OWNER"]
+            };
+            crate::record_force(
+                store,
+                &format!("force_{verb}"),
+                caller,
+                &svc,
+                reason,
+                overrode,
+            )?;
+        }
+        Ok(svc)
     }
-    Ok(svc)
+
+    fn attach(&self, expected: Option<&Service>) -> Result<Service> {
+        let lock = self.store.lock()?;
+        let svc = self.authorise(&lock, expected, true)?;
+        svc.input.as_ref().ok_or_else(|| no_input(&svc))?;
+        Ok(svc)
+    }
+
+    fn write(&self, expected: Option<&Service>, bytes: &[u8], mut audit: bool) -> Result<Service> {
+        let deadline = std::time::Instant::now() + WRITE_TIMEOUT;
+        let mut rest = bytes;
+        let mut pinned = None;
+        loop {
+            let (svc, n) = {
+                let lock = self.store.lock()?;
+                let svc = self.authorise(&lock, expected.or(pinned.as_ref()), audit)?;
+                let n = if rest.is_empty() {
+                    0
+                } else {
+                    try_write(self.store, &svc, rest)?
+                };
+                (svc, n)
+            };
+            rest = &rest[n..];
+            if rest.is_empty() {
+                svc.input.as_ref().ok_or_else(|| no_input(&svc))?;
+                return Ok(svc);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(TabaError::new(
+                    "E_INPUT_BLOCKED",
+                    format!(
+                        "{} is not reading its input; {} of {} bytes were not written",
+                        svc.id(),
+                        rest.len(),
+                        bytes.len()
+                    ),
+                )
+                .details(json!({ "service": svc.id(), "unwritten": rest.len() }))
+                .next(Next::run(
+                    "check the service",
+                    format!("taba logs {}", svc.id()),
+                )));
+            }
+            pinned = Some(svc);
+            audit = false;
+            if n == 0 {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
 }
 
 // ------------------------------------------------------------ send
@@ -605,9 +793,14 @@ pub fn cmd_send(a: SendArgs) -> Result<Output> {
     }
     let caller = scope::resolve(a.scope, a.agent)?;
     let store = Store::open()?;
-    let svc = authorise(&store, &caller, &a.target, "send", reason.as_deref(), true)?;
-    let input = svc.input.clone().expect("checked");
-    write(&svc, &input, &bytes)?;
+    let access = Access {
+        store: &store,
+        caller: &caller,
+        target: &a.target,
+        verb: "send",
+        force_reason: reason.as_deref(),
+    };
+    let svc = access.write(None, &bytes, true)?;
     let mut body = json!({
         "service": svc.id(),
         "bytes": bytes.len(),
@@ -661,15 +854,16 @@ pub fn cmd_signal(a: SignalArgs) -> Result<Output> {
     }
     let caller = scope::resolve(a.scope, a.agent)?;
     let store = Store::open()?;
-    let svc = authorise(
-        &store,
-        &caller,
-        &a.target,
-        "signal",
-        reason.as_deref(),
-        false,
-    )?;
-    send_signal(&svc, a.signal)?;
+    let access = Access {
+        store: &store,
+        caller: &caller,
+        target: &a.target,
+        verb: "signal",
+        force_reason: reason.as_deref(),
+    };
+    let lock = store.lock()?;
+    let svc = access.authorise(&lock, None, true)?;
+    send_signal(&svc, a.signal, false)?;
     let mut body = json!({
         "service": svc.id(),
         "signal": a.signal.name(),
@@ -693,17 +887,96 @@ pub fn cmd_signal(a: SignalArgs) -> Result<Output> {
 /// Signals the service's main process only: the default action of SIGUSR1
 /// and SIGUSR2 is to terminate, so the rest of the group is left alone.
 #[cfg(unix)]
-fn send_signal(svc: &Service, sig: Signal) -> Result<()> {
+fn send_signal(svc: &Service, sig: Signal, flutter: bool) -> Result<()> {
+    // Automatic Flutter signals require a verified handler and stable
+    // process handle. On macOS, the only supported Flutter path is input.
+    #[cfg(target_os = "macos")]
+    if flutter {
+        let key = if sig == Signal::Usr2 { "R" } else { "r" };
+        let mut error = TabaError::new(
+            "E_NO_RELOAD",
+            format!("{}: automatic Flutter reload and restart are disabled on macOS; use interactive r (reload) or R (restart) via taba attach or taba send", svc.id()),
+        )
+        .details(json!({ "service": svc.id(), "command": svc.template() }))
+        .next(Next::run(
+            "send the Flutter key if the service takes input",
+            format!("taba send {} --key {key}", svc.id()),
+        ));
+        // No input and input without an identity both require a restart.
+        // Only input with an identity skips that advice.
+        if svc.input.as_ref().is_none_or(|i| i.fifo_identity.is_none()) {
+            error = error.next(restart_interactive(svc));
+        }
+        return Err(error);
+    }
     let n = match sig {
         Signal::Usr1 => libc::SIGUSR1,
         Signal::Usr2 => libc::SIGUSR2,
         Signal::Hup => libc::SIGHUP,
     };
-    // Re-verify the identity right before signalling, as `stop` does.
     if !crate::proc::is_alive(svc.pid, svc.start_time) {
         return Err(not_running(svc));
     }
-    if unsafe { libc::kill(svc.pid, n) } != 0 {
+    // On Linux, signal through a stable handle, never a recycled PID.
+    #[cfg(target_os = "linux")]
+    let pidfd = {
+        use std::os::fd::FromRawFd;
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, svc.pid, 0u32) };
+        if fd >= 0 {
+            Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) })
+        } else {
+            let e = std::io::Error::last_os_error();
+            match e.raw_os_error() {
+                Some(libc::ESRCH) => return Err(not_running(svc)),
+                Some(libc::ENOSYS | libc::EPERM | libc::EACCES) if flutter => {
+                    return Err(no_reload(
+                        svc,
+                        "cannot pin the Flutter signal target on this system",
+                    ));
+                }
+                // Keep explicit `signal` available on older kernels.
+                Some(libc::ENOSYS | libc::EPERM | libc::EACCES) => None,
+                _ => {
+                    return Err(TabaError::new(
+                        "E_SIGNAL_FAILED",
+                        format!("{}: cannot pin its process: {e}", svc.id()),
+                    ));
+                }
+            }
+        }
+    };
+    #[cfg(target_os = "linux")]
+    if flutter && !verified_flutter_leader(svc.pid, n) {
+        return Err(no_reload(
+            svc,
+            "the service leader is not a verified Flutter signal target",
+        )
+        .next(restart_interactive(svc)));
+    }
+    if !crate::proc::is_alive(svc.pid, svc.start_time) {
+        return Err(not_running(svc));
+    }
+    #[cfg(target_os = "linux")]
+    let sent = {
+        use std::os::fd::AsRawFd;
+        if let Some(pidfd) = &pidfd {
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    pidfd.as_raw_fd(),
+                    n,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0u32,
+                )
+            }
+        } else {
+            unsafe { libc::kill(svc.pid, n) }.into()
+        }
+    };
+    // macOS has no pidfd equivalent: recheck the leader immediately before kill.
+    #[cfg(target_os = "macos")]
+    let sent = unsafe { libc::kill(svc.pid, n) };
+    if sent != 0 {
         let e = std::io::Error::last_os_error();
         return Err(TabaError::new(
             "E_SIGNAL_FAILED",
@@ -715,8 +988,71 @@ fn send_signal(svc: &Service, sig: Signal) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn send_signal(_svc: &Service, _sig: Signal) -> Result<()> {
+fn send_signal(_svc: &Service, _sig: Signal, _flutter: bool) -> Result<()> {
     Err(unsupported("taba signal"))
+}
+
+/// Flutter's Unix SDK launcher execs Dart. Recognise its tool only in
+/// Dart's script position, or a direct native Flutter leader, not a shell,
+/// package manager or FVM parent. Never search descendants for a target.
+#[cfg(target_os = "linux")]
+fn verified_flutter_leader(pid: i32, sig: i32) -> bool {
+    let Some(argv) = crate::proc::argv(pid) else {
+        return false;
+    };
+    let Some((program, args)) = argv.split_first() else {
+        return false;
+    };
+    let run_args = match base(program).as_str() {
+        "flutter" => args,
+        "dart" => {
+            let vm_options = args
+                .iter()
+                .take_while(|s| {
+                    s.starts_with("--packages=")
+                        || s.starts_with("--observe=")
+                        || matches!(s.as_str(), "--enable-asserts" | "--disable-dart-dev")
+                })
+                .count();
+            let Some((script, rest)) = args[vm_options..].split_first() else {
+                return false;
+            };
+            if Path::new(script).file_name().and_then(|s| s.to_str())
+                != Some("flutter_tools.snapshot")
+            {
+                return false;
+            }
+            rest
+        }
+        _ => return false,
+    };
+    if !flutter_run(run_args)
+        || run_args
+            .iter()
+            .any(|a| matches!(a.as_str(), "--machine" | "--no-hot"))
+    {
+        return false;
+    }
+    // USR1/2 terminate by default. The correct executable alone does
+    // not mean it has installed its reload handler yet.
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()
+        .and_then(|status| {
+            let mask = status
+                .lines()
+                .find_map(|line| line.strip_prefix("SigCgt:"))?;
+            u64::from_str_radix(mask.trim(), 16).ok()
+        })
+        .is_some_and(|mask| mask & (1 << (sig - 1)) != 0)
+}
+
+fn no_reload(svc: &Service, why: &str) -> TabaError {
+    TabaError::new("E_NO_RELOAD", format!("{}: {why}", svc.id()))
+        .details(json!({ "service": svc.id(), "command": svc.template() }))
+        .next(Next::run(
+            "if it takes input, send its reload key directly",
+            format!("taba send {} --key r", svc.id()),
+        ))
 }
 
 pub struct ReloadArgs {
@@ -729,44 +1065,30 @@ pub struct ReloadArgs {
 }
 
 /// `taba reload`: the most reliable reload for the kind of dev server.
-/// `flutter run`: SIGUSR1 (hot reload) or SIGUSR2 (`--restart`, hot
-/// restart), which needs no stdin. Vite: `r` + Enter on stdin (restarts the
+/// Linux `flutter run`: SIGUSR1 (hot reload) or SIGUSR2 (`--restart`, hot
+/// restart), which needs no stdin. On macOS, use Flutter's keys via attach
+/// or send instead. Vite: `r` + Enter on stdin (restarts the
 /// dev server; open pages reload), so it needs `--interactive`.
 pub fn cmd_reload(a: ReloadArgs) -> Result<Output> {
     let reason = crate::check_force(a.force, a.reason)?;
     let caller = scope::resolve(a.scope, a.agent)?;
     let store = Store::open()?;
-    let (scope, name) = crate::resolve_target(&a.target, &caller)?;
-    let peek = store
-        .get(&scope, &name)?
-        .ok_or_else(|| crate::not_found(&scope, &name))?;
-    let kind = detect(peek.template(), &peek.cwd);
-    if kind == Kind::Other {
-        return Err(TabaError::new(
-            "E_NO_RELOAD",
-            format!(
-                "{} is not a dev server taba knows how to reload (flutter run, vite)",
-                peek.id()
-            ),
-        )
-        .details(json!({ "service": peek.id(), "command": peek.template() }))
-        .next(Next::run(
-            "send its reload key yourself",
-            format!("taba send {} --key r", peek.id()),
-        )));
-    }
     if cfg!(windows) {
         return Err(unsupported("taba reload"));
     }
-    let id = peek.id();
-    let svc = authorise(
-        &store,
-        &caller,
-        &id,
-        "reload",
-        reason.as_deref(),
-        kind == Kind::Vite,
-    )?;
+    let access = Access {
+        store: &store,
+        caller: &caller,
+        target: &a.target,
+        verb: "reload",
+        force_reason: reason.as_deref(),
+    };
+    let lock = store.lock()?;
+    let svc = access.authorise(&lock, None, true)?;
+    let id = svc.id();
+    let kind = svc
+        .dev_kind
+        .unwrap_or_else(|| detect_words(&svc.command, None, true));
     let (method, text) = match kind {
         Kind::Flutter => {
             let sig = if a.restart {
@@ -774,7 +1096,7 @@ pub fn cmd_reload(a: ReloadArgs) -> Result<Output> {
             } else {
                 Signal::Usr1
             };
-            send_signal(&svc, sig)?;
+            send_signal(&svc, sig, true)?;
             let what = if a.restart {
                 "hot restart"
             } else {
@@ -789,9 +1111,16 @@ pub fn cmd_reload(a: ReloadArgs) -> Result<Output> {
                 ),
             )
         }
-        _ => {
-            let input = svc.input.clone().expect("checked");
-            write(&svc, &input, b"r\n")?;
+        Kind::VitePreview => return Err(no_reload(&svc, "Vite preview does not support reload")),
+        Kind::Other => {
+            return Err(
+                no_reload(&svc, "not a supported dev server (flutter run or Vite dev)")
+                    .next(restart_interactive(&svc)),
+            );
+        }
+        Kind::Vite => {
+            drop(lock);
+            access.write(Some(&svc), b"r\n", false)?;
             (
                 "stdin".to_string(),
                 format!("{id}: sent r (Vite restarts the dev server; open pages reload)"),
@@ -831,28 +1160,19 @@ pub fn cmd_attach(a: AttachArgs) -> Result<Option<Output>> {
     }
     let caller = scope::resolve(a.scope, a.agent)?;
     let store = Store::open()?;
-    let svc = authorise(
-        &store,
-        &caller,
-        &a.target,
-        "attach",
-        reason.as_deref(),
-        true,
-    )?;
+    let access = Access {
+        store: &store,
+        caller: &caller,
+        target: &a.target,
+        verb: "attach",
+        force_reason: reason.as_deref(),
+    };
+    let svc = access.attach(None)?;
     let (log, pos) = open_tail(&svc)?;
     if std::io::stdin().is_terminal() {
-        view(
-            &store,
-            &caller,
-            &svc,
-            log,
-            pos,
-            true,
-            false,
-            reason.as_deref(),
-        )
+        view(access, &svc, log, pos, true, false)
     } else {
-        forward_pipe(&svc, log, pos)
+        forward_pipe(access, &svc, log, pos)
     }?;
     Ok(None)
 }
@@ -860,9 +1180,16 @@ pub fn cmd_attach(a: AttachArgs) -> Result<Option<Output>> {
 /// `taba ui`: `i` on an interactive service. Input mode right away; Ctrl+]
 /// returns to the TUI.
 pub(crate) fn attach_from_ui(store: &Store, caller: &Caller, target: &str) -> Result<()> {
-    let svc = authorise(store, caller, target, "attach", None, true)?;
+    let access = Access {
+        store,
+        caller,
+        target,
+        verb: "attach",
+        force_reason: None,
+    };
+    let svc = access.attach(None)?;
     let (log, pos) = open_tail(&svc)?;
-    view(store, caller, &svc, log, pos, true, true, None)
+    view(access, &svc, log, pos, true, true)
 }
 
 /// `taba logs -f` on a terminal, for an interactive service: read-only
@@ -871,7 +1198,15 @@ pub(crate) fn follow(store: &Store, caller: &Caller, svc: &Service, log: File) -
     use std::io::Seek;
     let mut log = log;
     let pos = log.stream_position()?;
-    view(store, caller, svc, log, pos, false, false, None)
+    let id = svc.id();
+    let access = Access {
+        store,
+        caller,
+        target: &id,
+        verb: "attach",
+        force_reason: None,
+    };
+    view(access, svc, log, pos, false, false)
 }
 
 fn open_tail(svc: &Service) -> Result<(File, u64)> {
@@ -921,16 +1256,13 @@ fn banner(id: &str, typing: bool, leave_to_ui: bool) {
 /// each key to the service. `i` enters input mode (if the caller may type),
 /// Ctrl+] leaves it (or the view, with `leave_on_detach`), `q` / Ctrl+C
 /// quits. The service keeps running.
-#[allow(clippy::too_many_arguments)]
 fn view(
-    store: &Store,
-    caller: &Caller,
+    access: Access<'_>,
     svc: &Service,
     mut log: File,
     mut pos: u64,
     mut typing: bool,
     leave_on_detach: bool,
-    force_reason: Option<&str>,
 ) -> Result<()> {
     use std::io::{Read, Seek, SeekFrom, Write};
     let id = svc.id();
@@ -967,11 +1299,10 @@ fn view(
                 Some(i) => (&bytes[..i], true),
                 None => (&bytes[..], false),
             };
-            if !send.is_empty() {
-                let input = svc.input.as_ref().expect("interactive");
-                if let Err(e) = write(svc, input, send) {
-                    status(&e.message);
-                }
+            if !send.is_empty()
+                && let Err(e) = access.write(Some(svc), send, false)
+            {
+                status(&e.message);
             }
             if detach {
                 if leave_on_detach {
@@ -985,7 +1316,7 @@ fn view(
         for &b in &bytes {
             match b {
                 b'i' => {
-                    match authorise(store, caller, &id, "attach", force_reason, true) {
+                    match access.attach(Some(svc)) {
                         Ok(_) => {
                             typing = true;
                             banner(&id, typing, leave_on_detach);
@@ -1008,9 +1339,8 @@ fn view(
 
 /// `taba attach` from a pipe: forwards stdin until EOF, then shows the log
 /// a little longer so the answer to the last input is not cut off.
-fn forward_pipe(svc: &Service, mut log: File, mut pos: u64) -> Result<()> {
+fn forward_pipe(access: Access<'_>, svc: &Service, mut log: File, mut pos: u64) -> Result<()> {
     use std::io::{Read, Seek, SeekFrom, Write};
-    let input = svc.input.clone().expect("interactive");
     eprintln!(
         "taba: attached to {} (EOF detaches; the service keeps running)",
         svc.id()
@@ -1045,7 +1375,9 @@ fn forward_pipe(svc: &Service, mut log: File, mut pos: u64) -> Result<()> {
         match read_stdin(Duration::from_millis(50))? {
             None => {}
             Some(bytes) if bytes.is_empty() => linger = Some(std::time::Instant::now()),
-            Some(bytes) => write(svc, &input, &bytes)?,
+            Some(bytes) => {
+                access.write(Some(svc), &bytes, false)?;
+            }
         }
     };
     match outcome {
@@ -1162,17 +1494,49 @@ mod tests {
         assert_eq!(d("vite"), Kind::Vite);
         assert_eq!(d("npx vite --port 5173"), Kind::Vite);
         assert_eq!(d("node node_modules/vite/bin/vite.js"), Kind::Vite);
-        assert_eq!(d("vite preview"), Kind::Vite);
+        assert_eq!(d("vite preview"), Kind::VitePreview);
+        assert_eq!(d("vite --port 4173 preview"), Kind::VitePreview);
+        assert_eq!(d("vite --config preview"), Kind::Vite);
+        assert_eq!(d("vite --host preview"), Kind::Vite);
         assert_eq!(d("vite build"), Kind::Other);
         assert_eq!(d("python3 -m http.server"), Kind::Other);
         assert_eq!(d("node vite.config.ts"), Kind::Other);
-        // A shell command line is split into words.
+        assert_eq!(d("echo vite"), Kind::Other);
+        assert_eq!(d("node server.js vite"), Kind::Other);
+        assert_eq!(d("npx echo vite"), Kind::Other);
+        assert_eq!(
+            detect(&["echo".into(), "flutter run".into()], none),
+            Kind::Other
+        );
+        assert_eq!(
+            detect(
+                &["/opt/tools with spaces/flutter".into(), "run".into()],
+                none
+            ),
+            Kind::Flutter
+        );
+        assert_eq!(
+            detect(&["flutter".into(), "run test".into()], none),
+            Kind::Other
+        );
+        // Only an actual shell payload is parsed, with quotes preserved.
+        assert_eq!(
+            detect(
+                &[
+                    "sh".into(),
+                    "-c".into(),
+                    "exec '/opt/my tools/flutter' run".into()
+                ],
+                none
+            ),
+            Kind::Flutter
+        );
         assert_eq!(
             detect(
                 &["sh".into(), "-c".into(), "cd app && flutter run".into()],
                 none
             ),
-            Kind::Flutter
+            Kind::Other
         );
     }
 
@@ -1181,7 +1545,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("package.json"),
-            r#"{"scripts":{"dev":"vite --host","build":"vite build","start":"vite","serve":"node server.js"}}"#,
+            r#"{"scripts":{"dev":"vite --host","preview":"vite preview","build":"vite build","start":"vite","serve":"node server.js","info":"echo vite"}}"#,
         )
         .unwrap();
         let d = |s: &str| detect(&words(s), dir.path());
@@ -1194,5 +1558,8 @@ mod tests {
         assert_eq!(d("npm run serve"), Kind::Other);
         assert_eq!(d("npm install"), Kind::Other);
         assert_eq!(d("npm run missing"), Kind::Other);
+        assert_eq!(d("npm run info"), Kind::Other);
+        assert_eq!(d("npm run preview"), Kind::VitePreview);
+        assert_eq!(d("npm start -- preview"), Kind::VitePreview);
     }
 }
