@@ -1639,10 +1639,31 @@ pub(crate) fn stop_services(
     timeout: Duration,
     reason: Option<&str>,
 ) -> Result<Output> {
+    stop_services_with(
+        &proc::System,
+        store,
+        caller,
+        targets,
+        single,
+        timeout,
+        reason,
+    )
+}
+
+/// `stop_services` with the process operations of `ops`.
+fn stop_services_with(
+    ops: &impl proc::Ops,
+    store: &Store,
+    caller: &Caller,
+    targets: &[(String, String)],
+    single: bool,
+    timeout: Duration,
+    reason: Option<&str>,
+) -> Result<Output> {
     let mut done = Vec::new();
     let mut refused: Vec<(String, TabaError)> = Vec::new();
     for (s, n) in targets {
-        match stop_one(store, caller, s, n, timeout, reason) {
+        match stop_one(ops, store, caller, s, n, timeout, reason) {
             Ok(d) => done.push(d),
             Err(e) if single => return Err(e),
             Err(e) => refused.push((format!("{s}/{n}"), e)),
@@ -1730,6 +1751,7 @@ pub(crate) fn stop_services(
 /// Stops one service under the operation lock: checks and lock-taking happen
 /// under the global lock, signalling and waiting without it.
 fn stop_one(
+    ops: &impl proc::Ops,
     store: &Store,
     caller: &Caller,
     scope: &str,
@@ -1761,7 +1783,7 @@ fn stop_one(
             return Err(busy(&svc.id(), &op));
         }
         store.clear_stale_op(scope, name)?;
-        if !svc.is_running() {
+        if !ops.is_running(&svc) {
             let unverifiable = matches!(proc::info(svc.pid), Some(p) if !p.zombie && p.start_time != svc.start_time);
             return Ok(Stopped {
                 svc,
@@ -1780,15 +1802,15 @@ fn stop_one(
     };
 
     // Re-verify identity immediately before signalling (as v0.1 does).
-    let res = if svc.is_running() {
-        proc::stop_group(svc.pid, svc.pgid, svc.start_time, timeout).map(Some)
+    let res = if ops.is_running(&svc) {
+        ops.stop_group(&svc, timeout).map(Some)
     } else {
         Ok(None)
     };
     {
         let _lock = store.lock()?;
         store.release_op(scope, name)?;
-        if res.is_ok() && !svc.is_running() {
+        if res.is_ok() && !ops.is_running(&svc) {
             borrows::break_all(store, &svc, preserve_exclusive)?;
             claims::discard(store, &svc)?;
         }
@@ -2031,5 +2053,196 @@ mod cli_tests {
         let mut missing = Vec::new();
         walk(&Cli::command(), "taba", &mut missing);
         assert!(missing.is_empty(), "arguments without help: {missing:?}");
+    }
+}
+
+/// `taba stop` with a fake process layer: signal failures are deterministic
+/// and no real process is signalled.
+#[cfg(test)]
+mod stop_tests {
+    use super::*;
+    use crate::proc::fake::FakeOps;
+    use std::io::ErrorKind;
+    use std::path::PathBuf;
+
+    /// A throwaway store; removed on drop.
+    struct Tmp(Store, PathBuf);
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.1);
+        }
+    }
+
+    fn store(test: &str) -> Tmp {
+        let dir =
+            std::env::temp_dir().join(format!("taba-stop-unit-{}-{test}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Tmp(Store::at(dir.clone()), dir)
+    }
+
+    /// A service record whose pid and start time match no real process.
+    fn service(store: &Store, scope: &str, name: &str) {
+        store
+            .put(&Service {
+                scope: scope.into(),
+                name: name.into(),
+                command: vec!["dummy".into()],
+                cwd: PathBuf::from("."),
+                port: None,
+                pid: i32::MAX,
+                pgid: i32::MAX,
+                start_time: 1,
+                log_path: store.log_path(scope, name),
+                command_template: None,
+                port_request: None,
+                instance: None,
+                started_by: None,
+                ready: None,
+                service_ttl_secs: None,
+                service_expires_at: None,
+                moves: Vec::new(),
+                stop_requested_at: None,
+            })
+            .unwrap();
+    }
+
+    fn human_in(scope: &str) -> Caller {
+        Caller {
+            scope: Some(scope.into()),
+            source: None,
+            worktree: None,
+            branch: None,
+            agent: "human".into(),
+            agent_pid: None,
+            cwd: PathBuf::from("."),
+        }
+    }
+
+    fn targets(list: &[(&str, &str)]) -> Vec<(String, String)> {
+        list.iter()
+            .map(|(s, n)| (s.to_string(), n.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_failed_signal_is_e_signal_failed_and_keeps_the_service() {
+        let t = store("single");
+        service(&t.0, "s1", "web");
+        let ops = FakeOps::at(0);
+        ops.fail.set(Some(ErrorKind::PermissionDenied));
+        let err = stop_services_with(
+            &ops,
+            &t.0,
+            &human_in("s1"),
+            &targets(&[("s1", "web")]),
+            true,
+            Duration::from_secs(2),
+            None,
+        )
+        .err()
+        .expect("the stop fails");
+        assert_eq!(ops.calls(), ["stop web 2000"]);
+        assert_eq!(err.code, "E_SIGNAL_FAILED");
+        assert_eq!(err.exit_code(), 1);
+        assert!(
+            err.message.contains("s1/web: cannot signal process group")
+                && err.message.contains("fake signal failure"),
+            "{}",
+            err.message
+        );
+        let j = err.to_json();
+        assert_eq!(j["details"]["service"], "s1/web");
+        assert_eq!(j["details"]["pgid"], i32::MAX);
+        // The record stays, and the operation lock is released.
+        assert!(t.0.get("s1", "web").unwrap().is_some());
+        assert!(t.0.live_op("s1", "web").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_failed_signal_among_several_is_reported_as_failed() {
+        let t = store("multi");
+        service(&t.0, "s1", "bad");
+        service(&t.0, "s1", "good");
+        let ops = FakeOps::at(0);
+        ops.fail.set(Some(ErrorKind::PermissionDenied));
+        *ops.fail_name.borrow_mut() = Some("bad".into());
+        let out = stop_services_with(
+            &ops,
+            &t.0,
+            &human_in("s1"),
+            &targets(&[("s1", "bad"), ("s1", "good")]),
+            false,
+            Duration::from_secs(1),
+            None,
+        )
+        .unwrap();
+        assert_eq!(ops.calls(), ["stop bad 1000", "stop good 1000"]);
+        let results = out.body["results"].as_array().unwrap();
+        assert_eq!(results[0]["service"], "s1/good");
+        assert_eq!(results[0]["result"], "stopped");
+        assert_eq!(results[0]["signal"], "TERM");
+        assert_eq!(results[1]["service"], "s1/bad");
+        assert_eq!(results[1]["result"], "failed");
+        assert_eq!(results[1]["error"]["code"], "E_SIGNAL_FAILED");
+        let failure = out.failure.expect("a failure");
+        assert_eq!(failure.code, "E_SIGNAL_FAILED");
+        assert_eq!(failure.exit_code(), 1);
+        assert!(
+            failure.message.starts_with("1 of 2 service(s)"),
+            "{}",
+            failure.message
+        );
+        assert!(t.0.live_op("s1", "bad").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_refusal_outranks_a_signal_failure() {
+        let t = store("outrank");
+        service(&t.0, "s1", "bad");
+        service(&t.0, "s2", "theirs");
+        let ops = FakeOps::at(0);
+        ops.fail.set(Some(ErrorKind::PermissionDenied));
+        let out = stop_services_with(
+            &ops,
+            &t.0,
+            &human_in("s1"),
+            &targets(&[("s1", "bad"), ("s2", "theirs")]),
+            false,
+            Duration::from_secs(1),
+            None,
+        )
+        .unwrap();
+        // Another scope's service is refused before any signal.
+        assert_eq!(ops.calls(), ["stop bad 1000"]);
+        let results = out.body["results"].as_array().unwrap();
+        assert_eq!(results[0]["result"], "failed");
+        assert_eq!(results[1]["result"], "refused");
+        assert_eq!(results[1]["error"]["code"], "E_NOT_OWNER");
+        let failure = out.failure.expect("a failure");
+        assert_eq!(failure.code, "E_NOT_OWNER");
+        assert_eq!(failure.exit_code(), 3);
+        assert!(t.0.get("s2", "theirs").unwrap().is_some());
+    }
+
+    #[test]
+    fn a_service_that_exited_is_not_signalled() {
+        let t = store("exited");
+        service(&t.0, "s1", "web");
+        let ops = FakeOps::at(0);
+        ops.running.set(false);
+        ops.fail.set(Some(ErrorKind::PermissionDenied));
+        let out = stop_services_with(
+            &ops,
+            &t.0,
+            &human_in("s1"),
+            &targets(&[("s1", "web")]),
+            true,
+            Duration::from_secs(1),
+            None,
+        )
+        .unwrap();
+        assert!(ops.calls().is_empty());
+        assert_eq!(out.body["results"][0]["result"], "not_running");
+        assert!(out.failure.is_none());
     }
 }
