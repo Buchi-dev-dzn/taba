@@ -209,6 +209,9 @@ fn collect_with(
             }
         }
     }
+    if !dry && let Some(max) = cfg.log_max_size {
+        rotate_logs(store, max);
+    }
     if !dry && limit == usize::MAX {
         let _lock = store.lock()?;
         for log in store.orphan_logs()? {
@@ -234,6 +237,22 @@ fn collect_with(
         json!({"dry_run":dry,"dropped":dropped,"handed_over":moved,"kept":kept}),
         text,
     ))
+}
+
+/// Rotates the logs of existing services, running or not, that grew past
+/// `max` bytes (see `crate::rotate`). Best effort and never waits: a busy
+/// state lock or a failed rotation leaves the log to a later cleanup.
+fn rotate_logs(store: &Store, max: u64) {
+    let Ok(logs) = store.record_logs() else {
+        return;
+    };
+    for log in logs {
+        if log.metadata().is_ok_and(|m| m.len() > max)
+            && let Ok(Some(_lock)) = store.try_lock()
+        {
+            let _ = crate::rotate::copy_truncate(&log, max);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -270,6 +289,8 @@ mod tests {
             gc_grace: 600,
             log_retention: 86_400,
             stop_timeout: 5,
+            log_max_size: None,
+            events_max_size: None,
             unknown: Vec::new(),
         }
     }
@@ -514,6 +535,34 @@ mod tests {
         assert_eq!(drops(&t.0)[0]["signal"], Value::Null);
         // The log is kept for log_retention.
         assert!(t.0.log_path(SCOPE, "web").exists());
+    }
+
+    #[test]
+    fn rotated_logs_follow_log_retention_and_record_logs_rotate() {
+        let t = store("rotated");
+        scope(&t.0, None);
+        service(&t.0, "web");
+        let log = t.0.log_path(SCOPE, "web");
+        std::fs::write(&log, "0123456789").unwrap();
+        let c = Config {
+            log_max_size: Some(4),
+            log_retention: 0,
+            ..cfg()
+        };
+        let ops = FakeOps::at(T0);
+        explicit(&ops, &t.0, &c);
+        // The live record's log is rotated, not deleted.
+        let rotated = crate::rotate::rotated(&log);
+        assert_eq!(std::fs::read(&rotated).unwrap(), b"0123456789");
+        assert_eq!(std::fs::read(&log).unwrap(), b"");
+        assert!(!t.0.orphan_logs().unwrap().contains(&rotated));
+        // Dropped: both files become orphans and go after log_retention.
+        t.0.remove_record_keep_log(SCOPE, "web").unwrap();
+        let mut orphans = t.0.orphan_logs().unwrap();
+        orphans.sort();
+        assert_eq!(orphans, [log.clone(), rotated.clone()]);
+        explicit(&ops, &t.0, &c);
+        assert!(!log.exists() && !rotated.exists());
     }
 
     #[test]

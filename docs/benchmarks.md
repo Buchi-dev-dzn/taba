@@ -122,7 +122,9 @@ reported as well.
 | Runtime | uses the host `python3` (85 MB, already installed) | VM disk `Docker.raw`: 1.2 GB allocated |
 | One-time pull | – | 7.8 s for `python:3-slim` |
 
-taba's log grows without bound, and nothing rotates it. `taba rm` deletes it.
+taba does not rotate logs unless `log_max_size` is configured; a documented
+`10MiB` example keeps one rotated `.1` file, and `taba rm` deletes both.
+(These measurements predate log rotation.)
 
 ### Behaviour
 
@@ -185,8 +187,9 @@ native macOS for small files. The bind mount was the slowest.
   conflict message, `ps` by task, one place for logs), not speed.
 - **Memory of the server itself is identical** (~25 MB for Python, ~100 MB for
   Vite). taba does not make servers lighter.
-- **Logs are not rotated.** Docker's log drivers can rotate; taba's log grows
-  until `taba rm`.
+- **Log rotation is simpler.** When explicitly configured, taba keeps one
+  `.1` file per log above `log_max_size`, rotated lazily by `run`, `whoami`
+  and `gc`; it is not a hard disk quota.
 
 ## Where Docker wins, or the comparison does not apply
 

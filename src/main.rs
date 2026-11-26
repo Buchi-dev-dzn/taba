@@ -13,6 +13,7 @@ mod ports;
 mod proc;
 mod project;
 mod ready;
+mod rotate;
 mod runform;
 mod scope;
 mod state;
@@ -1209,6 +1210,12 @@ fn run_service(a: RunArgs, form: runform::RunForm) -> Result<Output> {
 
     let log_path = store.log_path(&scope, &name);
     state::create_private_dir_all(log_path.parent().expect("log has parent"))?;
+    // Rotate before the new process gets the file. Best effort: a failure
+    // (for example another program holding the file exclusively on Windows)
+    // only means the log keeps growing until a later rotation succeeds.
+    if let Some(max) = cfg.log_max_size {
+        let _ = rotate::copy_truncate(&log_path, max);
+    }
     let mut log = state::private_file()
         .append(true)
         .open(&log_path)
@@ -1972,6 +1979,11 @@ fn cmd_logs(target: &str, follow: bool, tail: Option<u64>, json: bool) -> Result
     let mut buf = Vec::new();
     loop {
         let running = svc.is_running();
+        if file.metadata()?.len() < pos {
+            // Rotated (copied to `.log.1` and truncated in place): the
+            // service now writes from the start of the same file.
+            pos = 0;
+        }
         file.seek(SeekFrom::Start(pos))?;
         buf.clear();
         file.read_to_end(&mut buf)?;

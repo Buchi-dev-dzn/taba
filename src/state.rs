@@ -5,8 +5,10 @@
 //! ```text
 //! services/<scope>/<name>.json   service records (v0.1 fields + optional v0.2 fields)
 //! logs/<scope>/<name>.log         service output
+//! logs/<scope>/<name>.log.1       its previous `log_max_size` bytes (rotated)
 //! ops/<scope>/<name>.json         in-flight mutation of one service (operation lock)
 //! events.jsonl                    append-only audit log
+//! events.jsonl.1                  its previous generation (`events_max_size`)
 //! version                         state schema version
 //! lock                            global lock (flock / LockFileEx)
 //! lock.holder                     pid of the last process that took the global lock
@@ -518,13 +520,17 @@ impl Store {
     }
 
     /// Appends one event to `events.jsonl` as a single line written with one
-    /// `write`. Call under the global lock.
+    /// `write`. Call under the global lock. A file that reached
+    /// `events_max_size` is first renamed to `events.jsonl.1` (best effort:
+    /// a failed rotation still appends).
     pub fn append_event(&self, event: &serde_json::Value) -> io::Result<()> {
         let mut line = serde_json::to_vec(event)?;
         line.push(b'\n');
-        let mut f = private_file()
-            .append(true)
-            .open(self.root.join("events.jsonl"))?;
+        let path = self.root.join("events.jsonl");
+        if let Some(max) = crate::config::events_max_size(&self.root) {
+            let _ = crate::rotate::rename_if_over(&path, max);
+        }
+        let mut f = private_file().append(true).open(&path)?;
         f.write_all(&line)
     }
 
@@ -618,14 +624,19 @@ impl Store {
     }
 
     /// Moves the record (rewritten as `svc`, already renamed) and the log of
-    /// `from_scope/name` to `svc.scope/name`. The running process keeps its
-    /// open log file, so logging continues in the renamed file.
+    /// `from_scope/name` (with its rotated `.1` file) to `svc.scope/name`.
+    /// The running process keeps its open log file, so logging continues in
+    /// the renamed file.
     pub fn move_service(&self, from_scope: &str, svc: &Service) -> io::Result<()> {
         let old_log = self.log_path(from_scope, &svc.name);
         let new_log = self.log_path(&svc.scope, &svc.name);
         create_private_dir_all(new_log.parent().expect("log has parent"))?;
         if old_log.exists() {
             fs::rename(&old_log, &new_log)?;
+        }
+        let old_rotated = crate::rotate::rotated(&old_log);
+        if old_rotated.exists() {
+            fs::rename(&old_rotated, crate::rotate::rotated(&new_log))?;
         }
         self.put(svc)?;
         remove_file_and_empty_parent(&self.record_path(from_scope, &svc.name))?;
@@ -645,8 +656,30 @@ impl Store {
     }
 
     /// Logs without a service record (of dropped services), with their
-    /// scope directory.
+    /// scope directory; rotated `<name>.log.1` files are listed on their own.
     pub fn orphan_logs(&self) -> io::Result<Vec<PathBuf>> {
+        Ok(self
+            .scan_logs()?
+            .into_iter()
+            .filter(|(_, r)| !r)
+            .map(|(p, _)| p)
+            .collect())
+    }
+
+    /// The current `<name>.log` files of existing service records (not
+    /// their rotated `.1` files): the logs `log_max_size` applies to.
+    pub fn record_logs(&self) -> io::Result<Vec<PathBuf>> {
+        Ok(self
+            .scan_logs()?
+            .into_iter()
+            .filter(|(p, r)| *r && p.extension().is_some_and(|x| x == "log"))
+            .map(|(p, _)| p)
+            .collect())
+    }
+
+    /// Every `<name>.log` and `<name>.log.1` under `logs/`, with whether
+    /// the service record still exists.
+    fn scan_logs(&self) -> io::Result<Vec<(PathBuf, bool)>> {
         let mut out = Vec::new();
         let Ok(scopes) = fs::read_dir(self.root.join("logs")) else {
             return Ok(out);
@@ -661,13 +694,12 @@ impl Store {
                 let Some(name) = path
                     .file_name()
                     .and_then(|n| n.to_str())
-                    .and_then(|n| n.strip_suffix(".log"))
+                    .and_then(|n| n.strip_suffix(".log.1").or_else(|| n.strip_suffix(".log")))
                 else {
                     continue;
                 };
-                if !self.record_path(&scope, name).exists() {
-                    out.push(path);
-                }
+                let has_record = self.record_path(&scope, name).exists();
+                out.push((path, has_record));
             }
         }
         Ok(out)
@@ -704,9 +736,11 @@ impl Store {
     pub fn remove(&self, scope: &str, name: &str) -> io::Result<()> {
         validate_ident("scope", scope).map_err(io::Error::other)?;
         validate_ident("name", name).map_err(io::Error::other)?;
+        let log = self.log_path(scope, name);
         for path in [
             self.record_path(scope, name),
-            self.log_path(scope, name),
+            crate::rotate::rotated(&log),
+            log,
             self.op_path(scope, name),
             self.claims_path(scope, name),
         ] {
