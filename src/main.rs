@@ -632,7 +632,7 @@ fn main() -> ExitCode {
     // main-thread stack. Parse and dispatch on a thread with an explicit stack.
     #[cfg(windows)]
     {
-        return std::thread::Builder::new()
+        std::thread::Builder::new()
             .name("taba-main".into())
             .stack_size(8 * 1024 * 1024)
             .spawn(main_impl)
