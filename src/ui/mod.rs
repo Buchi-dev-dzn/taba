@@ -5,7 +5,9 @@
 //! `ps`'s lease peek, so watching changes nothing). `x` stops or removes
 //! through the same functions as `taba stop` / `taba rm`, as the caller
 //! resolved like any CLI call (`$TABA_SCOPE`, `$TABA_AGENT`, git worktree),
-//! and never with `--force`. Quitting never stops anything.
+//! and never with `--force`. `i` on an interactive service (in the list or its
+//! log view) suspends the TUI and types into it until Ctrl+]. Quitting
+//! never stops anything.
 //!
 //! Built on ratatui with the crossterm backend (macOS, Linux and Windows
 //! terminals). The state and key handling live in `app.rs` and drawing in
@@ -135,6 +137,30 @@ fn event_loop(
                     running = Some((handle, rx, action));
                 }
                 Effect::OpenLog(path) => tail = Some(LogTail::new(path)),
+                Effect::Attach(scope, name) => {
+                    // The log view in input mode, as `taba attach SCOPE/NAME`
+                    // (never forced), with the TUI suspended until Ctrl+].
+                    ratatui::restore();
+                    let res =
+                        crate::input::attach_from_ui(store, caller, &format!("{scope}/{name}"));
+                    *terminal = ratatui::try_init().map_err(io_err)?;
+                    terminal.clear().map_err(io_err)?;
+                    match res {
+                        Ok(()) => {
+                            app.notice = Some(app::Notice {
+                                text: format!("detached from {scope}/{name}"),
+                                error: false,
+                            })
+                        }
+                        Err(e) => {
+                            app.notice = Some(app::Notice {
+                                text: e.message,
+                                error: true,
+                            })
+                        }
+                    }
+                    next_refresh = Instant::now();
+                }
                 Effect::None => {}
             }
         }
@@ -304,6 +330,8 @@ mod tests {
                     env_keys: Vec::new(),
                     env_hash: None,
                     discovered_ports: Vec::new(),
+                    input: None,
+                    dev_kind: None,
                 })
                 .unwrap();
         }

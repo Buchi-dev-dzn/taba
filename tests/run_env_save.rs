@@ -95,7 +95,7 @@ fn correction_diagnostics_do_not_echo_env_values() {
     let inline = format!("--env={token}");
     for env in [vec!["--env", token.as_str()], vec![inline.as_str()]] {
         for quoted in [false, true] {
-            let mut args = vec!["run", "--name", "web"];
+            let mut args = vec!["run", "--name", "web", "--interactive", "--save"];
             args.extend_from_slice(&env);
             if quoted {
                 args.extend_from_slice(&["npm run dev", "--open"]);
@@ -184,7 +184,12 @@ fn child_drops_caller_identity_but_honors_deliberate_env_overrides() {
             "vars=['deliberate', '123', 'text']",
         ),
     ] {
-        let args = run_args(name, &env, &["--save"], &command);
+        let switches = if cfg!(unix) {
+            vec!["--interactive", "--save"]
+        } else {
+            vec!["--no-interactive", "--save"]
+        };
+        let args = run_args(name, &env, &switches, &command);
         let out = f
             .cmd(&f.wt_a, &args)
             .env("TABA_AGENT", "agent-a")
@@ -194,6 +199,13 @@ fn child_drops_caller_identity_but_honors_deliberate_env_overrides() {
             .unwrap();
         assert_eq!(exit(&out), 0, "{}", text(&out));
         let v = json(&out);
+        assert_eq!(v["interactive"], cfg!(unix));
+        assert!(
+            v["saved"]["definition"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("interactive = {}", cfg!(unix)))
+        );
         let log = std::fs::read_to_string(v["log_path"].as_str().unwrap()).unwrap();
         assert!(log.contains(expected), "{log}");
         let stopped = f
@@ -210,6 +222,7 @@ fn child_drops_caller_identity_but_honors_deliberate_env_overrides() {
             .output()
             .unwrap();
         assert_eq!(exit(&up), 0, "{}", text(&up));
+        assert_eq!(json(&up)["results"][0]["interactive"], cfg!(unix));
         let logs = f.taba(&f.wt_a, &["logs", name]);
         assert!(text(&logs).contains(expected), "{}", text(&logs));
         let stopped = f
@@ -280,6 +293,7 @@ fn env_values_never_reach_state_events_logs_or_output() {
         v["error"]["details"]["env"],
         serde_json::json!(["API_TOKEN", "MODE"])
     );
+    assert_eq!(v["error"]["details"]["interactive"], false);
     let out = run(&f, &f.wt_a, &run_args("api", &changed, &[], &cmd));
     assert_eq!(exit(&out), 3);
     assert_no_secret("human error", &out);

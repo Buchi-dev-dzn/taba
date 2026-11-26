@@ -363,6 +363,7 @@ fn explicit_form_is_unchanged() {
             "directory",
             "discovered_ports",
             "instance",
+            "interactive",
             "log_path",
             "name",
             "ok",

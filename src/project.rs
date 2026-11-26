@@ -27,6 +27,8 @@ pub struct ServiceDef {
     /// Absolute: `cwd` resolved against the file's directory.
     pub cwd: PathBuf,
     pub service_ttl: Option<u64>,
+    /// `interactive = true/false`; unset: detected as for `run`.
+    pub interactive: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -151,6 +153,7 @@ fn parse_service(path: &Path, dir: &Path, name: &str, value: &toml::Value) -> Re
     let mut env = Vec::new();
     let mut cwd = crate::util::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     let mut service_ttl = None;
+    let mut interactive = None;
     for (k, v) in t {
         let key = at(k);
         let string = |v: &toml::Value| {
@@ -221,11 +224,18 @@ fn parse_service(path: &Path, dir: &Path, name: &str, value: &toml::Value) -> Re
                 service_ttl =
                     Some(parse_service_ttl_flag(&string(v)?).map_err(|m| err(path, &key, m))?)
             }
+            "interactive" => {
+                interactive = Some(
+                    v.as_bool()
+                        .ok_or_else(|| err(path, &key, "must be true or false"))?,
+                )
+            }
             _ => {
                 return Err(err(
                     path,
                     &key,
-                    "unknown key (known: cmd, port, ready, wait, env, cwd, service_ttl)",
+                    "unknown key (known: cmd, port, ready, wait, env, cwd, service_ttl, \
+                     interactive)",
                 ));
             }
         }
@@ -253,6 +263,7 @@ fn parse_service(path: &Path, dir: &Path, name: &str, value: &toml::Value) -> Re
         env,
         cwd,
         service_ttl,
+        interactive,
     })
 }
 
@@ -326,8 +337,8 @@ pub fn ready_text(r: &ReadySpec) -> String {
     }
 }
 
-/// What `run --save` asks to write. `wait`, `ready` and `service_ttl` are
-/// `None` when the run did not give them: the file's value is kept.
+/// What `run --save` asks to write. `wait`, `ready`, `service_ttl` and
+/// `interactive` are `None` when omitted: the file's value is kept.
 #[derive(Clone)]
 pub struct SaveRequest {
     pub name: String,
@@ -338,6 +349,7 @@ pub struct SaveRequest {
     pub env: Vec<(String, String)>,
     pub cwd: PathBuf,
     pub service_ttl: Option<u64>,
+    pub interactive: Option<bool>,
 }
 
 /// A checked `run --save`, written by `write_save` once the run succeeded.
@@ -368,6 +380,7 @@ fn same_def(a: &ServiceDef, b: &ServiceDef) -> bool {
         && ae == be
         && a.cwd == b.cwd
         && a.service_ttl == b.service_ttl
+        && a.interactive == b.interactive
 }
 
 /// Checks a `run --save` before anything starts: reads the file (an invalid
@@ -404,6 +417,7 @@ pub fn plan_save(path: PathBuf, req: SaveRequest, force: bool) -> Result<SavePla
         env: req.env,
         cwd: req.cwd,
         service_ttl: req.service_ttl.or(old.and_then(|o| o.service_ttl)),
+        interactive: req.interactive.or(old.and_then(|o| o.interactive)),
     };
     let dir = path.parent().unwrap_or(Path::new("."));
     let result = match old {
@@ -491,6 +505,9 @@ fn def_table(def: &ServiceDef, dir: &Path, hide_values: bool) -> toml_edit::Tabl
     }
     if let Some(ttl) = def.service_ttl {
         t.insert("service_ttl", value(crate::config::format_duration(ttl)));
+    }
+    if let Some(interactive) = def.interactive {
+        t.insert("interactive", value(interactive));
     }
     t
 }
@@ -596,6 +613,7 @@ mod tests {
             env: vec![("TOKEN".into(), "dummy-save-secret".into())],
             cwd: crate::util::canonicalize(dir).unwrap(),
             service_ttl: None,
+            interactive: None,
         }
     }
 
@@ -724,6 +742,7 @@ port = 5432
 cmd = ["python3", "worker.py"]
 ready = "log:started"
 service_ttl = "2h"
+interactive = true
 "#)
         .unwrap();
         let names: Vec<_> = pr.services.iter().map(|s| s.name.as_str()).collect();
@@ -739,6 +758,8 @@ service_ttl = "2h"
         assert_eq!(pr.services[1].port, Some(PortSpec::Fixed(5432)));
         assert_eq!(pr.services[1].wait, DEFAULT_WAIT);
         assert_eq!(pr.services[2].service_ttl, Some(7200));
+        assert_eq!(pr.services[2].interactive, Some(true));
+        assert_eq!(pr.services[0].interactive, None);
         let sel = pr
             .select(&["worker".into(), "web".into(), "worker".into()])
             .unwrap();

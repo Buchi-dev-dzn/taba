@@ -206,6 +206,9 @@ pub enum Access {
     /// `stop`, `rm`, `keep`, `disown`: renew, take over, or `E_SCOPE_HELD`;
     /// no record is created.
     Mutate,
+    /// Input authorization: like `Mutate`, but leave queued notices for
+    /// a subsequent command that can report them.
+    MutateKeepNotices,
     /// `whoami`: renew or take over, but report a live foreign holder
     /// instead of failing.
     Observe,
@@ -399,7 +402,10 @@ pub fn touch(
             rec.branch = Some(b.clone());
             changed = true;
         }
-        if (access != Access::Peek || state.is_live()) && !rec.notices.is_empty() {
+        if access != Access::MutateKeepNotices
+            && (access != Access::Peek || state.is_live())
+            && !rec.notices.is_empty()
+        {
             for n in rec.notices.drain(..) {
                 out.warnings.push(Warning {
                     code: notice_code(&n.code),

@@ -6,6 +6,7 @@
 //! services/<scope>/<name>.json   service records (v0.1 fields + optional v0.2 fields)
 //! logs/<scope>/<name>.log         service output
 //! ops/<scope>/<name>.json         in-flight mutation of one service (operation lock)
+//! inputs/<scope>/<name>.fifo      input of a service started with `run --interactive` (Unix)
 //! events.jsonl                    append-only audit log
 //! env.key                         random key for `env_hash` (see `env_fingerprint`)
 //! version                         state schema version
@@ -153,6 +154,29 @@ pub struct Service {
     /// TCP ports discovered for the short `run` form.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub discovered_ports: Vec<u16>,
+    /// `run --interactive` (Unix): the input FIFO and the holder process that
+    /// forwards it to the service's terminal (see `input.rs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<Input>,
+    /// Detected at launch, so editing a package script doesn't change what
+    /// `reload` thinks the running service is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dev_kind: Option<crate::input::Kind>,
+}
+
+/// The input side of an interactive service. Its stdin is a pseudo-terminal;
+/// the holder keeps the terminal's master side open and copies what `send`
+/// and `attach` write to `fifo` into it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Input {
+    pub fifo: PathBuf,
+    pub holder_pid: i32,
+    /// Holder start time, in the units of `Service::start_time`.
+    pub holder_start_time: u64,
+    /// The FIFO opened by this holder (device and inode). Older records
+    /// cannot prove this identity and must be restarted before taking input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fifo_identity: Option<(u64, u64)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -463,6 +487,14 @@ impl Store {
             .join(format!("{name}.log"))
     }
 
+    /// The FIFO used as stdin by a service started with `run --interactive`.
+    pub fn input_path(&self, scope: &str, name: &str) -> PathBuf {
+        self.root
+            .join("inputs")
+            .join(scope)
+            .join(format!("{name}.fifo"))
+    }
+
     fn op_path(&self, scope: &str, name: &str) -> PathBuf {
         self.root
             .join("ops")
@@ -484,6 +516,26 @@ impl Store {
 
     pub fn put(&self, svc: &Service) -> io::Result<()> {
         write_json(&self.record_path(&svc.scope, &svc.name), svc)
+    }
+
+    /// Roll back a failed publish, including errors after the record rename.
+    /// Leave claims and logs in place. Call under the global lock.
+    pub(crate) fn rollback_start(
+        &self,
+        svc: &Service,
+        previous: Option<&Service>,
+    ) -> io::Result<()> {
+        if self
+            .get(&svc.scope, &svc.name)?
+            .is_some_and(|cur| cur.instance() == svc.instance())
+        {
+            if let Some(previous) = previous {
+                self.put(previous)?;
+            } else {
+                remove_file_and_empty_parent(&self.record_path(&svc.scope, &svc.name))?;
+            }
+        }
+        Ok(())
     }
 
     /// The operation lock of `scope/name`, if a record exists (it may be stale).
@@ -682,6 +734,16 @@ impl Store {
         if let Some(dir) = old_log.parent() {
             let _ = fs::remove_dir(dir);
         }
+        // The service keeps its open FIFO; only the name writers use moves.
+        let old_input = self.input_path(from_scope, &svc.name);
+        if old_input.symlink_metadata().is_ok() {
+            let new_input = self.input_path(&svc.scope, &svc.name);
+            create_private_dir_all(new_input.parent().expect("input has parent"))?;
+            fs::rename(&old_input, &new_input)?;
+            if let Some(dir) = old_input.parent() {
+                let _ = fs::remove_dir(dir);
+            }
+        }
         let old_claims = self.claims_path(from_scope, &svc.name);
         if old_claims.exists() {
             let new_claims = self.claims_path(&svc.scope, &svc.name);
@@ -741,6 +803,7 @@ impl Store {
             self.record_path(scope, name),
             self.op_path(scope, name),
             self.claims_path(scope, name),
+            self.input_path(scope, name),
         ] {
             remove_file_and_empty_parent(&path)?;
         }
@@ -759,6 +822,7 @@ impl Store {
             self.log_path(scope, name),
             self.op_path(scope, name),
             self.claims_path(scope, name),
+            self.input_path(scope, name),
         ] {
             remove_file_and_empty_parent(&path)?;
         }

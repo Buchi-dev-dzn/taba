@@ -99,7 +99,17 @@ pub const RUN_VALUE_FLAGS: &[&str] = &[
     "--env",
 ];
 /// taba's `run` flags without a separate value.
-pub const RUN_SWITCHES: &[&str] = &["--wait", "--save", "--force", "--json", "--help", "-h"];
+pub const RUN_SWITCHES: &[&str] = &[
+    "--wait",
+    "--interactive",
+    "-i",
+    "--no-interactive",
+    "--save",
+    "--force",
+    "--json",
+    "--help",
+    "-h",
+];
 
 /// How the command was written on the `run` command line, read from the
 /// raw arguments (clap cannot tell these apart).
@@ -624,6 +634,21 @@ mod tests {
 
     fn strings(words: &[&str]) -> Vec<String> {
         words.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn prepare_knows_the_interactive_switches() {
+        for flag in ["-i", "--interactive", "--no-interactive"] {
+            let (args, _) = prepare(strings(&["taba", "run", "flutter run", flag])).unwrap();
+            assert_eq!(
+                args,
+                strings(&["taba", "run", flag, "--", "flutter run"]),
+                "{flag}"
+            );
+            let (args, shape) = prepare(strings(&["taba", "run", flag, "vite"])).unwrap();
+            assert_eq!(args, strings(&["taba", "run", flag, "vite"]), "{flag}");
+            assert!(shape.options_first, "{flag}");
+        }
     }
 
     #[test]

@@ -124,10 +124,15 @@ pub fn spawn_detached(mut cmd: Command) -> Result<Spawned, SpawnError> {
             Ok(())
         });
     }
-    let child = cmd.spawn().map_err(SpawnError::Start)?;
+    let mut child = cmd.spawn().map_err(SpawnError::Start)?;
     let pid = child.id() as i32;
-    drop(child);
-    let info = info(pid).ok_or(SpawnError::Vanished)?;
+    let Some(info) = info(pid) else {
+        // The direct child has not been reaped and its PID cannot have
+        // been reused. Do not leave it running without an identity record.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(SpawnError::Vanished);
+    };
     Ok(Spawned {
         pid,
         pgid: pid,

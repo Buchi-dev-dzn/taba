@@ -7,6 +7,7 @@ mod error;
 mod gc;
 mod handoff;
 mod hooks;
+mod input;
 mod lease;
 mod listing;
 mod ports;
@@ -91,6 +92,14 @@ enum Cmd {
         /// already_running re-run), independent of the lease
         #[arg(long, value_parser = config::parse_service_ttl_flag)]
         service_ttl: Option<u64>,
+        /// Interactive: the service's stdin is a terminal that `taba attach`,
+        /// `taba send` and `i` in the log view type into (macOS, Linux).
+        /// Default for `flutter run` and `vite`
+        #[arg(short = 'i', long)]
+        interactive: bool,
+        /// Not interactive, also for `flutter run` and `vite`
+        #[arg(long, conflicts_with = "interactive")]
+        no_interactive: bool,
         /// Set an environment variable for the service (repeatable). Values
         /// are never stored in taba state or printed.
         #[arg(long = "env", value_name = "KEY=VALUE")]
@@ -108,6 +117,102 @@ enum Cmd {
         /// flag, passed on unchanged (`--` before it is optional)
         #[arg(required = true, trailing_var_arg = true, value_name = "CMD")]
         command: Vec<String>,
+    },
+    /// Write a line (or one key) to the stdin of an interactive service
+    Send {
+        /// SCOPE/NAME, or NAME in the caller's scope
+        target: String,
+        /// Text to write; a newline is added unless --no-newline
+        #[arg(required_unless_present = "key", conflicts_with = "key")]
+        text: Option<String>,
+        /// Write one key without a newline: a character such as r, or enter,
+        /// esc, tab, space, backspace, ctrl-X
+        #[arg(long, value_parser = input::parse_key, value_name = "KEY")]
+        key: Option<input::Key>,
+        /// Do not add a newline after TEXT
+        #[arg(long, conflicts_with = "key")]
+        no_newline: bool,
+        /// The caller's scope (default: $TABA_SCOPE, else the git worktree)
+        #[arg(long)]
+        scope: Option<String>,
+        /// Agent acting (default: $TABA_AGENT, else "human")
+        #[arg(long)]
+        agent: Option<String>,
+        /// Write to a service of another scope (needs --reason; recorded)
+        #[arg(long)]
+        force: bool,
+        /// Why --force is needed (recorded in events.jsonl)
+        #[arg(long, requires = "force")]
+        reason: Option<String>,
+        /// Print one JSON document (also: TABA_OUTPUT=json)
+        #[arg(long)]
+        json: bool,
+    },
+    /// Follow an interactive service's log and type into it; Ctrl+] stops
+    /// typing, q quits, and the service keeps running
+    Attach {
+        /// SCOPE/NAME, or NAME in the caller's scope
+        target: String,
+        /// The caller's scope (default: $TABA_SCOPE, else the git worktree)
+        #[arg(long)]
+        scope: Option<String>,
+        /// Agent acting (default: $TABA_AGENT, else "human")
+        #[arg(long)]
+        agent: Option<String>,
+        /// Attach to a service of another scope (needs --reason; recorded)
+        #[arg(long)]
+        force: bool,
+        /// Why --force is needed (recorded in events.jsonl)
+        #[arg(long, requires = "force")]
+        reason: Option<String>,
+    },
+    /// Reload a dev server: `flutter run` hot reload (SIGUSR1; --restart:
+    /// hot restart, SIGUSR2), `vite` restart (`r` on its stdin)
+    Reload {
+        /// SCOPE/NAME, or NAME in the caller's scope
+        target: String,
+        /// Flutter: hot restart instead of hot reload
+        #[arg(long)]
+        restart: bool,
+        /// The caller's scope (default: $TABA_SCOPE, else the git worktree)
+        #[arg(long)]
+        scope: Option<String>,
+        /// Agent acting (default: $TABA_AGENT, else "human")
+        #[arg(long)]
+        agent: Option<String>,
+        /// Reload a service of another scope (needs --reason; recorded)
+        #[arg(long)]
+        force: bool,
+        /// Why --force is needed (recorded in events.jsonl)
+        #[arg(long, requires = "force")]
+        reason: Option<String>,
+        /// Print one JSON document (also: TABA_OUTPUT=json)
+        #[arg(long)]
+        json: bool,
+    },
+    /// Send SIGUSR1, SIGUSR2 or SIGHUP to a service's main process (Unix;
+    /// `flutter run` hot-reloads on USR1 and hot-restarts on USR2)
+    Signal {
+        /// SCOPE/NAME, or NAME in the caller's scope
+        target: String,
+        /// USR1, USR2 or HUP
+        #[arg(value_enum, ignore_case = true)]
+        signal: input::Signal,
+        /// The caller's scope (default: $TABA_SCOPE, else the git worktree)
+        #[arg(long)]
+        scope: Option<String>,
+        /// Agent acting (default: $TABA_AGENT, else "human")
+        #[arg(long)]
+        agent: Option<String>,
+        /// Signal a service of another scope (needs --reason; recorded)
+        #[arg(long)]
+        force: bool,
+        /// Why --force is needed (recorded in events.jsonl)
+        #[arg(long, requires = "force")]
+        reason: Option<String>,
+        /// Print one JSON document (also: TABA_OUTPUT=json)
+        #[arg(long)]
+        json: bool,
     },
     /// Start the services declared in the nearest taba.toml (all, or NAME...
     /// in that order) and wait until each is ready; running ones are reused
@@ -419,6 +524,16 @@ enum Cmd {
     #[cfg(windows)]
     #[command(name = "__ctrl-break", hide = true)]
     CtrlBreak { attach: u32, pgid: u32 },
+    /// Internal (Unix): the input holder of an interactive service
+    #[cfg(unix)]
+    #[command(name = "__hold", hide = true)]
+    Hold {
+        master: i32,
+        fifo: i32,
+        pid: i32,
+        pgid: i32,
+        start_time: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -537,6 +652,23 @@ fn usage_error(e: &clap::Error, args: &[String]) -> TabaError {
 }
 
 fn main() -> ExitCode {
+    // Clap's large derived command tree overflows the smaller default Windows
+    // main-thread stack. Parse and dispatch on a thread with an explicit stack.
+    #[cfg(windows)]
+    {
+        std::thread::Builder::new()
+            .name("taba-main".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(main_impl)
+            .expect("start taba main thread")
+            .join()
+            .expect("taba main thread")
+    }
+    #[cfg(not(windows))]
+    main_impl()
+}
+
+fn main_impl() -> ExitCode {
     let raw: Vec<String> = std::env::args().collect();
     let (args, shape) = match runform::prepare(raw.clone()) {
         Ok(prepared) => prepared,
@@ -570,6 +702,16 @@ fn main() -> ExitCode {
         Cmd::CtrlBreak { attach, pgid } => {
             return ExitCode::from(proc::ctrl_break_helper(attach, pgid));
         }
+        #[cfg(unix)]
+        Cmd::Hold {
+            master,
+            fifo,
+            pid,
+            pgid,
+            start_time,
+        } => {
+            return ExitCode::from(input::hold(master, fifo, pid, pgid, start_time));
+        }
         Cmd::Run {
             scope,
             agent,
@@ -579,6 +721,8 @@ fn main() -> ExitCode {
             ready,
             ttl,
             service_ttl,
+            interactive,
+            no_interactive,
             env,
             save,
             force,
@@ -586,7 +730,7 @@ fn main() -> ExitCode {
             command,
         } => {
             let json = json || env_json();
-            let interactive = !json
+            let prompt = !json
                 && std::env::var_os("TABA_AGENT").is_none_or(|a| a.is_empty())
                 && io::stdin().is_terminal()
                 && io::stderr().is_terminal();
@@ -603,6 +747,11 @@ fn main() -> ExitCode {
                             ready,
                             ttl,
                             service_ttl,
+                            interactive: if no_interactive {
+                                Some(false)
+                            } else {
+                                interactive.then_some(true)
+                            },
                             command,
                             cwd: None,
                             env,
@@ -610,12 +759,92 @@ fn main() -> ExitCode {
                             force,
                             shape,
                             raw,
-                            interactive,
+                            prompt,
                         })
                     })
                     .map(Some),
             )
         }
+        Cmd::Send {
+            target,
+            text,
+            key,
+            no_newline,
+            scope,
+            agent,
+            force,
+            reason,
+            json,
+        } => (
+            json || env_json(),
+            input::cmd_send(input::SendArgs {
+                target,
+                text,
+                key,
+                no_newline,
+                scope,
+                agent,
+                force,
+                reason,
+            })
+            .map(Some),
+        ),
+        Cmd::Attach {
+            target,
+            scope,
+            agent,
+            force,
+            reason,
+        } => (
+            env_json(),
+            input::cmd_attach(input::AttachArgs {
+                target,
+                scope,
+                agent,
+                force,
+                reason,
+            }),
+        ),
+        Cmd::Reload {
+            target,
+            restart,
+            scope,
+            agent,
+            force,
+            reason,
+            json,
+        } => (
+            json || env_json(),
+            input::cmd_reload(input::ReloadArgs {
+                target,
+                restart,
+                scope,
+                agent,
+                force,
+                reason,
+            })
+            .map(Some),
+        ),
+        Cmd::Signal {
+            target,
+            signal,
+            scope,
+            agent,
+            force,
+            reason,
+            json,
+        } => (
+            json || env_json(),
+            input::cmd_signal(input::SignalArgs {
+                target,
+                signal,
+                scope,
+                agent,
+                force,
+                reason,
+            })
+            .map(Some),
+        ),
         Cmd::Up {
             names,
             scope,
@@ -996,6 +1225,8 @@ struct RunArgs {
     ready: Option<ReadySpec>,
     ttl: Option<config::Ttl>,
     service_ttl: Option<u64>,
+    /// `-i` (Some(true)), `--no-interactive` (Some(false)), else detected.
+    interactive: Option<bool>,
     /// The command as clap collected it; [`runform::command_spec`] turns it
     /// into the argv to start.
     command: Vec<String>,
@@ -1009,7 +1240,36 @@ struct RunArgs {
     /// The original arguments, program name first (for corrections).
     raw: Vec<String>,
     /// A person at a terminal: a correctable command is offered to run.
-    interactive: bool,
+    prompt: bool,
+}
+
+/// Until the service is published, this invocation owns both processes.
+/// Runs before the state lock and pending terminal are dropped on failure.
+struct PendingStart {
+    service: proc::Spawned,
+    holder: Option<(i32, u64)>,
+    published: bool,
+}
+
+impl Drop for PendingStart {
+    fn drop(&mut self) {
+        if self.published {
+            return;
+        }
+        if let Some((pid, start)) = self.holder
+            && proc::is_alive(pid, start)
+        {
+            let _ = proc::stop_group(pid, pid, start, Duration::from_secs(2));
+        }
+        let proc::Spawned {
+            pid,
+            pgid,
+            start_time,
+        } = self.service;
+        if proc::group_is_ours(pid, pgid, start_time) {
+            let _ = proc::stop_group(pid, pgid, start_time, Duration::from_secs(2));
+        }
+    }
 }
 
 fn cmd_run(mut a: RunArgs) -> Result<Output> {
@@ -1023,7 +1283,7 @@ fn cmd_run(mut a: RunArgs) -> Result<Output> {
                 .and_then(|d| d["corrected"].as_str())
                 .map(String::from);
             match fixed {
-                Some(fixed) if a.interactive && confirm_corrected(&fixed) => {
+                Some(fixed) if a.prompt && confirm_corrected(&fixed) => {
                     let shape = runform::Shape {
                         separator: true,
                         ..a.shape
@@ -1050,6 +1310,7 @@ fn cmd_run(mut a: RunArgs) -> Result<Output> {
                 env: a.env.clone(),
                 cwd,
                 service_ttl: a.service_ttl,
+                interactive: a.interactive,
             },
             a.force,
         )?)
@@ -1066,7 +1327,7 @@ fn cmd_run(mut a: RunArgs) -> Result<Output> {
         );
         out.body.insert("saved".into(), json!({"path": plan.path, "name": plan.def.name, "result": plan.result, "definition": shown}));
         if !plan.def.env.is_empty() && plan.result != "unchanged" {
-            out.warnings.push(Warning { code: "W_ENV_SAVED", message: "environment values were saved to taba.toml in plain text; do not commit secrets".into() });
+            out.warnings.push(Warning { code: "W_ENV_SAVED", message: "environment values were saved to taba.toml in plain text; do not commit secrets".into(), details: None });
         }
     }
     Ok(out)
@@ -1127,6 +1388,13 @@ fn run_service(a: RunArgs, form: runform::RunForm) -> Result<Output> {
             ));
         }
     };
+    if a.interactive == Some(true) && cfg!(windows) {
+        return Err(input::unsupported("run --interactive"));
+    }
+    // `flutter run` and `vite` are interactive unless --no-interactive.
+    let interactive = a
+        .interactive
+        .unwrap_or_else(|| cfg!(unix) && input::detect(&a.command, &dir) != input::Kind::Other);
     if let Some(r) = &a.ready
         && r.needs_port()
         && a.port.is_none()
@@ -1203,6 +1471,7 @@ fn run_service(a: RunArgs, form: runform::RunForm) -> Result<Output> {
         if ex.template() == template.as_slice()
             && ex.cwd == dir
             && ex.port_request() == port_request
+            && ex.input.is_some() == interactive
             && ex.env_keys == env_keys
             && ex.env_hash == env_hash
         {
@@ -1220,14 +1489,15 @@ fn run_service(a: RunArgs, form: runform::RunForm) -> Result<Output> {
         return Err(TabaError::new(
             "E_CONFLICT",
             format!(
-                "{} is already running with a different command, directory, port or environment; stop it first",
+                "{} is already running with a different command, directory, port, environment or \
+                 interactive mode; stop it first",
                 ex.id(),
             ),
         )
         .details(json!({
             "service": ex.id(), "command": ex.template(), "directory": ex.cwd,
             "port": ex.port, "port_request": ex.port_request(), "instance": ex.instance(),
-            "env": ex.env_keys,
+            "interactive": ex.input.is_some(), "env": ex.env_keys,
         }))
         .next(Next::run(
             "stop it, then run again",
@@ -1285,6 +1555,19 @@ fn run_service(a: RunArgs, form: runform::RunForm) -> Result<Output> {
     let log_offset = log.metadata()?.len();
     let log_err = log.try_clone()?;
 
+    let mut terminal = if interactive {
+        Some(input::create(&store, &scope, &name)?)
+    } else {
+        None
+    };
+    let holder_err = match &terminal {
+        Some(_) => Some(log.try_clone()?),
+        None => None,
+    };
+    let stdin = match &terminal {
+        Some(t) => Stdio::from(t.stdin.try_clone()?),
+        None => Stdio::null(),
+    };
     let mut cmd = Command::new(proc::resolve_program(&command[0]));
     #[cfg(windows)]
     if let Some(line) = runform::shell_line(&command) {
@@ -1306,7 +1589,7 @@ fn run_service(a: RunArgs, form: runform::RunForm) -> Result<Output> {
         .envs(a.env.iter().map(|(k, v)| (k, v)))
         .env("TABA_SCOPE", &scope)
         .env("TABA_SERVICE", &name)
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));
     if let Some(p) = port {
@@ -1327,7 +1610,22 @@ fn run_service(a: RunArgs, form: runform::RunForm) -> Result<Output> {
             start_failed(format!("{id} exited immediately; see taba logs {id}"))
         }
     })?;
+    let mut pending = PendingStart {
+        service: spawned,
+        holder: None,
+        published: false,
+    };
+    // Interactive: the holder keeps the terminal open and feeds it input.
+    let input = match (terminal.as_ref(), holder_err) {
+        (Some(t), Some(err)) => {
+            let input = input::spawn_holder(t, &spawned, err)?;
+            pending.holder = Some((input.holder_pid, input.holder_start_time));
+            Some(input)
+        }
+        _ => None,
+    };
     let pid = spawned.pid;
+    let kind = input::detect(&command, &dir);
     let mut svc = Service {
         scope: scope.clone(),
         name: name.clone(),
@@ -1352,13 +1650,32 @@ fn run_service(a: RunArgs, form: runform::RunForm) -> Result<Output> {
         env_keys,
         env_hash,
         discovered_ports: Vec::new(),
+        input,
+        dev_kind: (kind != input::Kind::Other).then_some(kind),
     };
-    store.put(&svc)?;
-    if let Some(borrow) = &delegation {
-        borrows::rebind(&store, borrow, &svc)?;
-    }
     let op = if replacing { "replace" } else { "start" };
-    store.put_op(&scope, &name, &OpLock::mine(op, &caller.agent))?;
+    let publish = || -> Result<()> {
+        store.put_op(&scope, &name, &OpLock::mine(op, &caller.agent))?;
+        store.put(&svc)?;
+        if let (Some(borrow), Some(previous)) = (&delegation, &existing)
+            && let Err(e) = borrows::rebind(&store, borrow, &svc)
+        {
+            let _ = borrows::rebind(&store, borrow, previous);
+            return Err(e);
+        }
+        Ok(())
+    };
+    if let Err(e) = publish() {
+        let restored = store.rollback_start(&svc, existing.as_ref());
+        let _ = store.release_op(&scope, &name);
+        restored?;
+        return Err(e);
+    }
+    pending.published = true;
+    if let Some(t) = &mut terminal {
+        t.keep_fifo();
+    }
+    drop(terminal);
     // The port is reserved by the record now; wait without the global lock.
     drop(lock);
 
@@ -1489,12 +1806,18 @@ fn short_text(svc: &Service, started: bool, short: &Short) -> String {
         }
         None => {}
     }
-    format!(
+    let mut text = format!(
         "{head}\n  command: {}\n  name {:?} (from {:?}; set another with --name)\n  logs: taba logs {label} · stop: taba stop {label}",
         runform::display_command(svc.template()),
         svc.name,
         short.derived.source_text(),
-    )
+    );
+    if svc.input.is_some() {
+        text.push_str(&format!(
+            "\n  interactive: yes (type: taba attach {label}; i in taba logs -f)"
+        ));
+    }
+    text
 }
 
 fn run_result(
@@ -1534,6 +1857,7 @@ fn run_result(
                 "directory": svc.cwd,
                 "log_path": svc.log_path,
                 "discovered_ports": svc.discovered_ports,
+                "interactive": svc.input.is_some(),
             });
             if !svc.env_keys.is_empty() {
                 body["env"] = json!(svc.env_keys);
@@ -1549,6 +1873,11 @@ fn run_result(
                 "already running"
             };
             let mut text = describe(verb, &svc);
+            if svc.input.is_some() {
+                text.push_str(&format!(
+                    "\n  interactive: yes (type: taba attach {id}; i in taba logs -f)"
+                ));
+            }
             if !svc.env_keys.is_empty() {
                 text.push_str(&format!(
                     "\n  env  {} (values not shown)",
@@ -1627,6 +1956,7 @@ fn cmd_up(
             ready: def.ready.clone(),
             ttl,
             service_ttl: def.service_ttl,
+            interactive: def.interactive,
             command: def.command.clone(),
             cwd: Some(def.cwd.clone()),
             env: def.env.clone(),
@@ -1634,7 +1964,7 @@ fn cmd_up(
             force: false,
             shape: runform::Shape::default(),
             raw: Vec::new(),
-            interactive: false,
+            prompt: false,
         };
         let form = runform::resolve(
             args.name.clone(),
@@ -1886,6 +2216,7 @@ pub(crate) fn ps_snapshot(
             "claims": claims::rows(store, &queue)?,
             "borrows": { "shared": borrows.iter().filter(|b| !b.exclusive).count(), "exclusive": usize::from(exclusive.is_some()) },
             "locked_by": exclusive.map(|b| &b.scope),
+            "interactive": s.input.is_some(),
         }));
         borrowers.push(borrows.iter().map(|b| b.scope.clone()).collect());
     }
@@ -2047,6 +2378,13 @@ fn cmd_logs(target: &str, follow: bool, tail: Option<u64>, json: bool) -> Result
     }
     stdout.flush()?;
     if !follow {
+        return Ok(None);
+    }
+    // An interactive service on a terminal: the log view, read-only until `i`.
+    if cfg!(unix) && svc.input.is_some() && io::stdin().is_terminal() && io::stdout().is_terminal()
+    {
+        drop(stdout);
+        input::follow(&store, &caller, &svc, file)?;
         return Ok(None);
     }
     let mut pos = file.stream_position()?;
@@ -2574,6 +2912,9 @@ mod cli_tests {
             let Some(long) = a.get_long() else { continue };
             let takes_value = a.get_action().takes_values();
             let equals_only = a.is_require_equals_set();
+            if let Some(short) = a.get_short().filter(|_| !takes_value && long != "help") {
+                switches.push(format!("-{short}"));
+            }
             if takes_value && !equals_only {
                 values.push(format!("--{long}"));
             } else if long != "help" {
@@ -2646,6 +2987,8 @@ mod stop_tests {
                 env_keys: Vec::new(),
                 env_hash: None,
                 discovered_ports: Vec::new(),
+                input: None,
+                dev_kind: None,
             })
             .unwrap();
     }

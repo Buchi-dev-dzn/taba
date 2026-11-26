@@ -171,6 +171,9 @@ pub fn transfer(store: &Store, svc: &Service, target: &str, how: &str) -> Result
     let mut moved = svc.clone();
     moved.scope = target.into();
     moved.log_path = store.log_path(target, &svc.name);
+    if let Some(input) = &mut moved.input {
+        input.fifo = store.input_path(target, &svc.name);
+    }
     let event = json!({"at":rfc3339(now_secs()), "event":"service_moved", "how":how, "from":svc.id(), "to":moved.id(), "instance":svc.instance()});
     moved.moves.push(event.clone());
     store.move_service(&svc.scope, &moved)?;

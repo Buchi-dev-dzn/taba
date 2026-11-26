@@ -14,7 +14,10 @@ in. Everything below uses only these commands:
 taba whoami [--scope S] [--agent A] [--json]
 taba run [--scope S] --name N [--port P | --port auto | --port auto:START]
          [--wait[=SECS]] [--ready tcp|http:PATH|log:REGEX] [--ttl DURATION]
-         [--service-ttl DURATION] [--json] -- CMD...
+         [--service-ttl DURATION] [-i | --no-interactive] [--json] -- CMD...
+taba reload S/N | N [--restart] [--json]
+taba send S/N | N TEXT [--no-newline] | --key KEY [--json]
+taba signal S/N | N USR1|USR2|HUP [--json]
 taba up [NAME...] [--scope S] [--json]        # services declared in taba.toml
 taba down [NAME...] [--scope S] [--json]
 taba ps [--scope S] [--running] [--json]
@@ -47,6 +50,8 @@ Ctrl+C or when its stdout is closed), never in a one-shot tool call; there,
 use `taba ps --json`.
 `taba ui` is an interactive terminal UI for humans; agents should not run
 it (it needs a terminal and waits for keys). Point the human to it instead.
+The same goes for `taba attach` (it waits for keys): use `taba send` and
+`taba reload`.
 
 ## Identity, scope and leases
 
@@ -149,6 +154,8 @@ expiry when the human needs them.
 | `E_CONFIG` | `$TABA_HOME/config.toml`, `TABA_TTL`, or `TABA_LOCK_TIMEOUT` is invalid or unreadable. | Use `error.details` to correct the named key or environment value; do not discard state. |
 | `E_STATE` | State is unreadable, damaged, unavailable, or lacks space. | Read `error.details.path` and `error.next`; ask the human before any repair that removes records. |
 | `E_BUSY` | Another change is in progress, or the global state lock timed out. | Wait, inspect with `taba ps --json`, then retry. |
+| `E_NO_INPUT`, `E_NO_RELOAD`, `E_NOT_RUNNING`, `E_INPUT_BLOCKED` | `send` / `reload` could not reach the service. | See "Hot reload (Flutter, Vite)". |
+| `E_UNSUPPORTED` | Not available on this platform (interactive services on Windows). | Run it without `-i`; restart the service instead of reloading. |
 | `E_SIGNAL_FAILED` | taba could not signal a verified service. | Inspect the result and ask the human; do not use raw kill commands. |
 | `E_FORCE_NEEDS_REASON` | A protected action needs an audited reason. | Do not bypass the guard; ask the human or coordinator for direction. |
 | `E_UPDATE_FAILED` | An update check or verification failed. | Keep using the current binary and ask the human if an update is required. |
@@ -177,6 +184,41 @@ of source data, possibly starting mid-line. `truncated` is true if earlier
 data was omitted, and `bytes_total` is the original log size in bytes. The
 file is available at `log_path`, also listed by `taba ps --json`. Logs of any
 scope are readable.
+
+## Hot reload (Flutter, Vite)
+
+`flutter run` and `vite` (also behind `npm run dev`, `pnpm dev`, ...) start
+**interactive**: their stdin is a terminal taba can type into, and the
+`run` reply has `"interactive": true`. After you edit the app:
+
+```sh
+taba reload app --json             # flutter run: hot reload (SIGUSR1)
+taba reload app --restart --json   # flutter run: hot restart (SIGUSR2)
+taba reload web --json             # vite: sends r + Enter, restarts the dev server
+taba send app --key R --json       # any key the tool documents (no Enter)
+taba send repl 'print(1)' --json   # a line (with Enter) to a service started with -i
+```
+
+Then read the result in the log (`taba logs app --tail 20 --json`): Flutter
+prints `Reloaded application in ...` or `Restarted application in ...`, and
+compile errors there too. Do not restart the service to pick up a change
+that a reload can apply.
+
+- Start Flutter web with
+  `taba run --name app --wait=300 --ready "log:Flutter run key commands" --json -- flutter run -d chrome`.
+  That line appears before the browser has connected; if a reload right
+  after start reports `No client connected`, wait for
+  `log:Dart VM Service on Chrome is available` instead.
+- Any other program that reads keys: start it with `-i`. `--no-interactive`
+  turns the default off.
+- `send`, `reload` and `signal` follow the same ownership rules as `stop`:
+  your scope or an exclusive borrow. Errors: `E_NO_INPUT` (not interactive:
+  restart it with `-i`), `E_NO_RELOAD` (taba knows no reload for it; use
+  `taba send --key`), `E_NOT_RUNNING`, `E_INPUT_BLOCKED` (it does not read
+  its input). On Windows these return `E_UNSUPPORTED`; restart the service
+  to pick up changes there.
+- Humans type into it with `taba attach S/N`, or `i` in `taba logs -f` and
+  `taba ui`; point them there.
 
 ## Borrowing another scope's service
 
