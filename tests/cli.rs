@@ -20,12 +20,12 @@ fn usage_error(f: &Fixture, args: &[&str]) -> Value {
 #[test]
 fn json_usage_errors_name_the_argument_and_the_subcommand_help() {
     let f = Fixture::new("cli");
-    // The issue's example: the missing argument is named, and next points
-    // to the subcommand's help rather than a placeholder.
-    let v = usage_error(&f, &["run", "--", "x"]);
+    // The missing argument is named, and next points to the subcommand's
+    // help rather than a placeholder.
+    let v = usage_error(&f, &["run", "--name", "w"]);
     let e = &v["error"];
-    assert!(e["message"].as_str().unwrap().contains("--name"), "{v}");
-    assert_eq!(e["details"]["arguments"][0], "--name <NAME>", "{v}");
+    assert!(e["message"].as_str().unwrap().contains("<CMD>"), "{v}");
+    assert_eq!(e["details"]["arguments"][0], "<CMD>...", "{v}");
     assert!(
         e["details"]["usage"]
             .as_str()

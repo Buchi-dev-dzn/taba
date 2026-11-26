@@ -83,6 +83,43 @@ pub fn wait(svc: &Service, check: &ReadySpec, timeout: Duration, log_offset: u64
     }
 }
 
+/// The TCP ports `svc`'s processes (its process group, or its job on
+/// Windows) listen on, ascending. Uses the same socket listing as
+/// `ps --all`.
+pub fn discover_ports(svc: &Service) -> Vec<u16> {
+    let mut ports: Vec<u16> = crate::proc::all_listeners()
+        .into_iter()
+        .filter(|s| crate::proc::in_group(s.pid, svc.pid, svc.pgid, svc.start_time))
+        .map(|s| s.port)
+        .collect();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
+
+/// Waits until `svc`'s processes listen on at least one TCP port, the
+/// process exits, or `timeout` passes. `Ready` sets `svc.discovered_ports`;
+/// `TimedOut` leaves them empty.
+pub fn wait_for_port(svc: &mut Service, timeout: Duration) -> Outcome {
+    let start = Instant::now();
+    let deadline = start + timeout;
+    loop {
+        if !svc.is_running() {
+            return Outcome::Exited;
+        }
+        let ports = discover_ports(svc);
+        let ms = start.elapsed().as_millis() as u64;
+        if !ports.is_empty() {
+            svc.discovered_ports = ports;
+            return Outcome::Ready { ms };
+        }
+        if Instant::now() >= deadline {
+            return Outcome::TimedOut { ms };
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
 fn loopbacks(port: u16) -> [SocketAddr; 2] {
     [
         ([127, 0, 0, 1], port).into(),
