@@ -15,7 +15,8 @@
 
 `taba` starts, lists and stops local processes such as dev servers, grouped by
 the task they belong to. It gives you Docker-style `run / ps / logs / stop / rm`
-without containers. It's one binary, with no daemon and no config file.
+without containers. It's one binary, with no daemon; an optional local
+`$TABA_HOME/config.toml` controls lease and cleanup timing.
 
 ![taba ps showing three services in two scopes, login-fix and billing](docs/images/ps.svg)
 
@@ -336,6 +337,13 @@ taba is meant for AI coding agents as much as for people:
   worktree share its services. `$TABA_SCOPE` or `--scope` still override
   this, for orchestrators that want task-named scopes. Run `taba whoami` to
   see which scope applies.
+- **Give each agent session its own identity.** Set `TABA_AGENT` to a
+  session-specific name (for example `codex:<session-id>` or
+  `orca:<session-id>`) and, where available, set `TABA_AGENT_PID` to the
+  long-lived agent process PID. Claude Code's optional hooks set its
+  identity. Without `TABA_AGENT`, callers are all `human`, sharing one
+  identity and its non-expiring default lease. Identity coordinates
+  cooperative agents; it is not a credential.
 - **Errors are machine-readable.** With `--json` (or `TABA_OUTPUT=json`),
   every command prints one JSON document on stdout for success and failure,
   and nothing on stderr. A failure has `error.code`, `error.message`, `error.details` and
@@ -469,7 +477,7 @@ macOS. Method, sources and the full table are in
 | Port already in use | refuses and names the holder | crash-loops | the process exits | the process exits | the process exits |
 | Restarts, TUI, Linux | TUI (`taba ui`, since v0.2.3) and Linux; no restarts | all three | overmind: restarts and Linux; foreman: Linux | all three | all three (restarts only for tasks in `dekit.yaml`) |
 
-taba is the small option: no daemon and no config, and it is safe to run again,
+taba is the small option: no daemon and no required config, and it is safe to run again,
 for dev servers spread over many tasks and checkouts on one machine. If you
 need restarts or dependencies, use process-compose, dekit or pm2.
 
@@ -526,6 +534,19 @@ that. Measurements against Docker are in [docs/benchmarks.md](docs/benchmarks.md
 | `taba stop ... --force --reason TEXT` | Stop a service of another scope; recorded in `events.jsonl`. |
 | `taba rm S/N` (or `N` in your scope) | Delete a stopped service's record and log. Refuses a running service, and another scope's service without `--force --reason`. |
 | `taba rm --scope S` | Delete the records and logs of every stopped service in scope `S`; running ones are kept and reported. |
+| `taba renew [--scope S] [--ttl DURATION] [--json]` | Renew the caller's scope lease. |
+| `taba lease end [--scope S] [--json]` | Mark the caller's leases expired without immediately stopping services. |
+| `taba keep [--scope S] --reason TEXT [--off] [--json]` | Keep a scope's services beyond lease expiry; an agent must provide a recorded reason. |
+| `taba gc [--dry-run] [--json]` | Preview or collect services that are past a lease or service TTL. |
+| `taba borrow S/N [--ttl DURATION] [--json]` | Record a shared borrow and return the service instance and URL. |
+| `taba borrow --check BORROW_ID [--json]` | Verify that a borrow still points to the recorded running instance. |
+| `taba borrow --mut S/N [--wait-lock SECS] [--json] -- CMD...` | Hold an exclusive maintenance borrow while `CMD` runs; it receives `TABA_BORROWED_URL`. |
+| `taba release BORROW_ID \| S/N [--json]` | End the caller's borrow. |
+| `taba move [S/N] --to AGENT_OR_SCOPE [--json]` | Transfer a scope lease to an agent, or one service to an existing scope, without restarting it. |
+| `taba move --take [--force --reason TEXT] [--json]` | Take an expired scope lease explicitly; a live lease is refused unless an audited human-authorized override is used. |
+| `taba claim S/N [--cancel] [--json]` | Join or leave the queue for a service from another scope. |
+| `taba disown S/N \| --scope S [--json]` | Offer a service to its first eligible claimant. |
+| `taba hook claude-code\|codex EVENT` | Hook entry point for supported harness events; normally configured once, not run ad hoc by agents. |
 | `taba update --check [--json]` | Report whether a newer stable release exists on official GitHub Releases. Read-only. |
 | `taba update [--json]` | Check, then replace an eligible official standalone Linux or macOS install. Otherwise, report the manual upgrade path. See [Updating](#updating). |
 
@@ -554,7 +575,12 @@ single quotes). The exit status follows the code:
 | --- | --- | --- |
 | `E_USAGE`, `E_INVALID_IDENT`, `E_FORCE_NEEDS_REASON` | 2 | Bad flags or names (an argument error names the flag in `details.arguments` and points `next` at that command's `--help`); `--force` without `--reason`. |
 | `E_NO_SCOPE` | 2 | No `--scope`, no `$TABA_SCOPE`, and not inside a git worktree. |
-| `E_NOT_OWNER` | 3 | The service belongs to another scope. |
+| `E_NOT_OWNER` | 3 | The service belongs to another scope. Use it read-only, borrow it, or coordinate with its owner. |
+| `E_SCOPE_HELD` | 3 | Another agent identity has a live lease on the scope. Wait for the normal hand-off or ask the coordinator; do not impersonate the holder. |
+| `E_LEASE_LIVE` | 3 | `move --take` found a live holder. Wait for expiry or a planned hand-off. |
+| `E_BORROWED` | 3 | The owner tried to stop or replace a service with live borrowers. Coordinate release or disown it to a claimant. |
+| `E_LOCKED` | 3 | Another scope has an exclusive maintenance borrow. Retry later or use `--wait-lock` for a legitimate maintenance operation. |
+| `E_NO_CLAIMANT` | 3 | `disown` found no eligible claimant. Arrange a claim before disowning. |
 | `E_BUSY` | 3 | Another `stop` or starting `run` of that service is in progress, or another taba process held the state lock for the whole lock timeout (`details.holder_pid` when recorded). |
 | `E_CONFLICT` | 3 | Same name already running with a different command, directory or port. |
 | `E_STILL_RUNNING` | 3 | `rm` of a running service. |
@@ -562,8 +588,12 @@ single quotes). The exit status follows the code:
 | `E_NO_FREE_PORT` | 4 | `--port auto` found no free port in its range. |
 | `E_START_FAILED` | 4 | The process exited before it was ready; `details.log_tail` has its last lines. |
 | `E_NOT_READY` | 4 | `--wait` timed out; the process is still running. |
-| `E_NOT_FOUND` | 5 | No such service. |
-| `E_STATE`, `E_SIGNAL_FAILED` | 1 | State directory or a record unreadable, or too new; a signal failed. |
+| `E_NOT_FOUND` | 5 | No such service, scope record, or borrow. List current state and use a current target. |
+| `E_DANGLING` | 5 | A borrow no longer points at its recorded live instance. Borrow again and use the new reply. |
+| `E_BORROW_COMMAND` | 1 | The command run under `borrow --mut` exited unsuccessfully; inspect `exit_code` and its output. |
+| `E_CONFIG` | 1 | A `config.toml` field, `TABA_TTL`, or `TABA_LOCK_TIMEOUT` is invalid or unreadable; `details` identifies the source. |
+| `E_STATE` | 1 | State is unreadable, unavailable, damaged, or out of space. Read `details.path` and `next`; listings may instead emit `W_STATE_SKIPPED`. |
+| `E_SIGNAL_FAILED` | 1 | taba could not signal a verified service; inspect the result and ask the human rather than using raw process controls. |
 | `E_UPDATE_FAILED` | 1 | `taba update` could not reach, read or verify the release. The installed binary is unchanged. |
 
 `taba update --json` reports `status`: `up_to_date`, `update_available`
@@ -582,6 +612,18 @@ no longer tracked), or `taba rm --scope S --force --reason TEXT` for the
 scope's unreadable records and scope record. Records are written to a
 temporary file, flushed to disk and then renamed, so a crash leaves the old
 or the new content.
+
+Successful JSON replies can also carry non-fatal `warnings`; agents should
+record and act on them rather than treating a successful exit as proof that
+ownership or a borrow is unchanged. `W_TOOK_OVER` means the caller adopted
+an expired scope lease, while `W_HANDED_OVER` records a service transfer to a
+claimant or borrower. `W_BORROW_BROKEN` says a borrow became dangling;
+`W_BRANCH_CHANGED` says the worktree branch changed; `W_FORCED` records an
+audited override; `W_OWNER_GONE` says a lease holder's PID ended; and
+`W_NOTICE` is another hand-off or lease notice. `W_PORT_NOT_IN_COMMAND`
+warns that the app may ignore the supplied port, `W_NO_LSOF` means macOS port
+listing is unavailable, and `W_STATE_SKIPPED` names unreadable state that a
+listing omitted.
 
 ### Watching for changes
 
@@ -688,6 +730,8 @@ restarts the process.
 | --- | --- |
 | `TABA_SCOPE` | The caller's scope when `--scope` is not given; beats the git worktree. |
 | `TABA_AGENT` | Name of the acting agent, recorded with services and `--force` events (default `human`). |
+| `TABA_AGENT_PID` | PID of the long-lived agent process; when it exits, its lease can end early. |
+| `TABA_TTL` | Lease TTL such as `4h` or `none`; used after `--ttl` and before `config.toml`. |
 | `TABA_OUTPUT` | `json` makes every command print JSON (except `logs -f`, which streams text). |
 | `TABA_HOME` | State directory (default `~/.taba`). |
 | `TABA_LOCK_TIMEOUT` | Seconds a command waits for the state lock before `E_BUSY` (default `10`, `0` = try once). |
@@ -697,10 +741,14 @@ restarts the process.
 
 ```text
 $TABA_HOME (default ~/.taba)
+├── config.toml                    # optional: lease_ttl, claim_grace, gc_grace, log_retention, stop_timeout
 ├── services/<scope>/<name>.json   # command, directory, port, pid, pgid, start time, log path, instance
+├── scopes/<scope>.json             # lease holder, TTL, keep marker and notices
+├── claims/<scope>/<name>.json      # queued ownership claims
+├── borrows/<borrow-id>.json        # shared and exclusive borrow records
 ├── logs/<scope>/<name>.log        # stdout + stderr, appended across runs
 ├── ops/<scope>/<name>.json        # in-flight stop or start of that service (operation lock)
-├── events.jsonl                   # audit log of --force overrides
+├── events.jsonl                   # append-only created, moved, cleanup, hook and audited override events
 ├── version                        # state schema version (2)
 ├── btime/                         # Linux boot-time cache and recovery copies
 ├── lock                           # serialises changes to the state
@@ -722,6 +770,14 @@ with `E_BUSY`, so a suspended or stuck taba cannot hang every agent. `ps`
 and `logs` never wait: when the lock is busy they skip the lease renewal.
 
 State written by taba 0.1 is read unchanged.
+
+`config.toml` is optional and local to `$TABA_HOME`; all values are quoted
+durations such as `"4h"` or `"30m"`. `lease_ttl` controls agent leases,
+`claim_grace` delays a hand-off to a claimant, `gc_grace` delays collection
+of unclaimed expired services, `log_retention` controls cleanup of retained
+logs, and `stop_timeout` is the cleanup grace period. Unknown keys warn but
+are ignored. A malformed or unreadable file returns `E_CONFIG` naming the
+key or path.
 
 ## Platforms
 
@@ -786,10 +842,11 @@ taba is an early prototype:
   tracked, and `stop` won't reach them.
 - **No log rotation.** Logs grow across runs until you `taba rm` the service.
 - **Ownership is a convention, not security.** `--scope`, `$TABA_SCOPE` and
-  `$TABA_AGENT` are claims: any process of your user can name any scope, and
-  `taba stop --scope S` acts as `S`. The rules prevent accidents between
-  cooperating agents, not deliberate misuse. Agent leases, which tell a live
-  holder of a scope from its successor, come in a later milestone.
+  `$TABA_AGENT` are claims, not credentials. Leases prevent accidental
+  concurrent mutation by cooperating agents: a live holder produces
+  `E_SCOPE_HELD`, and its successor takes over only after the lease ends,
+  expires, or its recorded agent PID exits. They do not defend against a
+  malicious local process.
 - **`taba ui` draws with block and symbol characters** (`█ ▀ ▄ ▾ ▸ ●`).
   A terminal set to show East Asian ambiguous-width characters as double
   width misaligns them; use the default (single width).

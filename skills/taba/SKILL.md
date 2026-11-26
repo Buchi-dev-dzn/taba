@@ -11,15 +11,29 @@ the owning task stops it. By default your scope is the git worktree you work
 in. Everything below uses only these commands:
 
 ```sh
-taba whoami [--json]
+taba whoami [--scope S] [--agent A] [--json]
 taba run [--scope S] --name N [--port P | --port auto | --port auto:START]
-         [--wait[=SECS]] [--ready tcp|http:PATH|log:REGEX] [--json] -- CMD...
+         [--wait[=SECS]] [--ready tcp|http:PATH|log:REGEX] [--ttl DURATION]
+         [--service-ttl DURATION] [--json] -- CMD...
 taba ps [--scope S] [--running] [--json]
 taba ps --all [--json]
 taba ps --watch --json [--scope S] [--running] [--interval DURATION]
 taba logs S/N | N [--tail N] [-f] [--json]
 taba stop S/N | N | --scope S [--timeout SECS] [--json]
 taba rm S/N | N | --scope S [--json]
+taba renew [--scope S] [--ttl DURATION] [--json]
+taba lease end [--scope S] [--json]
+taba keep [--scope S] --reason TEXT [--json]
+taba gc [--dry-run] [--json]
+taba borrow S/N [--ttl DURATION] [--json]
+taba borrow --check BORROW_ID [--json]
+taba borrow --mut S/N [--wait-lock SECS] [--json] -- CMD...
+taba release BORROW_ID | S/N [--json]
+taba move [S/N] --to AGENT_OR_SCOPE [--json]
+taba move --take [--force --reason TEXT] [--json]
+taba claim S/N [--cancel] [--json]
+taba disown S/N | --scope S [--json]
+taba hook claude-code|codex pre-tool-use|session-start|session-end
 ```
 
 Every command takes `--json` (or `TABA_OUTPUT=json` in the environment) and
@@ -31,6 +45,25 @@ Ctrl+C or when its stdout is closed), never in a one-shot tool call; there,
 use `taba ps --json`.
 `taba ui` is an interactive terminal UI for humans; agents should not run
 it (it needs a terminal and waits for keys). Point the human to it instead.
+
+## Identity, scope and leases
+
+Set a distinct identity before the first mutating command. Hooks set it for
+Claude Code. In Codex and Orca, export it for the session (for example,
+`TABA_AGENT=codex:<session-id>` or `TABA_AGENT=orca:<session-id>`), and set
+`TABA_AGENT_PID` to the long-lived agent process PID when that PID is
+available. Without `TABA_AGENT`, every caller is `human`, so they share one
+identity and human leases do not expire by TTL. These identifiers coordinate
+cooperating agents; they are not credentials.
+
+The first `whoami`, `run`, `renew`, or other mutating command establishes or
+renews the scope lease. An agent lease defaults to four hours; `--ttl`,
+`TABA_TTL`, then `$TABA_HOME/config.toml`'s `lease_ttl` override it. A live
+lease held by another identity returns `E_SCOPE_HELD`; wait for the holder to
+end or expire, or ask the coordinator. Do not change `--scope` or `--agent`
+to impersonate a holder. `taba lease end` ends your lease without stopping
+services; `taba keep --reason TEXT` preserves the scope's services beyond
+expiry when the human needs them.
 
 ## Procedure
 
@@ -79,13 +112,28 @@ it (it needs a terminal and waits for keys). Point the human to it instead.
 
 | `error.code` | What happened | What to do |
 | --- | --- | --- |
-| `E_NO_SCOPE` | No `--scope`, no `$TABA_SCOPE`, not in a git worktree. | `cd` into your worktree or pass `--scope`. |
-| `E_PORT_IN_USE`, `E_PORT_CLAIMED` | The port is taken. Nothing was started. | `--port auto` (the command is in `next`); never kill the holder. |
+| `E_USAGE`, `E_INVALID_IDENT` | A flag, target, duration or identity is invalid. | Read `error.next` or `taba <command> --help`, correct it, then retry. |
+| `E_NO_SCOPE` | No `--scope`, no `$TABA_SCOPE`, not in a git worktree. | `cd` into your worktree or pass its intended `--scope`. |
+| `E_SCOPE_HELD` | Another agent has a live lease on the scope. | Wait for its lease to end or ask the coordinator; do not impersonate it. |
+| `E_LEASE_LIVE` | `move --take` found a live holder. | Wait for the normal hand-off, or ask the coordinator. |
+| `E_NOT_OWNER` | The service belongs to another scope. | Use its URL read-only, borrow it, or ask the coordinator. |
+| `E_BORROWED` | The owner tried to stop or replace a service with live borrowers. | Leave it running, coordinate its hand-off with `disown`, or wait for borrowers to release. |
+| `E_LOCKED` | Another scope has an exclusive maintenance borrow. | Retry later or use the documented `--wait-lock` when appropriate. |
+| `E_DANGLING` | A borrow no longer refers to its recorded live instance. | Borrow the service again; do not trust the stale URL. |
+| `E_NO_CLAIMANT` | `disown` found no eligible claimant. | Keep the service, or arrange for a successor to `claim` it first. |
+| `E_NOT_FOUND` | The requested service, scope, or borrow is absent. | Run `taba ps --json` and use a current target or borrow ID. |
+| `E_CONFLICT` | A name or destination conflicts with existing state. | Reuse the matching service, choose another name, or coordinate a transfer. |
+| `E_STILL_RUNNING` | `rm` was asked to remove a running service. | Stop only your own service first, then retry `rm`. |
+| `E_PORT_IN_USE`, `E_PORT_CLAIMED`, `E_NO_FREE_PORT` | The requested or automatic port cannot be used. | Use the `error.next` command or another `--port auto` range; never kill the holder. |
 | `E_START_FAILED` | The process exited before it was ready. | Read `error.details.log_tail` or `taba logs <name> --tail 100 --json`, fix, re-run. |
-| `E_NOT_READY` | `--wait` timed out; the process still runs. | `taba logs <name> --tail 100 --json`; `taba stop <name>` if it is stuck. |
-| `E_CONFLICT` | The name already runs with another command, directory or port. | `taba stop <name>` and run again, or use another `--name`. |
-| `E_NOT_OWNER` | The service belongs to another scope. | Use its URL read-only, or ask the human. |
-| `E_BUSY` | Someone else is stopping or starting that service right now, or another taba held the state lock too long (`details.holder_pid`). | Wait, then `taba ps --scope <scope> --json` and retry. |
+| `E_NOT_READY` | `--wait` timed out; the process still runs. | Inspect logs; stop it only if it is your service and genuinely stuck. |
+| `E_BORROW_COMMAND` | The command run under `borrow --mut` failed. | Read its output and `exit_code`, fix the maintenance command, then borrow again if needed. |
+| `E_CONFIG` | `$TABA_HOME/config.toml`, `TABA_TTL`, or `TABA_LOCK_TIMEOUT` is invalid or unreadable. | Use `error.details` to correct the named key or environment value; do not discard state. |
+| `E_STATE` | State is unreadable, damaged, unavailable, or lacks space. | Read `error.details.path` and `error.next`; ask the human before any repair that removes records. |
+| `E_BUSY` | Another change is in progress, or the global state lock timed out. | Wait, inspect with `taba ps --json`, then retry. |
+| `E_SIGNAL_FAILED` | taba could not signal a verified service. | Inspect the result and ask the human; do not use raw kill commands. |
+| `E_FORCE_NEEDS_REASON` | A protected action needs an audited reason. | Do not bypass the guard; ask the human or coordinator for direction. |
+| `E_UPDATE_FAILED` | An update check or verification failed. | Keep using the current binary and ask the human if an update is required. |
 
 ## Choosing a scope
 
@@ -116,9 +164,14 @@ scope are readable.
 
 Use `taba borrow S/N --json` for the URL and borrow ID. Check that ID with
 `taba borrow --check ID --json` before a long test run, and release it when
-finished. For maintenance use `taba borrow --mut S/N -- COMMAND`; the
-command gets `TABA_BORROWED_URL`. If stop reports `E_BORROWED`, consider
-`taba disown S/N` instead of forcing it. It hands over the live instance.
+finished with `taba release ID --json`. A borrow ends when its TTL or the
+borrower's lease ends. Treat `E_DANGLING` as a stale reference: borrow again
+and use the replacement reply rather than the old URL. For exclusive
+maintenance use `taba borrow --mut S/N -- COMMAND`; the command receives
+`TABA_BORROWED_URL` and its lock ends when the command exits. `E_LOCKED`
+means another exclusive borrower is active. A live borrow prevents an owner
+from stopping or replacing the instance (`E_BORROWED`); coordinate a normal
+release or hand-off rather than bypassing that protection.
 
 ## Stopping and cleaning up
 
@@ -145,7 +198,8 @@ A successor in the same scope can take over after your lease ends. Use
 check for `W_HANDED_OVER` rather than assuming the service transferred. If you
 know the next agent, give it the scope with `taba move --to AGENT`. Use
 `taba move S/N --to SCOPE` when transferring just one service. Neither
-command restarts the service.
+command restarts the service. `W_TOOK_OVER` means your expired predecessor's
+scope lease was adopted; reuse its services after inspecting them.
 
 When you hand work back, or may be cut off (usage limits), report each
 service you started, for example:
