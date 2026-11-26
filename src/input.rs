@@ -638,7 +638,14 @@ impl Access<'_> {
         let owner = caller.scope.as_deref() == Some(svc.scope.as_str());
         if owner && force_reason.is_none() {
             let cfg = config::Config::load(store.root())?;
-            lease::touch(store, &cfg, caller, &scope, lease::Access::Mutate, None)?;
+            lease::touch(
+                store,
+                &cfg,
+                caller,
+                &scope,
+                lease::Access::MutateKeepNotices,
+                None,
+            )?;
         }
         let live = borrows::live(store, &svc)?;
         let exclusive = live.iter().find(|b| b.exclusive);

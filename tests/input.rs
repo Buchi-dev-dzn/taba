@@ -203,6 +203,53 @@ mod unix {
         assert!(!fifo.exists());
     }
 
+    fn send_with_queued_borrow_warning(interactive: bool) {
+        let f = Fixture::new("input-borrow-warning");
+        let input = start(&f, &f.wt_b, "input", interactive);
+        let id = input["service"].as_str().unwrap();
+        let other = start(&f, &f.wt_a, "other", false);
+        let target = other["service"].as_str().unwrap();
+        let out = f.taba(&f.wt_b, &["borrow", target, "--json"]);
+        assert_eq!(exit(&out), 0, "{}", text(&out));
+        let borrow = json(&out);
+        let borrow_id = borrow["borrow"].as_str().unwrap();
+        let out = f.taba(&f.wt_a, &["stop", target, "--force", "--reason", "test"]);
+        assert_eq!(exit(&out), 0, "{}", text(&out));
+
+        let out = f.taba(&f.wt_b, &["send", id, "hello", "--json"]);
+        if interactive {
+            assert_eq!(exit(&out), 0, "{}", text(&out));
+            assert_eq!(json(&out)["bytes"], 6);
+        } else {
+            assert_eq!(exit(&out), 3, "{}", text(&out));
+            assert_eq!(code(&out), "E_NO_INPUT");
+        }
+
+        // Observe before any other command can drain the borrow notice.
+        let out = f.taba(&f.wt_b, &["ps", "--json"]);
+        assert_eq!(exit(&out), 0, "{}", text(&out));
+        let ps = json(&out);
+        let warnings = ps["warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 1, "{ps}");
+        let warning = &warnings[0];
+        assert_eq!(warning["code"], "W_BORROW_BROKEN");
+        assert_eq!(warning["details"]["borrow"], borrow_id);
+        assert_eq!(warning["details"]["service"], target);
+        let release = format!("taba release {borrow_id}");
+        assert_eq!(warning["details"]["release_command"], release);
+        assert!(warning["message"].as_str().unwrap().contains(&release));
+    }
+
+    #[test]
+    fn successful_send_preserves_queued_borrow_warning() {
+        send_with_queued_borrow_warning(true);
+    }
+
+    #[test]
+    fn refused_send_preserves_queued_borrow_warning() {
+        send_with_queued_borrow_warning(false);
+    }
+
     #[test]
     fn a_piped_attachment_rechecks_permission_for_each_input() {
         struct ReleaseOnDrop<'a> {
