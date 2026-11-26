@@ -301,6 +301,8 @@ mod tests {
                     service_expires_at: None,
                     moves: Vec::new(),
                     stop_requested_at: None,
+                    wait_request: None,
+                    env: Vec::new(),
                 })
                 .unwrap();
         }

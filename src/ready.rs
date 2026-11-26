@@ -24,6 +24,15 @@ impl ReadySpec {
         }
     }
 
+    /// The spec as `--ready` takes it, for the service record.
+    pub fn request(&self) -> String {
+        match self {
+            ReadySpec::Tcp => "tcp".into(),
+            ReadySpec::Http(path) => format!("http:{path}"),
+            ReadySpec::Log(re) => format!("log:{}", re.as_str()),
+        }
+    }
+
     pub fn needs_port(&self) -> bool {
         !matches!(self, ReadySpec::Log(_))
     }

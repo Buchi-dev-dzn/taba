@@ -164,7 +164,8 @@ replacing `run` take a per-service operation lock. The second one gets
 
 3. **Exclusive borrow (`&mut`).** Restarting, reconfiguring, resetting or
    migrating needs exclusive access. The owner gets it implicitly for the
-   length of one `stop` or replacing `run` (the per-service operation lock).
+   length of one `stop`, `restart` or replacing `run` (the per-service
+   operation lock).
    Anyone else, or the owner for a longer operation, takes
    `taba borrow --mut`. Only one exclusive borrow per service at a time.
    **Deviation from Rust:** an exclusive borrow does *not* wait for shared
@@ -670,7 +671,7 @@ Two kinds of lock, with different lifetimes:
    `logs` only try it once: when it is busy they skip the lease renewal and
    read without it, so a suspended taba never blocks them.
 2. **Per-service operation lock** (`ops/<scope>/<name>.json`). A record with
-   the operation (`stop`, `replace`, `exclusive_borrow`), taba's own pid and
+   the operation (`stop`, `replace`, `restart`, `exclusive_borrow`), taba's own pid and
    start time, and an expiry. It is created under the global lock (it is
    refused if one exists and its holder is still alive), and the slow part
    (signal and wait, spawn and wait for ready, the `-- CMD` of an exclusive
@@ -835,8 +836,8 @@ goes. taba therefore does not depend on the old agent doing anything.
 | `E_SCOPE_HELD` | 3 | Mutation in the caller's own scope while another agent holds it under a live lease (holder process alive). Names the holder, its pid, last renewal and expiry. | wait: the scope passes automatically once the holder's process ends; ask the coordinator or the human |
 | `E_LEASE_LIVE` | 3 | `move --take` while the lease is live. | wait until the holder ends or `expires_at`; ask the human |
 | `E_LOCKED` | 3 | Another agent holds an exclusive borrow. | retry after `expires_at`, or `--wait-lock SECS` |
-| `E_BUSY` | 3 | Another `stop` or replacing `run` is in flight, or the global state lock stayed held for `$TABA_LOCK_TIMEOUT` (details: `path`, `waited_secs`, `holder_pid` if recorded). | retry; `taba ps S/N` |
-| `E_BORROWED` | 3 | `stop` or `rm` of a service with live borrows from other scopes (decision 3). Details list the borrowers and the claim queue. | `taba disown S/N` (hands it to the first claimant or borrower); `taba move S/N --to <borrower scope>`; ask the human (`--force --reason`) |
+| `E_BUSY` | 3 | Another `stop`, `restart` or replacing `run` is in flight, or the global state lock stayed held for `$TABA_LOCK_TIMEOUT` (details: `path`, `waited_secs`, `holder_pid` if recorded). | retry; `taba ps S/N` |
+| `E_BORROWED` | 3 | `stop`, `restart` or `rm` of a service with live borrows from other scopes (decision 3). Details list the borrowers and the claim queue. | `taba disown S/N` (hands it to the first claimant or borrower); `taba move S/N --to <borrower scope>`; ask the human (`--force --reason`) |
 | `E_NO_CLAIMANT` | 3 | `disown` of a service with no live claimant and no borrower. | `taba stop S/N` (nothing depends on it) |
 | `E_DANGLING` | 5 | Borrow's instance is gone (stopped, replaced, or the port now belongs to something else). | `taba borrow S/N` again (new URL in details) |
 | `E_STILL_RUNNING` | 3 | `rm` of a running service (v0.1 behaviour). | `taba stop S/N` |
@@ -1192,6 +1193,88 @@ The command exits 3 if any service was refused.
 
 Errors: `E_NOT_FOUND, E_NO_SCOPE, E_NOT_OWNER, E_SCOPE_HELD, E_BORROWED,
 E_BUSY, E_LOCKED, E_UNVERIFIABLE, E_SIGNAL_FAILED, E_FORCE_NEEDS_REASON`.
+
+### `taba restart` (new, issue #43)
+
+```sh
+taba restart S/N | N [--wait[=SECS]] [--ready tcp | http:PATH | log:REGEX]
+             [--timeout SECS] [--force --reason TEXT] [--json]
+```
+
+A restart is `stop` followed by a replacing `run` of the recorded settings,
+done as **one** mutation under the operation lock (op `restart`), so nobody
+can start, replace or stop the service in between. It is a one-shot action,
+not supervision: taba never restarts anything on its own.
+
+- **Who may restart:** exactly `stop`'s rules (rule 3 and rule 6). The
+  owner scope's holder, or the holder of an exclusive borrow on the service;
+  anyone else gets `E_NOT_OWNER` (also a human without a scope). An owner is
+  refused with `E_BORROWED` while other scopes hold shared borrows, and with
+  `E_LOCKED` while another scope holds the exclusive borrow. Unlike `stop`, a
+  restart by another scope is never an early Drop: it always needs
+  `--force --reason`, which is recorded as `force_restart` in `events.jsonl`
+  (same fields as `force_stop`) and skips the ownership, lease and borrow
+  checks, never the identity check.
+- **What is reused:** the record's `command_template`, `cwd` and
+  `port_request`, its `--service-ttl` (restarted from now) and its move
+  history. `run` records its `--wait` timeout and `--ready` spec in
+  `wait_request` (an optional record field, absent in older records), and
+  `restart` reuses them; `--wait[=SECS]` and `--ready` override them. Without
+  either, `restart` keeps v0.1's 200 ms alive check, like `run`. The child's
+  environment is the restarting taba's, as for `run` (taba records no
+  environment). `started_by` becomes the restarting agent.
+- **Identity:** the service keeps its `SCOPE/NAME`, owner, log file (a new
+  `--- taba: ... starting` line is appended) and claim queue. It gets a new
+  `instance`.
+- **Port:** a fixed port is required again (`E_PORT_IN_USE` /
+  `E_PORT_CLAIMED` if something else took it in between). For `auto` and
+  `auto:START`, the old port is kept when it is free again, so the URL does
+  not change; otherwise the lowest free port of the range is taken, with
+  `W_PORT_CHANGED`. taba waits up to 3 s for the stopped server to release
+  its port before deciding.
+- **Borrows:** shared borrows of the old instance are marked broken (as after
+  a forced stop): they check as `E_DANGLING` with the new URL. The caller's
+  own exclusive borrow is rebound to the new instance, as with a replacing
+  `run` under `borrow --mut`. A forced restart breaks every borrow.
+- **Concurrency:** a second `restart`, a `stop` or a replacing `run` while one
+  is in flight gets `E_BUSY`, so running the same `restart` twice at once
+  restarts once.
+- **Failure:** if the old instance cannot be signalled, `E_SIGNAL_FAILED` and
+  nothing is started. If the new instance cannot be started, the error is
+  `run`'s (`E_START_FAILED`, `E_NOT_READY`, `E_PORT_IN_USE`, ...) and the
+  service is left stopped, with a `next` to retry the restart.
+- An exited service is simply started again (`previous.result` is
+  `not_running`).
+
+Success, `--json` (the `run` envelope with `status: "restarted"`, plus
+`previous`):
+
+```json
+{
+  "ok": true,
+  "status": "restarted",
+  "service": "login-fix-3f9a/web",
+  "scope": "login-fix-3f9a",
+  "name": "web",
+  "url": "http://localhost:4113",
+  "port": 4113,
+  "instance": "41388-1795502611043765",
+  "ready": { "check": "tcp", "ms": 910 },
+  "pid": 41388,
+  "directory": "/Users/me/wt/login-fix",
+  "log_path": "/Users/me/.taba/logs/login-fix-3f9a/web.log",
+  "previous": { "instance": "41230-1795502011043765", "pid": 41230, "port": 4113, "result": "stopped" },
+  "warnings": []
+}
+```
+
+`previous.result` is `stopped`, `killed` or `not_running`; `"forced": true`
+is added after `--force`.
+
+Errors: `E_NOT_FOUND, E_NO_SCOPE, E_NOT_OWNER, E_SCOPE_HELD, E_BORROWED,
+E_LOCKED, E_BUSY, E_SIGNAL_FAILED, E_FORCE_NEEDS_REASON, E_PORT_IN_USE,
+E_PORT_CLAIMED, E_NO_FREE_PORT, E_START_FAILED, E_NOT_READY, E_CONFIG,
+E_STATE`.
 
 ### `taba rm` (extended)
 

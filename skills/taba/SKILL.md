@@ -21,6 +21,7 @@ taba ps [--scope S] [--running] [--json]
 taba ps --all [--json]
 taba ps --watch --json [--scope S] [--running] [--interval DURATION]
 taba logs S/N | N [--tail N] [-f] [--json]
+taba restart S/N | N [--wait[=SECS]] [--ready CHECK] [--timeout SECS] [--json]
 taba stop S/N | N | --scope S [--timeout SECS] [--json]
 taba rm S/N | N | --scope S [--json]
 taba renew [--scope S] [--ttl DURATION] [--json]
@@ -124,7 +125,7 @@ expiry when the human needs them.
 | `E_SCOPE_HELD` | Another agent has a live lease on the scope. | Wait for its lease to end or ask the coordinator; do not impersonate it. |
 | `E_LEASE_LIVE` | `move --take` found a live holder. | Wait for the normal hand-off, or ask the coordinator. |
 | `E_NOT_OWNER` | The service belongs to another scope. | Use its URL read-only, borrow it, or ask the coordinator. |
-| `E_BORROWED` | The owner tried to stop or replace a service with live borrowers. | Leave it running, coordinate its hand-off with `disown`, or wait for borrowers to release. |
+| `E_BORROWED` | The owner tried to stop, restart or replace a service with live borrowers. | Leave it running, coordinate its hand-off with `disown`, or wait for borrowers to release. |
 | `E_LOCKED` | Another scope has an exclusive maintenance borrow. | Retry later or use the documented `--wait-lock` when appropriate. |
 | `E_DANGLING` | A borrow no longer refers to its recorded live instance. | Borrow the service again; do not trust the stale URL. |
 | `E_NO_CLAIMANT` | `disown` found no eligible claimant. | Keep the service, or arrange for a successor to `claim` it first. |
@@ -179,6 +180,25 @@ maintenance use `taba borrow --mut S/N -- COMMAND`; the command receives
 means another exclusive borrower is active. A live borrow prevents an owner
 from stopping or replacing the instance (`E_BORROWED`); coordinate a normal
 release or hand-off rather than bypassing that protection.
+
+## Restarting
+
+To pick up a config change in a server that does not hot-reload, restart it
+instead of `stop` plus retyping the `run` line:
+
+```sh
+taba restart web --json
+```
+
+It reruns the recorded command in the recorded directory with the same port
+request and the same `--wait`/`--ready` (override with `--wait[=SECS]` and
+`--ready`). The URL stays when the port is free again (`W_PORT_CHANGED`
+otherwise); the `instance` is new, so other scopes' borrows of the old one
+check as `E_DANGLING`. The rules are `stop`'s: only your own scope's
+services, or one you hold `borrow --mut` on; `E_BORROWED` while another
+scope borrows it; `E_BUSY` if a stop or restart is already in flight (retry,
+do not start a second one). Never use `--force` to restart another scope's
+service.
 
 ## Stopping and cleaning up
 

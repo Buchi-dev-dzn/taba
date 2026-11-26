@@ -140,6 +140,25 @@ pub struct Service {
     /// seconds); a later cleanup forces it once `stop_timeout` has passed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_requested_at: Option<u64>,
+    /// The `--wait` and `--ready` this instance was started with, so that
+    /// `restart` waits the same way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_request: Option<WaitRequest>,
+    /// Extra environment variables the command was started with (from
+    /// `taba.toml`), so that `restart` sets them again. Kept in the private
+    /// record only; `ps` does not print them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<(String, String)>,
+}
+
+/// `run --wait[=SECS] [--ready SPEC]` as given.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WaitRequest {
+    /// The `--wait` timeout in milliseconds.
+    pub ms: u64,
+    /// `--ready` as given (`tcp`, `http:PATH`, `log:REGEX`), if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
