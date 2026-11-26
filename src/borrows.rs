@@ -1,11 +1,11 @@
 //! Instance-bound shared and exclusive borrows. Mutations hold the state lock.
 use crate::{
     config::{Config, Ttl},
-    error::{Next, Output, Result, TabaError},
+    error::{Next, Output, Result, TabaError, Warning},
     lease::{self, Access, Holder},
     scope::Caller,
     state::{self, Service, Store},
-    util::{now_secs, parse_rfc3339, rfc3339},
+    util::{now_secs, parse_rfc3339, rfc3339, shell_quote},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -112,16 +112,23 @@ pub fn break_all(store: &Store, svc: &Service, preserve_exclusive: bool) -> Resu
         }
         b.broken = true;
         save(store, &b)?;
-        lease::notify(
-            store,
-            &b.scope,
-            "W_BORROW_BROKEN",
-            format!("{} is no longer available", svc.id()),
-        )?;
+        lease::notify_warning(store, &b.scope, broken_warning(&b.id, &b.service))?;
         store.append_event(&json!({"at":rfc3339(now_secs()),"event":"borrow_broken","service":svc.id(),"borrow":b.id}))?;
     }
     Ok(())
 }
+fn broken_warning(id: &str, service: &str) -> Warning {
+    let release_command = format!("taba release {}", shell_quote(id));
+    Warning {
+        code: "W_BORROW_BROKEN",
+        message: format!(
+            "borrow {}: {} is no longer available; run {release_command} to release this dangling borrow",
+            id, service,
+        ),
+        details: Some(json!({"borrow":id,"service":service,"release_command":release_command})),
+    }
+}
+
 pub fn rebind(store: &Store, b: &Borrow, new: &Service) -> Result<()> {
     let mut b = b.clone();
     b.instance = new.instance();
@@ -183,7 +190,7 @@ pub struct Request {
     pub json: bool,
 }
 fn response(b: &Borrow, svc: &Service, other: &[Borrow]) -> Output {
-    Output::new(
+    let mut out = Output::new(
         json!({"borrow":b.id,"kind":if b.exclusive{"exclusive"}else{"shared"},"service":svc.id(),"url":svc.url(),"port":svc.port,"instance":svc.instance(),"expires_at":b.expires_at,"other_borrows":{"shared":other.iter().filter(|x|!x.exclusive && x.id!=b.id).count(),"exclusive":other.iter().find(|x|x.exclusive && x.id!=b.id).map(|x|&x.scope)}}),
         format!(
             "{}: {}{}",
@@ -191,7 +198,18 @@ fn response(b: &Borrow, svc: &Service, other: &[Borrow]) -> Output {
             svc.id(),
             svc.url().map_or(String::new(), |u| format!(" {u}"))
         ),
-    )
+    );
+    if !b.exclusive && b.scope == svc.scope {
+        out.warnings.push(Warning {
+            code: "W_SAME_SCOPE_BORROW",
+            message: format!(
+                "borrow {} is in the same scope as {}; it does not prevent the owner from stopping or replacing the service; borrow from another scope if stop protection is needed",
+                b.id, svc.id(),
+            ),
+            details: Some(json!({"borrow":b.id,"service":svc.id()})),
+        });
+    }
+    out
 }
 fn locate(store: &Store, caller: &Caller, target: &str) -> Result<Vec<Borrow>> {
     let mut out = Vec::new();
@@ -283,7 +301,7 @@ pub fn cmd(store: &Store, cfg: &Config, caller: &Caller, a: Request) -> Result<O
         };
         save(store, &b)?;
         let mut out = response(&b, &svc, &other);
-        out.warnings = touched.warnings;
+        out.warnings.extend(touched.warnings);
         break (b, out);
     };
     if let Some((program, args)) = a.command.split_first() {
@@ -328,8 +346,38 @@ pub fn release(store: &Store, caller: &Caller, target: &str) -> Result<Output> {
     for b in &bs {
         remove(store, b)?;
     }
+    // A released borrow no longer needs its queued cleanup instruction.
+    if let Some(mut rec) = store.get_scope(&caller.require_scope()?)? {
+        let before = rec.notices.len();
+        rec.notices.retain(|n| {
+            n.code != "W_BORROW_BROKEN"
+                || !n.details.as_ref().is_some_and(|d| {
+                    ids.iter()
+                        .any(|id| d["borrow"].as_str() == Some(id.as_str()))
+                })
+        });
+        if rec.notices.len() != before {
+            store.put_scope(&rec)?;
+        }
+    }
     Ok(Output::new(
         json!({"released":ids}),
         format!("released {} borrow(s)", ids.len()),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dangling_release_command_quotes_the_borrow_id() {
+        let id = "b-odd'; echo $HOME";
+        let warning = broken_warning(id, "owner/db");
+        let command = format!("taba release {}", shell_quote(id));
+        assert_eq!(warning.to_json()["details"]["release_command"], command);
+        assert_eq!(warning.to_json()["details"]["borrow"], id);
+        assert!(warning.message.contains(&command));
+        assert_ne!(command, format!("taba release {id}"));
+    }
 }

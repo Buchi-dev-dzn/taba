@@ -101,6 +101,11 @@ expiry when the human needs them.
    service under `results`; `taba down --json` stops them. Do not write a
    `taba.toml` unless the human asks.
 
+   With explicit `run`, `--env KEY=VALUE` is repeatable and values are never
+   returned by taba; use only values the human has authorized. `--save` writes
+   the run to `taba.toml` after it succeeds, and `--force` may replace a
+   different definition only when the human explicitly asks.
+
    Read `url` from the reply and use exactly that URL. Never invent a port,
    never use a port you did not get from taba, and make the app fail instead
    of moving to another port (`--strictPort` for Vite). taba also sets `PORT`

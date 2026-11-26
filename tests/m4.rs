@@ -21,6 +21,7 @@ fn shared_borrow_protects_instance_and_forcing_breaks_it() {
     let b = call(&f, &f.wt_b, &["borrow", target]);
     let id = b["borrow"].as_str().unwrap();
     assert_eq!(b["instance"], web["instance"]);
+    assert_eq!(b["warnings"], serde_json::json!([]), "{b}");
     let denied = call(&f, &f.wt_a, &["stop", target]);
     assert_eq!(denied["error"]["code"], "E_BORROWED", "{denied}");
     assert!(http_ok(port_of(&web)));
@@ -32,6 +33,144 @@ fn shared_borrow_protects_instance_and_forcing_breaks_it() {
     assert_eq!(stop["ok"], true, "{stop}");
     let check = call(&f, &f.wt_b, &["borrow", "--check", id]);
     assert_eq!(check["error"]["code"], "E_DANGLING", "{check}");
+}
+
+#[test]
+fn same_scope_shared_borrow_warns_without_blocking_owner_stop() {
+    let f = Fixture::new("borrow_same_scope");
+    let web = call(&f, &f.wt_a, &run_auto("db"));
+    let target = web["service"].as_str().unwrap();
+    let b = call(&f, &f.wt_a, &["borrow", target]);
+    assert_eq!(b["ok"], true, "{b}");
+    assert_eq!(b["kind"], "shared");
+    assert_eq!(b["instance"], web["instance"]);
+    let id = b["borrow"].as_str().unwrap();
+    let live_check = call(&f, &f.wt_a, &["borrow", "--check", id]);
+    assert_eq!(live_check["ok"], true, "{live_check}");
+    assert_eq!(live_check["warnings"][0]["code"], "W_SAME_SCOPE_BORROW");
+    let stop = call(&f, &f.wt_a, &["stop", "db"]);
+    assert_eq!(stop["ok"], true, "{stop}");
+    let check = call(&f, &f.wt_a, &["borrow", "--check", id]);
+    assert_eq!(check["error"]["code"], "E_DANGLING", "{check}");
+    let warning = &b["warnings"][0];
+    assert_eq!(warning["code"], "W_SAME_SCOPE_BORROW", "{b}");
+    assert!(
+        warning["message"]
+            .as_str()
+            .unwrap()
+            .contains("does not prevent")
+    );
+    assert_eq!(warning["details"]["borrow"], id);
+    assert_eq!(warning["details"]["service"], target);
+
+    let web = call(&f, &f.wt_a, &run_auto("db"));
+    let human = f.taba(&f.wt_a, &["borrow", web["service"].as_str().unwrap()]);
+    assert!(human.status.success(), "{}", text(&human));
+    let stderr = String::from_utf8_lossy(&human.stderr);
+    assert!(stderr.contains("same scope"), "{stderr}");
+    assert!(stderr.contains("does not prevent"), "{stderr}");
+    assert!(stderr.contains("owner"), "{stderr}");
+    assert!(stderr.contains("stop"), "{stderr}");
+    let exclusive = call(&f, &f.wt_a, &["borrow", "--mut", "db"]);
+    assert_eq!(exclusive["ok"], true, "{exclusive}");
+    assert_eq!(exclusive["kind"], "exclusive");
+    assert_eq!(exclusive["warnings"], serde_json::json!([]));
+    assert_eq!(
+        call(
+            &f,
+            &f.wt_a,
+            &["release", exclusive["borrow"].as_str().unwrap()]
+        )["ok"],
+        true
+    );
+}
+
+#[test]
+fn dangling_warnings_identify_each_borrow_and_release_cleans_up() {
+    let f = Fixture::new("borrow_dangling_diagnostics");
+    let web = call(&f, &f.wt_a, &run_auto("db"));
+    let target = web["service"].as_str().unwrap();
+    let first = call(&f, &f.wt_b, &["borrow", target]);
+    let second = call(&f, &f.wt_b, &["borrow", target]);
+    let ids = [
+        first["borrow"].as_str().unwrap(),
+        second["borrow"].as_str().unwrap(),
+    ];
+    assert_ne!(ids[0], ids[1]);
+    let stop = call(
+        &f,
+        &f.wt_a,
+        &["stop", target, "--force", "--reason", "test"],
+    );
+    assert_eq!(stop["ok"], true, "{stop}");
+    let ps = call(&f, &f.wt_b, &["ps"]);
+    let warnings = ps["warnings"].as_array().unwrap();
+    assert_eq!(warnings.len(), 2, "{ps}");
+    for id in ids {
+        let warning = warnings
+            .iter()
+            .find(|w| w["details"]["borrow"] == id)
+            .unwrap_or_else(|| panic!("missing warning for {id}: {ps}"));
+        assert_eq!(warning["code"], "W_BORROW_BROKEN");
+        assert_eq!(warning["details"]["service"], target);
+        let command = format!("taba release {id}");
+        assert_eq!(warning["details"]["release_command"], command);
+        let message = warning["message"].as_str().unwrap();
+        assert!(
+            message.contains(id) && message.contains(target) && message.contains(&command),
+            "{message}"
+        );
+        assert_eq!(
+            call(&f, &f.wt_b, &["borrow", "--check", id])["error"]["code"],
+            "E_DANGLING"
+        );
+        let release = call(&f, &f.wt_b, &["release", id]);
+        assert_eq!(release["released"][0], id, "{release}");
+        assert_eq!(
+            call(&f, &f.wt_b, &["borrow", "--check", id])["error"]["code"],
+            "E_NOT_FOUND"
+        );
+    }
+    assert_eq!(
+        call(&f, &f.wt_b, &["ps"])["warnings"],
+        serde_json::json!([])
+    );
+    assert!(!f.home().join("borrows").exists());
+}
+
+#[test]
+fn release_removes_only_its_queued_dangling_warning() {
+    let f = Fixture::new("borrow_release_notice");
+    let web = call(&f, &f.wt_a, &run_auto("db"));
+    let target = web["service"].as_str().unwrap();
+    let first = call(&f, &f.wt_b, &["borrow", target]);
+    let second = call(&f, &f.wt_b, &["borrow", target]);
+    let first_id = first["borrow"].as_str().unwrap();
+    let second_id = second["borrow"].as_str().unwrap();
+    assert_eq!(
+        call(
+            &f,
+            &f.wt_a,
+            &["stop", target, "--force", "--reason", "test"]
+        )["ok"],
+        true
+    );
+    assert_eq!(call(&f, &f.wt_b, &["release", first_id])["ok"], true);
+    let human = f.taba(&f.wt_b, &["ps"]);
+    assert!(human.status.success(), "{}", text(&human));
+    let stderr = String::from_utf8_lossy(&human.stderr);
+    assert!(!stderr.contains(first_id), "{stderr}");
+    assert_eq!(stderr.matches("taba: warning:").count(), 1, "{stderr}");
+    assert!(stderr.contains(target), "{stderr}");
+    assert!(
+        stderr.contains(&format!("taba release {second_id}")),
+        "{stderr}"
+    );
+    assert_eq!(call(&f, &f.wt_b, &["release", second_id])["ok"], true);
+    assert_eq!(
+        call(&f, &f.wt_b, &["ps"])["warnings"],
+        serde_json::json!([])
+    );
 }
 
 #[test]

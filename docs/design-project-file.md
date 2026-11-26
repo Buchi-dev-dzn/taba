@@ -47,10 +47,9 @@ service_ttl = "8h"       # as --service-ttl
 
 - `taba up [NAME...] [--scope S] [--agent A] [--ttl D] [--json]` runs
   `run --wait=<wait>` for each selected service. A service that is already
-  running with the same command, directory and port request is reused
-  (`already_running`); one running with different settings is `E_CONFLICT`,
-  as for `run`. Changing only `env` does not count as different: stop the
-  service to apply it.
+  running with the same command, directory, port request and environment is
+  reused (`already_running`); one with different settings is `E_CONFLICT`.
+  State stores environment names and a keyed fingerprint, never values.
 - On the first failure `up` stops. The reply has `ok: false`, `results` with
   each service handled so far (the failed one with `status: "failed"` and its
   error), and `error` with the failed service's code, `details.not_started`
@@ -62,6 +61,10 @@ service_ttl = "8h"       # as --service-ttl
   A declared service without a record is reported as `absent`.
 - No `taba.toml` found is `E_NO_PROJECT` (exit 5). An unknown `NAME` is
   `E_USAGE`.
+- `taba run ... --save [--force]` writes a successful run to this file,
+  preserving comments and other tables. A different definition is refused
+  before starting unless `--force`; saved environment values are plain text
+  and replies show them as `<hidden>`.
 
 ## Out of scope
 

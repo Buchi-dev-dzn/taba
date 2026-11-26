@@ -153,6 +153,7 @@ pub fn skipped_warnings() -> Vec<Warning> {
         .map(|message| Warning {
             code: "W_STATE_SKIPPED",
             message,
+            details: None,
         })
         .collect()
 }
@@ -175,11 +176,16 @@ pub fn exit_code(code: &str) -> u8 {
 pub struct Warning {
     pub code: &'static str,
     pub message: String,
+    pub details: Option<Value>,
 }
 
 impl Warning {
     pub fn to_json(&self) -> Value {
-        json!({ "code": self.code, "message": self.message })
+        let mut warning = json!({ "code": self.code, "message": self.message });
+        if let Some(details) = &self.details {
+            warning["details"] = details.clone();
+        }
+        warning
     }
 }
 
@@ -274,4 +280,22 @@ pub fn print_json(v: &Value) {
         "{}",
         serde_json::to_string_pretty(v).expect("JSON values always serialize")
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn warning_without_details_keeps_its_json_shape() {
+        let warning = Warning {
+            code: "W_NOTICE",
+            message: "a notice".into(),
+            details: None,
+        };
+        assert_eq!(
+            warning.to_json(),
+            json!({"code":"W_NOTICE","message":"a notice"})
+        );
+    }
 }

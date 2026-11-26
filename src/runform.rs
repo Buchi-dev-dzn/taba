@@ -96,6 +96,7 @@ pub const RUN_VALUE_FLAGS: &[&str] = &[
     "--ready",
     "--ttl",
     "--service-ttl",
+    "--env",
 ];
 /// taba's `run` flags without a separate value.
 pub const RUN_SWITCHES: &[&str] = &[
@@ -103,6 +104,8 @@ pub const RUN_SWITCHES: &[&str] = &[
     "--interactive",
     "-i",
     "--no-interactive",
+    "--save",
+    "--force",
     "--json",
     "--help",
     "-h",
@@ -207,7 +210,7 @@ pub fn prepare(raw: Vec<String>) -> Result<(Vec<String>, Shape)> {
         fixed.extend(raw[run_at..start].iter().cloned());
         fixed.push(inside);
         fixed.extend(options);
-        let fixed = display_argv(&fixed);
+        let fixed = display_run_argv(&fixed);
         return Err(TabaError::usage(format!(
             "{first} is not a taba option; if it is for your command, put it inside the \
              quotes: {fixed}"
@@ -287,7 +290,35 @@ fn with_separator(raw: &[String], command: &[String]) -> String {
     fixed.extend(raw[1..at].iter().cloned());
     fixed.push("--".into());
     fixed.extend(command.iter().cloned());
-    display_argv(&fixed)
+    display_run_argv(&fixed)
+}
+
+/// Displays a corrected run command without exposing taba's `--env` values.
+/// This is presentation only: the original argv still starts the child.
+fn display_run_argv(words: &[String]) -> String {
+    fn hidden(assignment: &str) -> String {
+        match assignment.split_once('=') {
+            Some((key, _)) => format!("{key}=<hidden>"),
+            None => "<hidden>".into(),
+        }
+    }
+    let mut shown = words.to_vec();
+    let mut i = 0;
+    while i < shown.len() {
+        if shown[i] == "--" {
+            break;
+        }
+        if shown[i] == "--env" {
+            i += 1;
+            if let Some(value) = shown.get_mut(i) {
+                *value = hidden(value);
+            }
+        } else if let Some(value) = shown[i].strip_prefix("--env=") {
+            shown[i] = format!("--env={}", hidden(value));
+        }
+        i += 1;
+    }
+    display_argv(&shown)
 }
 
 /// `taba run --name NAME` for the same command: `-- argv`, or the quoted
@@ -703,6 +734,41 @@ mod tests {
         );
         let err = prepare(strings(&["taba", "run", "a b", "--name"])).unwrap_err();
         assert_eq!(err.message, "--name needs a value");
+    }
+
+    #[test]
+    fn corrections_hide_env_values_but_keep_original_arguments() {
+        const SECRET: &str = "dummy-correction-secret";
+        for env in [
+            strings(&["--env", &format!("TOKEN={SECRET}")]),
+            strings(&[&format!("--env=TOKEN={SECRET}")]),
+        ] {
+            let mut raw = strings(&["taba", "run"]);
+            raw.extend(env.clone());
+            raw.extend(strings(&["npm", "run", "dev"]));
+            let error = command_spec(
+                Shape {
+                    options_first: true,
+                    separator: false,
+                },
+                strings(&["npm", "run", "dev"]),
+                &raw,
+            )
+            .unwrap_err();
+            assert!(!error.to_json().to_string().contains(SECRET));
+            // This is the exact string used by the interactive confirmation.
+            let corrected = error.details.as_ref().unwrap()["corrected"]
+                .as_str()
+                .unwrap();
+            assert!(corrected.contains("TOKEN=<hidden>"));
+            assert!(raw.join(" ").contains(SECRET));
+            let mut quoted = strings(&["taba", "run", "npm run dev"]);
+            quoted.extend(env);
+            quoted.push("--open".into());
+            let error = prepare(quoted).unwrap_err();
+            assert!(!error.to_json().to_string().contains(SECRET));
+            assert!(error.message.contains("TOKEN=<hidden>"));
+        }
     }
 
     #[test]

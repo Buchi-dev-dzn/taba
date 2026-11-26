@@ -100,6 +100,16 @@ enum Cmd {
         /// Not interactive, also for `flutter run` and `vite`
         #[arg(long, conflicts_with = "interactive")]
         no_interactive: bool,
+        /// Set an environment variable for the service (repeatable). Values
+        /// are never stored in taba state or printed.
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        env: Vec<String>,
+        /// Write this service to taba.toml after it starts.
+        #[arg(long)]
+        save: bool,
+        /// With --save, replace a different saved definition.
+        #[arg(long, requires = "save")]
+        force: bool,
         /// Print one JSON document (also: TABA_OUTPUT=json)
         #[arg(long)]
         json: bool,
@@ -713,6 +723,9 @@ fn main_impl() -> ExitCode {
             service_ttl,
             interactive,
             no_interactive,
+            env,
+            save,
+            force,
             json,
             command,
         } => {
@@ -723,28 +736,33 @@ fn main_impl() -> ExitCode {
                 && io::stderr().is_terminal();
             (
                 json,
-                cmd_run(RunArgs {
-                    scope,
-                    agent,
-                    name,
-                    port,
-                    wait,
-                    ready,
-                    ttl,
-                    service_ttl,
-                    interactive: if no_interactive {
-                        Some(false)
-                    } else {
-                        interactive.then_some(true)
-                    },
-                    command,
-                    cwd: None,
-                    env: Vec::new(),
-                    shape,
-                    raw,
-                    prompt,
-                })
-                .map(Some),
+                project::parse_env_args(&env)
+                    .and_then(|env| {
+                        cmd_run(RunArgs {
+                            scope,
+                            agent,
+                            name,
+                            port,
+                            wait,
+                            ready,
+                            ttl,
+                            service_ttl,
+                            interactive: if no_interactive {
+                                Some(false)
+                            } else {
+                                interactive.then_some(true)
+                            },
+                            command,
+                            cwd: None,
+                            env,
+                            save,
+                            force,
+                            shape,
+                            raw,
+                            prompt,
+                        })
+                    })
+                    .map(Some),
             )
         }
         Cmd::Send {
@@ -1216,6 +1234,8 @@ struct RunArgs {
     cwd: Option<std::path::PathBuf>,
     /// Extra environment variables for the command.
     env: Vec<(String, String)>,
+    save: bool,
+    force: bool,
     shape: runform::Shape,
     /// The original arguments, program name first (for corrections).
     raw: Vec<String>,
@@ -1276,7 +1296,41 @@ fn cmd_run(mut a: RunArgs) -> Result<Output> {
     };
     a.command = spec.template;
     let form = runform::resolve(a.name.clone(), a.wait, a.ready.is_some(), &spec.words)?;
-    run_service(a, form)
+    let plan = if a.save {
+        let caller = scope::resolve(a.scope.clone(), a.agent.clone())?;
+        let cwd = a.cwd.clone().unwrap_or_else(|| caller.cwd.clone());
+        Some(project::plan_save(
+            project::save_path(&caller.cwd, caller.worktree.as_deref()),
+            project::SaveRequest {
+                name: form.name.clone(),
+                command: a.command.clone(),
+                port: a.port.clone(),
+                ready: a.ready.clone(),
+                wait: a.wait,
+                env: a.env.clone(),
+                cwd,
+                service_ttl: a.service_ttl,
+                interactive: a.interactive,
+            },
+            a.force,
+        )?)
+    } else {
+        None
+    };
+    let mut out = run_service(a, form)?;
+    if let Some(plan) = plan {
+        let plan = project::write_save(&plan)?;
+        let shown = project::render(
+            &plan.def,
+            plan.path.parent().unwrap_or(std::path::Path::new(".")),
+            true,
+        );
+        out.body.insert("saved".into(), json!({"path": plan.path, "name": plan.def.name, "result": plan.result, "definition": shown}));
+        if !plan.def.env.is_empty() && plan.result != "unchanged" {
+            out.warnings.push(Warning { code: "W_ENV_SAVED", message: "environment values were saved to taba.toml in plain text; do not commit secrets".into(), details: None });
+        }
+    }
+    Ok(out)
 }
 
 /// Offers the corrected command line on the terminal; Enter or `y` runs it.
@@ -1307,6 +1361,14 @@ fn run_service(a: RunArgs, form: runform::RunForm) -> Result<Output> {
     let scope = caller.require_scope()?;
     check_ident("name", &name)?;
     let dir = a.cwd.clone().unwrap_or_else(|| caller.cwd.clone());
+    let mut env_keys: Vec<String> = a.env.iter().map(|(k, _)| k.clone()).collect();
+    env_keys.sort();
+    if let Some(dupe) = env_keys.windows(2).find(|pair| pair[0] == pair[1]) {
+        return Err(TabaError::usage(format!(
+            "--env {} is given twice",
+            dupe[0]
+        )));
+    }
     let short = form.derived.map(|derived| Short {
         derived,
         label: if caller.source == Some(ScopeSource::Flag) {
@@ -1365,6 +1427,7 @@ fn run_service(a: RunArgs, form: runform::RunForm) -> Result<Output> {
     gc::collect(&store, &cfg, false, 5, Some(&scope))?;
     let lock = store.lock()?;
     store.mark_version()?;
+    let env_hash = store.env_fingerprint(&a.env)?;
     let existing = store.get(&scope, &name)?;
     if let Some(short) = short
         && let Some(ex) = &existing
@@ -1409,6 +1472,8 @@ fn run_service(a: RunArgs, form: runform::RunForm) -> Result<Output> {
             && ex.cwd == dir
             && ex.port_request() == port_request
             && ex.input.is_some() == interactive
+            && ex.env_keys == env_keys
+            && ex.env_hash == env_hash
         {
             let mut ex = ex.clone();
             if let Some(ttl) = a.service_ttl.or(ex.service_ttl_secs) {
@@ -1424,19 +1489,15 @@ fn run_service(a: RunArgs, form: runform::RunForm) -> Result<Output> {
         return Err(TabaError::new(
             "E_CONFLICT",
             format!(
-                "{} is already running with a different command, directory, port or \
-                 interactive mode (command {:?}, dir {}, port {}, interactive {}); stop it first",
+                "{} is already running with a different command, directory, port, environment or \
+                 interactive mode; stop it first",
                 ex.id(),
-                ex.template(),
-                tilde(&ex.cwd),
-                ex.port_request().unwrap_or_else(|| "-".into()),
-                ex.input.is_some(),
             ),
         )
         .details(json!({
             "service": ex.id(), "command": ex.template(), "directory": ex.cwd,
             "port": ex.port, "port_request": ex.port_request(), "instance": ex.instance(),
-            "interactive": ex.input.is_some(),
+            "interactive": ex.input.is_some(), "env": ex.env_keys,
         }))
         .next(Next::run(
             "stop it, then run again",
@@ -1467,6 +1528,7 @@ fn run_service(a: RunArgs, form: runform::RunForm) -> Result<Output> {
                 "the command has no {{port}}; taba only set PORT={}, which the app may ignore",
                 port.unwrap_or(0)
             ),
+            details: None,
         });
     }
     let command: Vec<String> = match port {
@@ -1518,6 +1580,12 @@ fn run_service(a: RunArgs, form: runform::RunForm) -> Result<Output> {
     #[cfg(not(windows))]
     cmd.args(&command[1..]);
     cmd.current_dir(&dir)
+        // Caller identity and output preferences belong to the invoking
+        // agent, not nested taba calls made by the service. Explicit --env
+        // (or project env) remains a deliberate override.
+        .env_remove("TABA_AGENT")
+        .env_remove("TABA_AGENT_PID")
+        .env_remove("TABA_OUTPUT")
         .envs(a.env.iter().map(|(k, v)| (k, v)))
         .env("TABA_SCOPE", &scope)
         .env("TABA_SERVICE", &name)
@@ -1579,6 +1647,8 @@ fn run_service(a: RunArgs, form: runform::RunForm) -> Result<Output> {
             .map(|t| util::rfc3339(util::now_secs().saturating_add(t))),
         moves: Vec::new(),
         stop_requested_at: None,
+        env_keys,
+        env_hash,
         discovered_ports: Vec::new(),
         input,
         dev_kind: (kind != input::Kind::Other).then_some(kind),
@@ -1774,7 +1844,7 @@ fn run_result(
                 None if port_found => Some(json!({ "check": "port", "ms": ms })),
                 None => None,
             };
-            let body = json!({
+            let mut body = json!({
                 "status": status,
                 "service": id,
                 "scope": svc.scope,
@@ -1789,6 +1859,9 @@ fn run_result(
                 "discovered_ports": svc.discovered_ports,
                 "interactive": svc.input.is_some(),
             });
+            if !svc.env_keys.is_empty() {
+                body["env"] = json!(svc.env_keys);
+            }
             if let Some(short) = short {
                 let mut out = Output::new(body, short_text(&svc, status == "started", short));
                 out.warnings = warnings;
@@ -1803,6 +1876,12 @@ fn run_result(
             if svc.input.is_some() {
                 text.push_str(&format!(
                     "\n  interactive: yes (type: taba attach {id}; i in taba logs -f)"
+                ));
+            }
+            if !svc.env_keys.is_empty() {
+                text.push_str(&format!(
+                    "\n  env  {} (values not shown)",
+                    svc.env_keys.join(", ")
                 ));
             }
             if let Some(c) = check {
@@ -1881,6 +1960,8 @@ fn cmd_up(
             command: def.command.clone(),
             cwd: Some(def.cwd.clone()),
             env: def.env.clone(),
+            save: false,
+            force: false,
             shape: runform::Shape::default(),
             raw: Vec::new(),
             prompt: false,
@@ -2903,6 +2984,8 @@ mod stop_tests {
                 service_expires_at: None,
                 moves: Vec::new(),
                 stop_requested_at: None,
+                env_keys: Vec::new(),
+                env_hash: None,
                 discovered_ports: Vec::new(),
                 input: None,
                 dev_kind: None,

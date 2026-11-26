@@ -387,6 +387,9 @@ pub fn spawn_holder(t: &Terminal, spawned: &crate::proc::Spawned, stderr: File) 
             spawned.pgid.to_string(),
             spawned.start_time.to_string(),
         ])
+        .env_remove("TABA_AGENT")
+        .env_remove("TABA_AGENT_PID")
+        .env_remove("TABA_OUTPUT")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(stderr));
@@ -561,17 +564,17 @@ fn no_input(svc: &Service) -> TabaError {
         ),
     )
     .details(json!({ "service": svc.id() }))
-    .next(Next::run(
-        "restart it with --interactive (stop it first)",
-        format!("taba stop {}", svc.id()),
-    ))
+    .next(restart_interactive(svc))
 }
 
 fn restart_interactive(svc: &Service) -> Next {
-    Next::run(
-        "stop the instance, then rerun the original `taba run --interactive ...` command (add --interactive before the service command, replacing --no-interactive if present)",
-        format!("taba stop {}", svc.id()),
-    )
+    let hint = "stop the instance, then rerun the original `taba run --interactive ...` command (add --interactive before the service command, replacing --no-interactive if present)";
+    let hint = if svc.env_keys.is_empty() {
+        hint.to_string()
+    } else {
+        format!("{hint}; supply the original environment values again")
+    };
+    Next::run(&hint, format!("taba stop {}", svc.id()))
 }
 
 fn holder_gone(svc: &Service, input: &Input) -> TabaError {
@@ -584,10 +587,7 @@ fn holder_gone(svc: &Service, input: &Input) -> TabaError {
         ),
     )
     .details(json!({ "service": svc.id(), "holder_pid": input.holder_pid }))
-    .next(Next::run(
-        "restart it (stop it first)",
-        format!("taba stop {}", svc.id()),
-    ))
+    .next(restart_interactive(svc))
 }
 
 fn not_running(svc: &Service) -> TabaError {

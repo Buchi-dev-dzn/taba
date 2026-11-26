@@ -8,6 +8,7 @@
 //! ops/<scope>/<name>.json         in-flight mutation of one service (operation lock)
 //! inputs/<scope>/<name>.fifo      input of a service started with `run --interactive` (Unix)
 //! events.jsonl                    append-only audit log
+//! env.key                         random key for `env_hash` (see `env_fingerprint`)
 //! version                         state schema version
 //! lock                            global lock (flock / LockFileEx)
 //! lock.holder                     pid of the last process that took the global lock
@@ -141,9 +142,16 @@ pub struct Service {
     /// seconds); a later cleanup forces it once `stop_timeout` has passed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_requested_at: Option<u64>,
-    /// TCP ports the service's processes were found listening on when `run`
-    /// reported it (ascending). The URL falls back to the first one when the
-    /// service has no `--port`.
+    /// Names (never values) of the variables `run --env` or taba.toml set,
+    /// sorted; a re-run with other names is a different service.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_keys: Vec<String>,
+    /// HMAC-SHA-256 of the variables (names and values) under this state
+    /// directory's random `env.key`, so a re-run notices a changed value
+    /// without storing it. `None` when no variables were set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_hash: Option<String>,
+    /// TCP ports discovered for the short `run` form.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub discovered_ports: Vec<u16>,
     /// `run --interactive` (Unix): the input FIFO and the holder process that
@@ -219,7 +227,6 @@ impl Service {
         format!("{}/{}", self.scope, self.name)
     }
 
-    /// `--port`'s port, else the first discovered one.
     pub fn url(&self) -> Option<String> {
         self.port
             .or_else(|| self.discovered_ports.first().copied())
@@ -584,6 +591,49 @@ impl Store {
         &self.root
     }
 
+    /// A keyed fingerprint of `env` (the variables `run --env` or taba.toml
+    /// set), `None` when it is empty. The key is 32 random bytes in
+    /// `env.key`, created owner-only on first use, so the fingerprint can't
+    /// be checked against guessed values without it. The order of `env`
+    /// does not matter. Call under the global lock.
+    pub fn env_fingerprint(&self, env: &[(String, String)]) -> io::Result<Option<String>> {
+        if env.is_empty() {
+            return Ok(None);
+        }
+        let key = self.env_key()?;
+        let mut vars: Vec<&(String, String)> = env.iter().collect();
+        vars.sort();
+        let mut msg = Vec::new();
+        for (k, v) in vars {
+            // Length-prefixed, so ("A", "B=C") and ("A=B", "C") differ.
+            for part in [k, v] {
+                msg.extend_from_slice(&(part.len() as u64).to_le_bytes());
+                msg.extend_from_slice(part.as_bytes());
+            }
+        }
+        let mac = hmac_sha256(&key, &msg);
+        Ok(Some(mac.iter().map(|b| format!("{b:02x}")).collect()))
+    }
+
+    fn env_key(&self) -> io::Result<Vec<u8>> {
+        let path = self.root.join("env.key");
+        match fs::read(&path) {
+            Ok(k) if k.len() == 32 => return Ok(k),
+            Ok(_) => {} // damaged: replace it (running services then differ)
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        let key = random_bytes_32();
+        let tmp = path.with_extension("tmp");
+        private_file()
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?
+            .write_all(&key)?;
+        fs::rename(&tmp, &path)?;
+        Ok(key.to_vec())
+    }
+
     // ---- scope records (`scopes/<scope>.json`)
 
     fn scope_path(&self, scope: &str) -> PathBuf {
@@ -879,6 +929,40 @@ pub(crate) fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> io::Resu
     }
 }
 
+fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut k = [0u8; 64];
+    k[..key.len()].copy_from_slice(key); // key is 32 bytes, below the block size
+    let mut inner = Sha256::new();
+    inner.update(k.map(|b| b ^ 0x36));
+    inner.update(msg);
+    let mut outer = Sha256::new();
+    outer.update(k.map(|b| b ^ 0x5c));
+    outer.update(inner.finalize());
+    outer.finalize().into()
+}
+
+/// 32 bytes from the OS random source the standard library seeds its hash
+/// maps with (`RandomState`), mixed through SHA-256 with the time and pid.
+fn random_bytes_32() -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    use std::hash::BuildHasher;
+    let mut h = Sha256::new();
+    for i in 0u64..8 {
+        h.update(
+            std::collections::hash_map::RandomState::new()
+                .hash_one(i)
+                .to_le_bytes(),
+        );
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    h.update(now.as_nanos().to_le_bytes());
+    h.update(std::process::id().to_le_bytes());
+    h.finalize().into()
+}
+
 /// Creates `dir` and any missing parents. On Unix, directories taba creates
 /// are owner-only (0700): records hold command lines and working
 /// directories, logs hold service output that often includes secrets. On
@@ -1017,6 +1101,67 @@ mod tests {
         let v: serde_json::Value = read_json(&path).unwrap().unwrap();
         assert_eq!(v["x"], 2);
         assert!(!path.with_extension("json.tmp").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hmac_matches_rfc_4231() {
+        let mac = hmac_sha256(b"Jefe", b"what do ya want for nothing?");
+        let hex: String = mac.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
+
+    #[test]
+    fn env_fingerprint_is_keyed_order_free_and_value_sensitive() {
+        let dir = std::env::temp_dir().join(format!("taba-envhash-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let store = Store::at(dir.clone());
+        let v = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        assert_eq!(store.env_fingerprint(&[]).unwrap(), None);
+        let a = store
+            .env_fingerprint(&v(&[("A", "1"), ("B", "2")]))
+            .unwrap();
+        let key = fs::read(dir.join("env.key")).unwrap();
+        assert_eq!(key.len(), 32);
+        assert_eq!(
+            store
+                .env_fingerprint(&v(&[("B", "2"), ("A", "1")]))
+                .unwrap(),
+            a
+        );
+        assert_ne!(
+            store
+                .env_fingerprint(&v(&[("A", "1"), ("B", "3")]))
+                .unwrap(),
+            a
+        );
+        assert_ne!(
+            store
+                .env_fingerprint(&v(&[("A", "1=B"), ("", "2")]))
+                .unwrap(),
+            a
+        );
+        assert_eq!(
+            fs::read(dir.join("env.key")).unwrap(),
+            key,
+            "the key is kept"
+        );
+        // Another state directory has another key.
+        let other = dir.join("other");
+        fs::create_dir_all(&other).unwrap();
+        let b = Store::at(other)
+            .env_fingerprint(&v(&[("A", "1"), ("B", "2")]))
+            .unwrap();
+        assert_ne!(a, b);
         let _ = fs::remove_dir_all(&dir);
     }
 }
