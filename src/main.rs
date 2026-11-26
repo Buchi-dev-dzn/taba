@@ -638,7 +638,7 @@ fn main() -> ExitCode {
             .spawn(main_impl)
             .expect("start taba main thread")
             .join()
-            .expect("taba main thread");
+            .expect("taba main thread")
     }
     #[cfg(not(windows))]
     main_impl()
