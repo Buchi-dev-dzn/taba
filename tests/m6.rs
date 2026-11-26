@@ -155,6 +155,7 @@ fn equivalent_command_shapes_get_the_same_decision() {
     for cmd in [
         format!("TABA_AGENT=claude-code:other taba stop --scope {scope}"),
         format!("taba stop --scope {scope} --agent claude-code:other"),
+        "taba run --agent claude-code:other npm run dev".to_string(),
         format!("export TABA_AGENT=human; taba stop --scope {scope}"),
     ] {
         assert_eq!(decision(&run("claude-code", &cmd)), "ask", "{cmd}");
@@ -164,6 +165,7 @@ fn equivalent_command_shapes_get_the_same_decision() {
     for cmd in [
         "TABA_AGENT=claude-code:worker-a taba ps",
         "taba ps --agent claude-code:other",
+        "TABA_AGENT=claude-code:other taba",
         "cargo test 2>&1 | tail -n 5",
     ] {
         let before = unchecked();
