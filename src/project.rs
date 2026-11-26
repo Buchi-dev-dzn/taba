@@ -192,12 +192,7 @@ fn parse_service(path: &Path, dir: &Path, name: &str, value: &toml::Value) -> Re
                 };
                 for (var, val) in vars {
                     let vkey = format!("{key}.{var}");
-                    if var.is_empty() || var.contains('=') || var.contains('\0') {
-                        return Err(err(path, &vkey, "is not a valid variable name"));
-                    }
-                    if matches!(var.as_str(), "PORT" | "TABA_SCOPE" | "TABA_SERVICE") {
-                        return Err(err(path, &vkey, "is set by taba and cannot be overridden"));
-                    }
+                    check_env_key(var).map_err(|m| err(path, &vkey, m))?;
                     let val = val
                         .as_str()
                         .ok_or_else(|| err(path, &vkey, "must be a string"))?;
@@ -290,6 +285,262 @@ fn parse_cmd(path: &Path, key: &str, v: &toml::Value) -> Result<Vec<String>> {
         return Err(err(path, key, "is empty"));
     }
     Ok(argv)
+}
+
+/// Checks an environment variable name for `run --env` and taba.toml `env`.
+pub fn check_env_key(key: &str) -> std::result::Result<(), String> {
+    if key.is_empty() || key.contains('=') || key.contains('\0') {
+        return Err(format!("{key:?} is not a valid variable name"));
+    }
+    if matches!(key, "PORT" | "TABA_SCOPE" | "TABA_SERVICE") {
+        return Err(format!("{key} is set by taba and cannot be overridden"));
+    }
+    Ok(())
+}
+
+/// clap value parser for `run --env KEY=VALUE`.
+pub fn parse_env_pair(s: &str) -> std::result::Result<(String, String), String> {
+    let (k, v) = s
+        .split_once('=')
+        .ok_or_else(|| "expected KEY=VALUE".to_string())?;
+    check_env_key(k)?;
+    Ok((k.to_string(), v.to_string()))
+}
+
+/// The text form of a ready check, as `--ready` and taba.toml take it.
+pub fn ready_text(r: &ReadySpec) -> String {
+    match r {
+        ReadySpec::Tcp => "tcp".into(),
+        ReadySpec::Http(p) => format!("http:{p}"),
+        ReadySpec::Log(re) => format!("log:{}", re.as_str()),
+    }
+}
+
+/// What `run --save` asks to write. `wait`, `ready` and `service_ttl` are
+/// `None` when the run did not give them: the file's value is kept.
+pub struct SaveRequest {
+    pub name: String,
+    pub command: Vec<String>,
+    pub port: Option<PortSpec>,
+    pub ready: Option<ReadySpec>,
+    pub wait: Option<f64>,
+    pub env: Vec<(String, String)>,
+    pub cwd: PathBuf,
+    pub service_ttl: Option<u64>,
+}
+
+/// A checked `run --save`, written by `write_save` once the run succeeded.
+pub struct SavePlan {
+    pub path: PathBuf,
+    pub exists: bool,
+    pub def: ServiceDef,
+    /// `created` (new file), `added`, `updated` or `unchanged`.
+    pub result: &'static str,
+}
+
+/// Where `run --save` writes: the taba.toml `taba up` would read from
+/// `cwd`, else a new one at the worktree root, else in `cwd`.
+pub fn save_path(cwd: &Path, worktree: Option<&Path>) -> PathBuf {
+    find(cwd).unwrap_or_else(|| worktree.unwrap_or(cwd).join(FILE_NAME))
+}
+
+fn same_def(a: &ServiceDef, b: &ServiceDef) -> bool {
+    let mut ae = a.env.clone();
+    let mut be = b.env.clone();
+    ae.sort();
+    be.sort();
+    a.command == b.command
+        && a.port.as_ref().map(PortSpec::request) == b.port.as_ref().map(PortSpec::request)
+        && a.ready.as_ref().map(ready_text) == b.ready.as_ref().map(ready_text)
+        && a.wait == b.wait
+        && ae == be
+        && a.cwd == b.cwd
+        && a.service_ttl == b.service_ttl
+}
+
+/// Checks a `run --save` before anything starts: reads the file (an invalid
+/// one is `E_CONFIG`), and refuses to replace a different definition of the
+/// same name without `force` (`E_CONFLICT`).
+pub fn plan_save(path: PathBuf, req: SaveRequest, force: bool) -> Result<SavePlan> {
+    let existing = if path.is_file() {
+        let text = std::fs::read_to_string(&path).map_err(|e| {
+            TabaError::new("E_CONFIG", format!("cannot read {}: {e}", path.display()))
+                .details(json!({ "source": "project", "path": path }))
+        })?;
+        // An empty file is a valid place to add the first service.
+        if text.trim().is_empty() {
+            Some(None)
+        } else {
+            Some(
+                parse(&path, &text)?
+                    .services
+                    .into_iter()
+                    .find(|s| s.name == req.name),
+            )
+        }
+    } else {
+        None
+    };
+    let old = existing.as_ref().and_then(|e| e.as_ref());
+    let def = ServiceDef {
+        name: req.name,
+        command: req.command,
+        port: req.port,
+        ready: req.ready.or_else(|| old.and_then(|o| o.ready.clone())),
+        wait: req.wait.or(old.map(|o| o.wait)).unwrap_or(DEFAULT_WAIT),
+        env: req.env,
+        cwd: req.cwd,
+        service_ttl: req.service_ttl.or(old.and_then(|o| o.service_ttl)),
+    };
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let result = match old {
+        None if existing.is_none() => "created",
+        None => "added",
+        Some(o) if same_def(o, &def) => "unchanged",
+        Some(o) if !force => {
+            return Err(TabaError::new(
+                "E_CONFLICT",
+                format!(
+                    "{} already defines services.{} differently; run again with --force to \
+                     replace it",
+                    path.display(),
+                    def.name
+                ),
+            )
+            .details(json!({
+                "path": path,
+                "name": def.name,
+                "existing": render(o, dir, true),
+                "requested": render(&def, dir, true),
+            }))
+            .next(Next::just("add --force to replace the saved definition"))
+            .next(Next::just("or drop --save, or use another --name")));
+        }
+        Some(_) => "updated",
+    };
+    Ok(SavePlan {
+        exists: existing.is_some(),
+        path,
+        def,
+        result,
+    })
+}
+
+fn def_table(def: &ServiceDef, dir: &Path, hide_values: bool) -> toml_edit::Table {
+    use toml_edit::{Array, InlineTable, Item, Table, value};
+    let mut t = Table::new();
+    let mut cmd = Array::new();
+    for a in &def.command {
+        cmd.push(a.as_str());
+    }
+    t.insert("cmd", value(cmd));
+    match &def.port {
+        Some(PortSpec::Fixed(p)) => {
+            t.insert("port", value(i64::from(*p)));
+        }
+        Some(p) => {
+            t.insert("port", value(p.request()));
+        }
+        None => {}
+    }
+    if let Some(r) = &def.ready {
+        t.insert("ready", value(ready_text(r)));
+    }
+    if def.wait != DEFAULT_WAIT {
+        if def.wait.fract() == 0.0 && def.wait < i64::MAX as f64 {
+            t.insert("wait", value(def.wait as i64));
+        } else {
+            t.insert("wait", value(def.wait));
+        }
+    }
+    if !def.env.is_empty() {
+        let mut env = InlineTable::new();
+        for (k, v) in &def.env {
+            env.insert(
+                k,
+                (if hide_values { "<hidden>" } else { v.as_str() }).into(),
+            );
+        }
+        t.insert("env", Item::Value(env.into()));
+    }
+    let base = crate::util::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    if def.cwd != base {
+        let rel = match def.cwd.strip_prefix(&base) {
+            Ok(r) => r
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/"),
+            Err(_) => def.cwd.to_string_lossy().into_owned(),
+        };
+        t.insert("cwd", value(rel));
+    }
+    if let Some(ttl) = def.service_ttl {
+        t.insert("service_ttl", value(crate::config::format_duration(ttl)));
+    }
+    t
+}
+
+/// The `[services.NAME]` table as TOML text; env values hidden when asked.
+pub fn render(def: &ServiceDef, dir: &Path, hide_values: bool) -> String {
+    let mut doc = toml_edit::DocumentMut::new();
+    let mut services = toml_edit::Table::new();
+    services.set_implicit(true);
+    services.insert(
+        &def.name,
+        toml_edit::Item::Table(def_table(def, dir, hide_values)),
+    );
+    doc.insert("services", toml_edit::Item::Table(services));
+    doc.to_string()
+}
+
+/// Writes a checked plan, keeping the rest of the file (comments included).
+pub fn write_save(plan: &SavePlan) -> Result<()> {
+    if plan.result == "unchanged" {
+        return Ok(());
+    }
+    let path = &plan.path;
+    let io_err = |e: std::io::Error| {
+        TabaError::new("E_CONFIG", format!("cannot write {}: {e}", path.display()))
+            .details(json!({ "source": "project", "path": path }))
+    };
+    let text = if plan.exists {
+        std::fs::read_to_string(path).map_err(io_err)?
+    } else {
+        String::new()
+    };
+    let mut doc: toml_edit::DocumentMut = text
+        .parse()
+        .map_err(|e: toml_edit::TomlError| err(path, "syntax", e.to_string()))?;
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let services = doc
+        .entry("services")
+        .or_insert_with(|| {
+            let mut t = toml_edit::Table::new();
+            t.set_implicit(true);
+            toml_edit::Item::Table(t)
+        })
+        .as_table_mut()
+        .ok_or_else(|| {
+            err(
+                path,
+                "services",
+                "must be a table of [services.NAME] tables",
+            )
+        })?;
+    let mut table = def_table(&plan.def, dir, false);
+    if let Some(old) = services.get(&plan.def.name).and_then(|i| i.as_table()) {
+        // Keep the comment above the replaced table.
+        table.decor_mut().clone_from(old.decor());
+        table.set_position(old.position().unwrap_or(0));
+    }
+    services.insert(&plan.def.name, toml_edit::Item::Table(table));
+    let tmp = path.with_extension("toml.taba-tmp");
+    std::fs::write(&tmp, doc.to_string()).map_err(io_err)?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        io_err(e)
+    })
 }
 
 #[cfg(test)]

@@ -78,6 +78,19 @@ enum Cmd {
         /// already_running re-run), independent of the lease
         #[arg(long, value_parser = config::parse_service_ttl_flag)]
         service_ttl: Option<u64>,
+        /// Set an environment variable for the service (repeatable). Only the
+        /// names are recorded and printed; a re-run with other names is a
+        /// different service
+        #[arg(long = "env", value_parser = project::parse_env_pair,
+              value_name = "KEY=VALUE")]
+        env: Vec<(String, String)>,
+        /// Also write this service to taba.toml (the nearest one, else the
+        /// worktree root's), so `taba up NAME` starts it
+        #[arg(long)]
+        save: bool,
+        /// With --save: replace a different saved definition of NAME
+        #[arg(long, requires = "save")]
+        force: bool,
         /// Print one JSON document (also: TABA_OUTPUT=json)
         #[arg(long)]
         json: bool,
@@ -545,6 +558,9 @@ fn main() -> ExitCode {
             ready,
             ttl,
             service_ttl,
+            env,
+            save,
+            force,
             json,
             command,
         } => (
@@ -560,7 +576,9 @@ fn main() -> ExitCode {
                 service_ttl,
                 command,
                 cwd: None,
-                env: Vec::new(),
+                env,
+                save,
+                force,
             })
             .map(Some),
         ),
@@ -946,13 +964,87 @@ struct RunArgs {
     cwd: Option<std::path::PathBuf>,
     /// Extra environment variables for the command.
     env: Vec<(String, String)>,
+    /// `--save`: write the service to taba.toml after it started.
+    save: bool,
+    /// `--force` with `--save`.
+    force: bool,
 }
 
+/// `taba run`, with `--save` checked before the start and written after it.
 fn cmd_run(a: RunArgs) -> Result<Output> {
+    let plan = if a.save {
+        let caller = scope::resolve(a.scope.clone(), a.agent.clone())?;
+        check_ident("name", &a.name)?;
+        let dir = a.cwd.clone().unwrap_or_else(|| caller.cwd.clone());
+        let path = project::save_path(&caller.cwd, caller.worktree.as_deref());
+        let req = project::SaveRequest {
+            name: a.name.clone(),
+            command: a.command.clone(),
+            port: a.port.clone(),
+            ready: a.ready.clone(),
+            wait: a.wait,
+            env: a.env.clone(),
+            cwd: dir,
+            service_ttl: a.service_ttl,
+        };
+        Some(project::plan_save(path, req, a.force)?)
+    } else {
+        None
+    };
+    let mut out = run_service(a)?;
+    if let Some(plan) = plan {
+        project::write_save(&plan)?;
+        let dir = plan.path.parent().unwrap_or(std::path::Path::new("."));
+        let shown = project::render(&plan.def, dir, true);
+        out.body.insert(
+            "saved".into(),
+            json!({
+                "path": plan.path,
+                "name": plan.def.name,
+                "result": plan.result,
+                "definition": shown,
+            }),
+        );
+        let verb = match plan.result {
+            "unchanged" => "already saved in",
+            "updated" => "updated in",
+            _ => "saved to",
+        };
+        out.text.push_str(&format!(
+            "\n  {verb} {}:\n{}",
+            tilde(&plan.path),
+            shown
+                .trim_end()
+                .lines()
+                .map(|l| format!("    {l}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+        if !plan.def.env.is_empty() && plan.result != "unchanged" {
+            let keys: Vec<&str> = plan.def.env.iter().map(|(k, _)| k.as_str()).collect();
+            out.warnings.push(Warning {
+                code: "W_ENV_SAVED",
+                message: format!(
+                    "{} now holds the values of {} in plain text; do not commit secrets",
+                    tilde(&plan.path),
+                    keys.join(", ")
+                ),
+            });
+        }
+    }
+    Ok(out)
+}
+
+fn run_service(a: RunArgs) -> Result<Output> {
     let caller = scope::resolve(a.scope.clone(), a.agent.clone())?;
     let scope = caller.require_scope()?;
     check_ident("name", &a.name)?;
     let dir = a.cwd.clone().unwrap_or_else(|| caller.cwd.clone());
+    let mut env_keys: Vec<String> = a.env.iter().map(|(k, _)| k.clone()).collect();
+    env_keys.sort();
+    if let Some(w) = env_keys.windows(2).find(|w| w[0] == w[1]) {
+        return Err(TabaError::usage(format!("--env {} is given twice", w[0])));
+    }
     let name = a.name.clone();
     let wait = match a.wait {
         None => None,
@@ -1031,6 +1123,7 @@ fn cmd_run(a: RunArgs) -> Result<Output> {
         if ex.template() == template.as_slice()
             && ex.cwd == dir
             && ex.port_request() == port_request
+            && ex.env_keys == env_keys
         {
             let mut ex = ex.clone();
             if let Some(ttl) = a.service_ttl.or(ex.service_ttl_secs) {
@@ -1162,6 +1255,7 @@ fn cmd_run(a: RunArgs) -> Result<Output> {
             .map(|t| util::rfc3339(util::now_secs().saturating_add(t))),
         moves: Vec::new(),
         stop_requested_at: None,
+        env_keys,
     };
     store.put(&svc)?;
     if let Some(borrow) = &delegation {
@@ -1249,6 +1343,7 @@ fn run_result(
                 "pid": svc.pid,
                 "directory": svc.cwd,
                 "log_path": svc.log_path,
+                "env": svc.env_keys,
             });
             let verb = if status == "started" {
                 "started"
@@ -1256,6 +1351,12 @@ fn run_result(
                 "already running"
             };
             let mut text = describe(verb, &svc);
+            if !svc.env_keys.is_empty() {
+                text.push_str(&format!(
+                    "\n  env  {} (values not shown)",
+                    svc.env_keys.join(", ")
+                ));
+            }
             if let Some(c) = check {
                 text.push_str(&format!("\n  ready {} check passed in {ms} ms", c.name()));
             }
@@ -1317,7 +1418,7 @@ fn cmd_up(
     let mut warnings = Vec::new();
     let mut failure = None;
     for (i, def) in selected.iter().enumerate() {
-        let res = cmd_run(RunArgs {
+        let res = run_service(RunArgs {
             scope: scope_flag.clone(),
             agent: agent.clone(),
             name: def.name.clone(),
@@ -1329,6 +1430,8 @@ fn cmd_up(
             command: def.command.clone(),
             cwd: Some(def.cwd.clone()),
             env: def.env.clone(),
+            save: false,
+            force: false,
         });
         match res {
             Ok(out) => {
@@ -2295,6 +2398,7 @@ mod stop_tests {
                 service_expires_at: None,
                 moves: Vec::new(),
                 stop_requested_at: None,
+                env_keys: Vec::new(),
             })
             .unwrap();
     }

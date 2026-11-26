@@ -140,6 +140,10 @@ pub struct Service {
     /// seconds); a later cleanup forces it once `stop_timeout` has passed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_requested_at: Option<u64>,
+    /// Names (never values) of the variables `run --env` or taba.toml set,
+    /// sorted; a re-run with other names is a different service.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
