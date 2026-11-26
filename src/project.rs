@@ -298,13 +298,23 @@ pub fn check_env_key(key: &str) -> std::result::Result<(), String> {
     Ok(())
 }
 
-/// clap value parser for `run --env KEY=VALUE`.
-pub fn parse_env_pair(s: &str) -> std::result::Result<(String, String), String> {
-    let (k, v) = s
-        .split_once('=')
-        .ok_or_else(|| "expected KEY=VALUE".to_string())?;
-    check_env_key(k)?;
-    Ok((k.to_string(), v.to_string()))
+/// Splits `run --env KEY=VALUE` arguments. Done here rather than by clap,
+/// whose errors quote the rejected argument: an error names at most the
+/// variable, never a value.
+pub fn parse_env_args(args: &[String]) -> Result<Vec<(String, String)>> {
+    args.iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let (k, v) = s.split_once('=').ok_or_else(|| {
+                TabaError::usage(format!(
+                    "--env takes KEY=VALUE; argument {} of --env has no '='",
+                    i + 1
+                ))
+            })?;
+            check_env_key(k).map_err(|m| TabaError::usage(format!("--env: {m}")))?;
+            Ok((k.to_string(), v.to_string()))
+        })
+        .collect()
 }
 
 /// The text form of a ready check, as `--ready` and taba.toml take it.
@@ -511,7 +521,9 @@ pub fn write_save(plan: &SavePlan) -> Result<()> {
     };
     let mut doc: toml_edit::DocumentMut = text
         .parse()
-        .map_err(|e: toml_edit::TomlError| err(path, "syntax", e.to_string()))?;
+        // Only the message: the full text quotes the line, which may hold
+        // an env value.
+        .map_err(|e: toml_edit::TomlError| err(path, "syntax", e.message().to_string()))?;
     let dir = path.parent().unwrap_or(Path::new("."));
     let services = doc
         .entry("services")

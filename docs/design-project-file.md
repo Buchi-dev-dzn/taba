@@ -47,10 +47,11 @@ service_ttl = "8h"       # as --service-ttl
 
 - `taba up [NAME...] [--scope S] [--agent A] [--ttl D] [--json]` runs
   `run --wait=<wait>` for each selected service. A service that is already
-  running with the same command, directory and port request is reused
-  (`already_running`); one running with different settings is `E_CONFLICT`,
-  as for `run`. Changing only `env` does not count as different: stop the
-  service to apply it.
+  running with the same command, directory, port request and `env` (names
+  and values) is reused (`already_running`); one running with different
+  settings is `E_CONFLICT`, as for `run`. The record keeps only the `env`
+  names and a keyed fingerprint of the values (see `run --env` in the
+  README), never the values.
 - On the first failure `up` stops. The reply has `ok: false`, `results` with
   each service handled so far (the failed one with `status: "failed"` and its
   error), and `error` with the failed service's code, `details.not_started`
@@ -62,6 +63,15 @@ service_ttl = "8h"       # as --service-ttl
   A declared service without a record is reported as `absent`.
 - No `taba.toml` found is `E_NO_PROJECT` (exit 5). An unknown `NAME` is
   `E_USAGE`.
+- `taba run ... --save [--force]` writes a `run` to this file: to the
+  `taba.toml` `up` would read from the current directory, else a new one at
+  the worktree root. It parses the file and checks for a different
+  definition of the name (`E_CONFLICT` without `--force`) before starting
+  anything, writes only after the service started, and edits the file in
+  place (other tables and comments are kept). Flags the run did not give
+  (`--ready`, `--wait`, `--service-ttl`) keep the saved definition's values.
+  `env` values are written in plain text (`W_ENV_SAVED`) and shown as
+  `<hidden>` in replies.
 
 ## Out of scope
 

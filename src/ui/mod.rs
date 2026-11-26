@@ -302,6 +302,7 @@ mod tests {
                     moves: Vec::new(),
                     stop_requested_at: None,
                     env_keys: Vec::new(),
+                    env_hash: None,
                 })
                 .unwrap();
         }

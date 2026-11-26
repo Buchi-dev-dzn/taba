@@ -302,6 +302,60 @@ spaces; taba runs no shell. `taba up` stops at the first service that fails
 to start or become ready, leaves the ones already started running, and lists
 what it did. `taba down` leaves services the file doesn't declare alone.
 
+### Saving a `taba run` to taba.toml
+
+`taba run --save` starts the service as usual and then writes it to
+`taba.toml` as `[services.NAME]`, so `taba up NAME` starts it the same way
+later:
+
+```sh
+taba run --name api --port auto --ready http:/health --wait --save -- uvicorn app:app --port {port}
+#   saved to ~/src/app/taba.toml:
+#     [services.api]
+#     cmd = ["uvicorn", "app:app", "--port", "{port}"]
+#     port = "auto"
+#     ready = "http:/health"
+```
+
+It writes to the `taba.toml` that `taba up` would read from the current
+directory, or creates one at the git worktree root (else in the current
+directory). The rest of the file, comments included, is kept. It saves
+`cmd`, `port`, `ready`, `wait`, `env`, `service_ttl`, and `cwd` relative to
+the file. When the run gives no `--ready`, `--wait` or `--service-ttl`, a
+saved definition keeps its own. The file is checked before anything starts:
+if it already declares the name differently, `run --save` fails with
+`E_CONFLICT` (exit 3) and starts nothing; `--force` replaces that
+definition. The file is written only after the service started (or was
+already running), so a failed start leaves it unchanged. The JSON reply
+adds `saved` with `path`, `name`, `result` (`created`, `added`, `updated`
+or `unchanged`) and the `definition`, with `env` values shown as
+`<hidden>`.
+
+### Environment variables for a service
+
+`taba run --env KEY=VALUE` (repeatable) sets a variable in the service's
+environment, like `env` in `taba.toml`. `PORT`, `TABA_SCOPE` and
+`TABA_SERVICE` are set by taba and can't be given. taba treats values as
+secrets:
+
+- The service record keeps only the variable names (`env_keys`) and a keyed
+  fingerprint (`env_hash`, HMAC-SHA-256 under a random key in
+  `$TABA_HOME/env.key`), never a value. Replies list the names under `env`
+  (`API_TOKEN, MODE (values not shown)` in text); values are not printed,
+  logged, put in events or quoted in errors, and a malformed `--env`
+  argument is reported by position, not echoed.
+- Re-running with the same names and values (in any order) reuses the
+  service (`already_running`). Other names or another value, or none, is a
+  different service: `E_CONFLICT` while it runs, so stop it first.
+- With `--save`, values *are* written to `taba.toml` in plain text, since
+  `taba up` needs them; taba warns `W_ENV_SAVED`. Don't commit secrets: keep
+  such a `taba.toml` out of version control, or save without the secret
+  and pass it another way.
+
+The values still reach the service's environment, so anything the service
+prints, and tools that show a process's environment to the same user (such
+as `/proc/PID/environ`), can show them.
+
 taba.toml only lists what to start. There is no restart on crash, health
 monitoring or dependency graph; see
 [docs/design-project-file.md](docs/design-project-file.md).
@@ -560,7 +614,7 @@ that. Measurements against Docker are in [docs/benchmarks.md](docs/benchmarks.md
 
 | Command | What it does |
 | --- | --- |
-| `taba run [--scope S] --name N [--port P \| auto \| auto:START] [--wait[=SECS]] [--ready CHECK] [--json] -- CMD...` | Start `CMD` detached as service `S/N`, in its own process group, with output appended to its log. `{port}` in `CMD` is replaced by the port, and `PORT` is set. |
+| `taba run [--scope S] --name N [--port P \| auto \| auto:START] [--wait[=SECS]] [--ready CHECK] [--env KEY=VALUE]... [--save [--force]] [--json] -- CMD...` | Start `CMD` detached as service `S/N`, in its own process group, with output appended to its log. `{port}` in `CMD` is replaced by the port, and `PORT` is set. `--env` sets variables (only their names are recorded or shown); `--save` also writes the service to `taba.toml`, and `--force` lets it replace a different definition. See [Saving a `taba run`](#saving-a-taba-run-to-tabatoml) and [Environment variables for a service](#environment-variables-for-a-service). |
 | `taba up [NAME...] [--scope S] [--ttl DURATION] [--json]` | Start the services declared in the nearest `taba.toml` (all, or `NAME...` in that order), each like `run --wait`, reusing ones already running. Stops at the first failure and leaves started ones running. See [Project services](#project-services-tabatoml). |
 | `taba down [NAME...] [--scope S] [--timeout SECS] [--json]` | Stop your scope's services that the nearest `taba.toml` declares (all, or `NAME...`). |
 | `taba whoami [--scope S] [--json]` | Show the scope taba uses here, its source (`flag`, `env`, `git`), worktree, branch, agent and services. |
@@ -623,7 +677,7 @@ single quotes). The exit status follows the code:
 | `E_LOCKED` | 3 | Another scope has an exclusive maintenance borrow. Retry later or use `--wait-lock` for a legitimate maintenance operation. |
 | `E_NO_CLAIMANT` | 3 | `disown` found no eligible claimant. Arrange a claim before disowning. |
 | `E_BUSY` | 3 | Another `stop` or starting `run` of that service is in progress, or another taba process held the state lock for the whole lock timeout (`details.holder_pid` when recorded). |
-| `E_CONFLICT` | 3 | Same name already running with a different command, directory or port. |
+| `E_CONFLICT` | 3 | Same name already running with a different command, directory, port or `--env` (names or values); or `run --save` found a different definition of the name in `taba.toml` (add `--force`). |
 | `E_STILL_RUNNING` | 3 | `rm` of a running service. |
 | `E_PORT_IN_USE`, `E_PORT_CLAIMED` | 4 | The port is held by a process, or reserved by another taba service. |
 | `E_NO_FREE_PORT` | 4 | `--port auto` found no free port in its range. |

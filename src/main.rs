@@ -78,12 +78,11 @@ enum Cmd {
         /// already_running re-run), independent of the lease
         #[arg(long, value_parser = config::parse_service_ttl_flag)]
         service_ttl: Option<u64>,
-        /// Set an environment variable for the service (repeatable). Only the
-        /// names are recorded and printed; a re-run with other names is a
-        /// different service
-        #[arg(long = "env", value_parser = project::parse_env_pair,
-              value_name = "KEY=VALUE")]
-        env: Vec<(String, String)>,
+        /// Set an environment variable for the service (repeatable). Only
+        /// the names are recorded and printed, never the values; a re-run
+        /// with other names or values is a different service
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        env: Vec<String>,
         /// Also write this service to taba.toml (the nearest one, else the
         /// worktree root's), so `taba up NAME` starts it
         #[arg(long)]
@@ -565,22 +564,25 @@ fn main() -> ExitCode {
             command,
         } => (
             json || env_json(),
-            cmd_run(RunArgs {
-                scope,
-                agent,
-                name,
-                port,
-                wait,
-                ready,
-                ttl,
-                service_ttl,
-                command,
-                cwd: None,
-                env,
-                save,
-                force,
-            })
-            .map(Some),
+            project::parse_env_args(&env)
+                .and_then(|env| {
+                    cmd_run(RunArgs {
+                        scope,
+                        agent,
+                        name,
+                        port,
+                        wait,
+                        ready,
+                        ttl,
+                        service_ttl,
+                        command,
+                        cwd: None,
+                        env,
+                        save,
+                        force,
+                    })
+                })
+                .map(Some),
         ),
         Cmd::Up {
             names,
@@ -1086,6 +1088,7 @@ fn run_service(a: RunArgs) -> Result<Output> {
     gc::collect(&store, &cfg, false, 5, Some(&scope))?;
     let lock = store.lock()?;
     store.mark_version()?;
+    let env_hash = store.env_fingerprint(&a.env)?;
     let existing = store.get(&scope, &name)?;
     let mut delegation = None;
     if a.scope.is_some()
@@ -1124,6 +1127,7 @@ fn run_service(a: RunArgs) -> Result<Output> {
             && ex.cwd == dir
             && ex.port_request() == port_request
             && ex.env_keys == env_keys
+            && ex.env_hash == env_hash
         {
             let mut ex = ex.clone();
             if let Some(ttl) = a.service_ttl.or(ex.service_ttl_secs) {
@@ -1139,17 +1143,23 @@ fn run_service(a: RunArgs) -> Result<Output> {
         return Err(TabaError::new(
             "E_CONFLICT",
             format!(
-                "{} is already running with a different command, directory or port \
-                 (command {:?}, dir {}, port {}); stop it first",
+                "{} is already running with a different command, directory, port or \
+                 environment (command {:?}, dir {}, port {}, env {}); stop it first",
                 ex.id(),
                 ex.template(),
                 tilde(&ex.cwd),
                 ex.port_request().unwrap_or_else(|| "-".into()),
+                if ex.env_keys.is_empty() {
+                    "-".to_string()
+                } else {
+                    format!("{} (values not shown)", ex.env_keys.join(", "))
+                },
             ),
         )
         .details(json!({
             "service": ex.id(), "command": ex.template(), "directory": ex.cwd,
             "port": ex.port, "port_request": ex.port_request(), "instance": ex.instance(),
+            "env": ex.env_keys,
         }))
         .next(Next::run(
             "stop it, then run again",
@@ -1256,6 +1266,7 @@ fn run_service(a: RunArgs) -> Result<Output> {
         moves: Vec::new(),
         stop_requested_at: None,
         env_keys,
+        env_hash,
     };
     store.put(&svc)?;
     if let Some(borrow) = &delegation {
@@ -2399,6 +2410,7 @@ mod stop_tests {
                 moves: Vec::new(),
                 stop_requested_at: None,
                 env_keys: Vec::new(),
+                env_hash: None,
             })
             .unwrap();
     }
