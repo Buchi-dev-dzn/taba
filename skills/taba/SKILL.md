@@ -106,6 +106,12 @@ expiry when the human needs them.
    of moving to another port (`--strictPort` for Vite). taba also sets `PORT`
    in the app's environment. Re-running the same command is safe: it returns
    `"status": "already_running"` with the same URL.
+
+   Always use this explicit form: `--name`, then `--`, then the command.
+   `taba run npm run dev` without `--name` is a shorthand for people. It
+   derives the name from the command and reports whichever port the app
+   picks. Don't use it, and don't quote the command into one argument
+   (that runs it through the shell).
 4. **On an error, read `error.code` and do the first item of `error.next`.**
    Every reply is one JSON document with `"ok"`. Never answer
    `E_PORT_IN_USE`, `E_PORT_CLAIMED` or `E_NOT_OWNER` with `kill`, `pkill`,

@@ -141,6 +141,11 @@ pub struct Service {
     /// seconds); a later cleanup forces it once `stop_timeout` has passed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_requested_at: Option<u64>,
+    /// TCP ports the service's processes were found listening on when `run`
+    /// reported it (ascending). The URL falls back to the first one when the
+    /// service has no `--port`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discovered_ports: Vec<u16>,
     /// `run --interactive` (Unix): the input FIFO and the holder process that
     /// forwards it to the service's terminal (see `input.rs`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -206,8 +211,11 @@ impl Service {
         format!("{}/{}", self.scope, self.name)
     }
 
+    /// `--port`'s port, else the first discovered one.
     pub fn url(&self) -> Option<String> {
-        self.port.map(|p| format!("http://localhost:{p}"))
+        self.port
+            .or_else(|| self.discovered_ports.first().copied())
+            .map(|p| format!("http://localhost:{p}"))
     }
 
     pub fn is_running(&self) -> bool {
