@@ -628,6 +628,23 @@ fn usage_error(e: &clap::Error, args: &[String]) -> TabaError {
 }
 
 fn main() -> ExitCode {
+    // Clap's large derived command tree overflows the smaller default Windows
+    // main-thread stack. Parse and dispatch on a thread with an explicit stack.
+    #[cfg(windows)]
+    {
+        return std::thread::Builder::new()
+            .name("taba-main".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(main_impl)
+            .expect("start taba main thread")
+            .join()
+            .expect("taba main thread");
+    }
+    #[cfg(not(windows))]
+    main_impl()
+}
+
+fn main_impl() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(e) => {
