@@ -28,7 +28,7 @@ use scope::{Caller, ScopeSource, check_ident};
 use serde_json::{Value, json};
 use state::{OpLock, Service, Store};
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, IsTerminal, Read, Seek, SeekFrom, Write};
 use std::process::{Command, ExitCode, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -78,11 +78,14 @@ enum Cmd {
         /// already_running re-run), independent of the lease
         #[arg(long, value_parser = config::parse_service_ttl_flag)]
         service_ttl: Option<u64>,
-        /// Interactive: give the service a stdin that stays open, for
-        /// `taba send` and `taba attach` (e.g. `r` for a Flutter hot reload;
-        /// Unix only)
-        #[arg(short = 'i', long = "interactive")]
-        input: bool,
+        /// Interactive: the service's stdin is a terminal that `taba attach`,
+        /// `taba send` and `i` in the log view type into (macOS, Linux).
+        /// Default for `flutter run` and `vite`
+        #[arg(short = 'i', long)]
+        interactive: bool,
+        /// Not interactive, also for `flutter run` and `vite`
+        #[arg(long, conflicts_with = "interactive")]
+        no_interactive: bool,
         /// Print one JSON document (also: TABA_OUTPUT=json)
         #[arg(long)]
         json: bool,
@@ -90,7 +93,7 @@ enum Cmd {
         #[arg(last = true, required = true, value_name = "CMD")]
         command: Vec<String>,
     },
-    /// Write a line (or one key) to the stdin of a service started with --interactive
+    /// Write a line (or one key) to the stdin of an interactive service
     Send {
         /// SCOPE/NAME, or NAME in the caller's scope
         target: String,
@@ -120,8 +123,8 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Follow a service's log and type into its stdin (--interactive services);
-    /// Ctrl+] detaches and the service keeps running
+    /// Follow an interactive service's log and type into it; Ctrl+] stops
+    /// typing, q quits, and the service keeps running
     Attach {
         /// SCOPE/NAME, or NAME in the caller's scope
         target: String,
@@ -137,6 +140,30 @@ enum Cmd {
         /// Why --force is needed (recorded in events.jsonl)
         #[arg(long, requires = "force")]
         reason: Option<String>,
+    },
+    /// Reload a dev server: `flutter run` hot reload (SIGUSR1; --restart:
+    /// hot restart, SIGUSR2), `vite` restart (`r` on its stdin)
+    Reload {
+        /// SCOPE/NAME, or NAME in the caller's scope
+        target: String,
+        /// Flutter: hot restart instead of hot reload
+        #[arg(long)]
+        restart: bool,
+        /// The caller's scope (default: $TABA_SCOPE, else the git worktree)
+        #[arg(long)]
+        scope: Option<String>,
+        /// Agent acting (default: $TABA_AGENT, else "human")
+        #[arg(long)]
+        agent: Option<String>,
+        /// Reload a service of another scope (needs --reason; recorded)
+        #[arg(long)]
+        force: bool,
+        /// Why --force is needed (recorded in events.jsonl)
+        #[arg(long, requires = "force")]
+        reason: Option<String>,
+        /// Print one JSON document (also: TABA_OUTPUT=json)
+        #[arg(long)]
+        json: bool,
     },
     /// Send SIGUSR1, SIGUSR2 or SIGHUP to a service's main process (Unix;
     /// `flutter run` hot-reloads on USR1 and hot-restarts on USR2)
@@ -433,6 +460,16 @@ enum Cmd {
     #[cfg(windows)]
     #[command(name = "__ctrl-break", hide = true)]
     CtrlBreak { attach: u32, pgid: u32 },
+    /// Internal (Unix): the input holder of an interactive service
+    #[cfg(unix)]
+    #[command(name = "__hold", hide = true)]
+    Hold {
+        master: i32,
+        fifo: i32,
+        pid: i32,
+        pgid: i32,
+        start_time: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -574,6 +611,16 @@ fn main() -> ExitCode {
         Cmd::CtrlBreak { attach, pgid } => {
             return ExitCode::from(proc::ctrl_break_helper(attach, pgid));
         }
+        #[cfg(unix)]
+        Cmd::Hold {
+            master,
+            fifo,
+            pid,
+            pgid,
+            start_time,
+        } => {
+            return ExitCode::from(input::hold(master, fifo, pid, pgid, start_time));
+        }
         Cmd::Run {
             scope,
             agent,
@@ -583,7 +630,8 @@ fn main() -> ExitCode {
             ready,
             ttl,
             service_ttl,
-            input,
+            interactive,
+            no_interactive,
             json,
             command,
         } => (
@@ -597,7 +645,11 @@ fn main() -> ExitCode {
                 ready,
                 ttl,
                 service_ttl,
-                input,
+                interactive: if no_interactive {
+                    Some(false)
+                } else {
+                    interactive.then_some(true)
+                },
                 command,
             })
             .map(Some),
@@ -641,6 +693,26 @@ fn main() -> ExitCode {
                 force,
                 reason,
             }),
+        ),
+        Cmd::Reload {
+            target,
+            restart,
+            scope,
+            agent,
+            force,
+            reason,
+            json,
+        } => (
+            json || env_json(),
+            input::cmd_reload(input::ReloadArgs {
+                target,
+                restart,
+                scope,
+                agent,
+                force,
+                reason,
+            })
+            .map(Some),
         ),
         Cmd::Signal {
             target,
@@ -1019,7 +1091,8 @@ struct RunArgs {
     ready: Option<ReadySpec>,
     ttl: Option<config::Ttl>,
     service_ttl: Option<u64>,
-    input: bool,
+    /// `-i` (Some(true)), `--no-interactive` (Some(false)), else detected.
+    interactive: Option<bool>,
     command: Vec<String>,
 }
 
@@ -1037,11 +1110,13 @@ fn cmd_run(a: RunArgs) -> Result<Output> {
             ));
         }
     };
-    if a.input && cfg!(windows) {
-        return Err(input::unsupported("run --interactive").next(Next::just(
-            "start it without --interactive; Windows support is tracked in the taba issues",
-        )));
+    if a.interactive == Some(true) && cfg!(windows) {
+        return Err(input::unsupported("run --interactive"));
     }
+    // `flutter run` and `vite` are interactive unless --no-interactive.
+    let interactive = a.interactive.unwrap_or_else(|| {
+        cfg!(unix) && input::detect(&a.command, &caller.cwd) != input::Kind::Other
+    });
     if let Some(r) = &a.ready
         && r.needs_port()
         && a.port.is_none()
@@ -1110,7 +1185,7 @@ fn cmd_run(a: RunArgs) -> Result<Output> {
         if ex.template() == template.as_slice()
             && ex.cwd == caller.cwd
             && ex.port_request() == port_request
-            && ex.input.is_some() == a.input
+            && ex.input.is_some() == interactive
         {
             let mut ex = ex.clone();
             if let Some(ttl) = a.service_ttl.or(ex.service_ttl_secs) {
@@ -1127,7 +1202,7 @@ fn cmd_run(a: RunArgs) -> Result<Output> {
             "E_CONFLICT",
             format!(
                 "{} is already running with a different command, directory, port or \
-                 --interactive (command {:?}, dir {}, port {}, input {}); stop it first",
+                 interactive mode (command {:?}, dir {}, port {}, interactive {}); stop it first",
                 ex.id(),
                 ex.template(),
                 tilde(&ex.cwd),
@@ -1138,7 +1213,7 @@ fn cmd_run(a: RunArgs) -> Result<Output> {
         .details(json!({
             "service": ex.id(), "command": ex.template(), "directory": ex.cwd,
             "port": ex.port, "port_request": ex.port_request(), "instance": ex.instance(),
-            "input": ex.input.is_some(),
+            "interactive": ex.input.is_some(),
         }))
         .next(Next::run(
             "stop it, then run again",
@@ -1195,14 +1270,17 @@ fn cmd_run(a: RunArgs) -> Result<Output> {
     let log_offset = log.metadata()?.len();
     let log_err = log.try_clone()?;
 
-    let fifo = if a.input {
+    let terminal = if interactive {
         Some(input::create(&store, &scope, &name)?)
     } else {
         None
     };
-    let input_path = fifo.as_ref().map(|f| f.path.clone());
-    let stdin = match &fifo {
-        Some(f) => Stdio::from(f.stdin.try_clone()?),
+    let holder_err = match &terminal {
+        Some(_) => Some(log.try_clone()?),
+        None => None,
+    };
+    let stdin = match &terminal {
+        Some(t) => Stdio::from(t.stdin.try_clone()?),
         None => Stdio::null(),
     };
     let mut cmd = Command::new(proc::resolve_program(&command[0]));
@@ -1225,15 +1303,28 @@ fn cmd_run(a: RunArgs) -> Result<Output> {
     };
     // Detached: its own session / process group (Unix) or console and job
     // (Windows), so closing the launching terminal does not stop it.
-    let spawned = proc::spawn_detached(cmd);
-    // The child holds its own copies of the FIFO now.
-    drop(fifo);
-    let spawned = spawned.map_err(|e| match e {
+    let spawned = proc::spawn_detached(cmd).map_err(|e| match e {
         proc::SpawnError::Start(e) => start_failed(format!("cannot start {:?}: {e}", command[0])),
         proc::SpawnError::Vanished => {
             start_failed(format!("{id} exited immediately; see taba logs {id}"))
         }
     })?;
+    // Interactive: the holder keeps the terminal open and feeds it input.
+    let input = match (terminal, holder_err) {
+        (Some(t), Some(err)) => match input::spawn_holder(t, &spawned, err) {
+            Ok(i) => Some(i),
+            Err(e) => {
+                let _ = proc::stop_group(
+                    spawned.pid,
+                    spawned.pgid,
+                    spawned.start_time,
+                    Duration::from_secs(2),
+                );
+                return Err(e);
+            }
+        },
+        _ => None,
+    };
     let pid = spawned.pid;
     let mut svc = Service {
         scope: scope.clone(),
@@ -1256,7 +1347,7 @@ fn cmd_run(a: RunArgs) -> Result<Output> {
             .map(|t| util::rfc3339(util::now_secs().saturating_add(t))),
         moves: Vec::new(),
         stop_requested_at: None,
-        input: input_path,
+        input,
     };
     store.put(&svc)?;
     if let Some(borrow) = &delegation {
@@ -1344,6 +1435,7 @@ fn run_result(
                 "pid": svc.pid,
                 "directory": svc.cwd,
                 "log_path": svc.log_path,
+                "interactive": svc.input.is_some(),
             });
             let verb = if status == "started" {
                 "started"
@@ -1351,6 +1443,11 @@ fn run_result(
                 "already running"
             };
             let mut text = describe(verb, &svc);
+            if svc.input.is_some() {
+                text.push_str(&format!(
+                    "\n  interactive: yes (type: taba attach {id}; i in taba logs -f)"
+                ));
+            }
             if let Some(c) = check {
                 text.push_str(&format!("\n  ready {} check passed in {ms} ms", c.name()));
             }
@@ -1542,7 +1639,7 @@ pub(crate) fn ps_snapshot(
             "claims": claims::rows(store, &queue)?,
             "borrows": { "shared": borrows.iter().filter(|b| !b.exclusive).count(), "exclusive": usize::from(exclusive.is_some()) },
             "locked_by": exclusive.map(|b| &b.scope),
-            "input": s.input.is_some(),
+            "interactive": s.input.is_some(),
         }));
         borrowers.push(borrows.iter().map(|b| b.scope.clone()).collect());
     }
@@ -1704,6 +1801,13 @@ fn cmd_logs(target: &str, follow: bool, tail: Option<u64>, json: bool) -> Result
     }
     stdout.flush()?;
     if !follow {
+        return Ok(None);
+    }
+    // An interactive service on a terminal: the log view, read-only until `i`.
+    if cfg!(unix) && svc.input.is_some() && io::stdin().is_terminal() && io::stdout().is_terminal()
+    {
+        drop(stdout);
+        input::follow(&store, &caller, &svc, file)?;
         return Ok(None);
     }
     let mut pos = file.stream_position()?;

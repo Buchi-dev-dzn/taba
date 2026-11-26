@@ -5,8 +5,8 @@
 //! `ps`'s lease peek, so watching changes nothing). `x` stops or removes
 //! through the same functions as `taba stop` / `taba rm`, as the caller
 //! resolved like any CLI call (`$TABA_SCOPE`, `$TABA_AGENT`, git worktree),
-//! and never with `--force`. `i` on a service started with `--interactive`
-//! suspends the TUI and runs `taba attach` until Ctrl+] detaches. Quitting
+//! and never with `--force`. `i` on an interactive service (in the list or its
+//! log view) suspends the TUI and types into it until Ctrl+]. Quitting
 //! never stops anything.
 //!
 //! Built on ratatui with the crossterm backend (macOS, Linux and Windows
@@ -138,10 +138,11 @@ fn event_loop(
                 }
                 Effect::OpenLog(path) => tail = Some(LogTail::new(path)),
                 Effect::Attach(scope, name) => {
-                    // The same as `taba attach SCOPE/NAME` (never forced),
-                    // with the TUI suspended until Ctrl+] detaches.
+                    // The log view in input mode, as `taba attach SCOPE/NAME`
+                    // (never forced), with the TUI suspended until Ctrl+].
                     ratatui::restore();
-                    let res = crate::input::attach(store, caller, &format!("{scope}/{name}"), None);
+                    let res =
+                        crate::input::attach_from_ui(store, caller, &format!("{scope}/{name}"));
                     *terminal = ratatui::try_init().map_err(io_err)?;
                     terminal.clear().map_err(io_err)?;
                     match res {

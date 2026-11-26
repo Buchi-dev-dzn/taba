@@ -282,6 +282,7 @@ Windows Terminal and PowerShell, and Linux terminals.
 | `←` `→`, `Space` | Fold or unfold a scope. Folding only changes the view; nothing is stopped. |
 | `x` | On a running service: stop it. On a scope line: stop every service of that scope. On an exited service: remove it, like `taba rm`. It asks first: `y` confirms, any other key cancels. |
 | `l` | Follow the selected service's log, like `taba logs -f`. `↑` `↓` `PgUp` `PgDn` scroll, `End` follows again, `Esc` goes back. |
+| `i` | On an [interactive](#interactive-dev-servers-flutter-vite) service, in the list or its log: type into it. The UI steps aside for the log view in input mode; `Ctrl+]` comes back. |
 | `/` | Filter by scope or service name. `Enter` keeps the filter, `Esc` clears it. |
 | `Esc` | Clear the filter and any messages. |
 | `q`, `Ctrl+C` | Quit. Services keep running. |
@@ -309,6 +310,64 @@ Windows Terminal and PowerShell, and Linux terminals.
   `NO_COLOR` (or use `TERM=dumb`) for no colors at all.
 - **It needs an interactive terminal.** Programs should read
   `taba ps --watch --json` instead.
+
+## Interactive dev servers (Flutter, Vite)
+
+Some dev servers take keys while they run: `flutter run` (`r` hot reload,
+`R` hot restart), Vite (`r` + Enter restarts the server, `h` + Enter shows
+help). They only read those keys when stdin is a terminal, so taba can start
+a service **interactive**: its stdin is a pseudo-terminal, and its output
+still goes to the log as for any other service.
+
+```sh
+# flutter run and vite are interactive automatically:
+taba run --name app --wait=300 --ready "log:Flutter run key commands" -- flutter run -d chrome
+# started login-fix-3f9a/app
+#   ...
+#   interactive: yes (type: taba attach login-fix-3f9a/app; i in taba logs -f)
+
+taba run --name web --port auto --wait -- npm run dev -- --port '{port}' --strictPort
+
+# Anything else: -i / --interactive. --no-interactive turns it off.
+taba run -i --name repl -- python3 -i
+```
+
+**Typing.** `taba logs -f S/N` on a terminal shows the log read-only. Press
+`i` to type into the service (a bar says *INPUT MODE*): every key goes to
+it, as if you ran it in that terminal. `Ctrl+]` stops typing, and `q` (or
+`Ctrl+C`) leaves the log; the service keeps running either way.
+`taba attach S/N` opens the same view already in input mode. In `taba ui`,
+`i` does the same. Watching is free; typing follows the [ownership
+rules](#ownership-model), as `stop` does.
+
+**From scripts and agents.**
+
+| Command | What it does |
+| --- | --- |
+| `taba reload S/N` | Reload the dev server the best way taba knows. `flutter run`: SIGUSR1 (hot reload; `--restart`: SIGUSR2, hot restart), which needs no stdin. Vite: `r` + Enter (restarts the server; open pages reload). Anything else: `E_NO_RELOAD`. |
+| `taba send S/N TEXT` | Write `TEXT` and a newline to its stdin (`--no-newline` for none). |
+| `taba send S/N --key K` | Write one key: a character such as `r`, or `enter`, `esc`, `tab`, `space`, `backspace`, `ctrl-X`. |
+| `taba signal S/N USR1\|USR2\|HUP` | Signal the service's main process (works without `--interactive`). |
+
+`taba ps --json` shows `"interactive": true` for such services.
+
+Notes:
+
+- **Flutter web: wait for the browser.** `flutter run -d chrome` prints
+  `Flutter run key commands` before the browser has connected; a reload in
+  that gap only recompiles (`No client connected`). If a script reloads
+  right after start, wait for
+  `--ready "log:Dart VM Service on Chrome is available"` instead.
+- **How it works.** One small holder process per interactive service
+  (`taba __hold`, exits with the service) keeps the terminal open and
+  forwards what `send` and `attach` write to
+  `$TABA_HOME/inputs/<scope>/<name>.fifo`. Echo is off, so typed keys do not
+  show up in the log. The terminal is not the service's controlling
+  terminal: `Ctrl+C` typed into it is not turned into SIGINT; use
+  `taba stop`.
+- **Windows** is not supported yet ([#79](https://github.com/Buchi-dev-dzn/taba/issues/79)):
+  `-i` fails with `E_UNSUPPORTED`, and `flutter run` / `vite` start as
+  before, without input.
 
 ## Use with AI agents
 
@@ -456,6 +515,8 @@ If your agent doesn't load skills, paste this into `AGENTS.md` or `CLAUDE.md`:
 - On an error, read `error.code` and do the first item of `error.next`. Never
   answer `E_PORT_IN_USE` or `E_NOT_OWNER` with `kill`, `pkill` or `--force`.
 - Read recent output with `taba logs <name> --tail 100 --json`.
+- After editing a Flutter or Vite app, run `taba reload <name>` (Flutter hot
+  restart: `--restart`), not a restart of the service.
 - Stop only your own scope: `taba stop --scope <scope>`, then clean up with
   `taba rm --scope <scope>`. Never touch other scopes or processes taba
   didn't start.
@@ -521,13 +582,17 @@ that. Measurements against Docker are in [docs/benchmarks.md](docs/benchmarks.md
 
 | Command | What it does |
 | --- | --- |
-| `taba run [--scope S] --name N [--port P \| auto \| auto:START] [--wait[=SECS]] [--ready CHECK] [--json] -- CMD...` | Start `CMD` detached as service `S/N`, in its own process group, with output appended to its log. `{port}` in `CMD` is replaced by the port, and `PORT` is set. |
+| `taba run [--scope S] --name N [--port P \| auto \| auto:START] [--wait[=SECS]] [--ready CHECK] [-i \| --no-interactive] [--json] -- CMD...` | Start `CMD` detached as service `S/N`, in its own process group, with output appended to its log. `{port}` in `CMD` is replaced by the port, and `PORT` is set. `-i` makes it [interactive](#interactive-dev-servers-flutter-vite) (default for `flutter run` and `vite`). |
 | `taba whoami [--scope S] [--json]` | Show the scope taba uses here, its source (`flag`, `env`, `git`), worktree, branch, agent and services. |
 | `taba ps [--scope S] [--running] [--json]` | List services with status `running`, `starting`, `stopping` or `exited`, plus URL and directory (`~` for your home; absolute in `--json`). `--running` hides exited ones. |
 | `taba ps --watch --json [--scope S] [--running] [--interval DURATION]` | Keep running and print the `ps --json` document as one line (NDJSON) at once and again whenever it changes, until interrupted. Read-only. See [Watching for changes](#watching-for-changes). |
 | `taba ps --all [--json]` | List every listening TCP port of your user, managed by taba or not: address, pid, command, directory, git worktree and branch, and the taba service if there is one. Read-only. |
 | `taba ui` | Browse every scope's services in a terminal UI; stop, remove, filter and follow logs with the keyboard. See [Terminal UI](#terminal-ui). |
-| `taba logs S/N [--tail N] [-f] [--json]` (or a bare name in your scope) | Print the log, or its last `N` lines. Add `-f` to follow it until the service exits. `--json` returns up to 16 KiB of log data in `log` and is incompatible with `-f`. |
+| `taba logs S/N [--tail N] [-f] [--json]` (or a bare name in your scope) | Print the log, or its last `N` lines. Add `-f` to follow it until the service exits; for an interactive service on a terminal, `i` types into it. `--json` returns up to 16 KiB of log data in `log` and is incompatible with `-f`. |
+| `taba attach S/N` | Follow an interactive service's log in input mode; `Ctrl+]` stops typing, `q` quits. From a pipe: forward stdin until EOF. |
+| `taba send S/N TEXT \| --key K [--no-newline]` | Write to an interactive service's stdin. |
+| `taba reload S/N [--restart]` | Hot reload `flutter run` (SIGUSR1; `--restart`: SIGUSR2), restart Vite (`r`). |
+| `taba signal S/N USR1\|USR2\|HUP` | Signal a service's main process (macOS, Linux). |
 | `taba stop S/N` (or `N` in your scope) | Stop one service of your own scope. |
 | `taba stop --scope S` | Stop every service in scope `S`. |
 | `taba stop ... --timeout SECS` | Seconds to wait between SIGTERM and SIGKILL (Windows: Ctrl+Break and job termination; default 5). |
@@ -551,8 +616,9 @@ that. Measurements against Docker are in [docs/benchmarks.md](docs/benchmarks.md
 | `taba update [--json]` | Check, then replace an eligible official standalone Linux or macOS install. Otherwise, report the manual upgrade path. See [Updating](#updating). |
 
 `--ready` is `tcp` (default when there is a port), `http:PATH` or
-`log:REGEX`, and needs `--wait`. `--agent NAME` on `run`, `stop`, `rm` and
-`whoami` overrides `$TABA_AGENT`. Run `taba <command> --help` to see all
+`log:REGEX`, and needs `--wait`. `--agent NAME` on `run`, `stop`, `rm`,
+`whoami`, `send`, `attach`, `reload` and `signal` overrides `$TABA_AGENT`;
+`send`, `attach`, `reload` and `signal` take `--force --reason` like `stop`. Run `taba <command> --help` to see all
 flags.
 
 ### Errors
@@ -582,7 +648,10 @@ single quotes). The exit status follows the code:
 | `E_LOCKED` | 3 | Another scope has an exclusive maintenance borrow. Retry later or use `--wait-lock` for a legitimate maintenance operation. |
 | `E_NO_CLAIMANT` | 3 | `disown` found no eligible claimant. Arrange a claim before disowning. |
 | `E_BUSY` | 3 | Another `stop` or starting `run` of that service is in progress, or another taba process held the state lock for the whole lock timeout (`details.holder_pid` when recorded). |
-| `E_CONFLICT` | 3 | Same name already running with a different command, directory or port. |
+| `E_CONFLICT` | 3 | Same name already running with a different command, directory, port or interactive mode. |
+| `E_NO_INPUT` | 3 | `send` or `attach` to a service that is not interactive (or whose input holder is gone). Restart it with `--interactive`. |
+| `E_NO_RELOAD` | 3 | `reload` of something that is not `flutter run` or Vite. Use `taba send S/N --key ...` with its own key. |
+| `E_NOT_RUNNING` | 3 | `send`, `attach`, `reload` or `signal` of a service that has exited. |
 | `E_STILL_RUNNING` | 3 | `rm` of a running service. |
 | `E_PORT_IN_USE`, `E_PORT_CLAIMED` | 4 | The port is held by a process, or reserved by another taba service. |
 | `E_NO_FREE_PORT` | 4 | `--port auto` found no free port in its range. |
@@ -593,6 +662,8 @@ single quotes). The exit status follows the code:
 | `E_BORROW_COMMAND` | 1 | The command run under `borrow --mut` exited unsuccessfully; inspect `exit_code` and its output. |
 | `E_CONFIG` | 1 | A `config.toml` field, `TABA_TTL`, or `TABA_LOCK_TIMEOUT` is invalid or unreadable; `details` identifies the source. |
 | `E_STATE` | 1 | State is unreadable, unavailable, damaged, or out of space. Read `details.path` and `next`; listings may instead emit `W_STATE_SKIPPED`. |
+| `E_INPUT_BLOCKED` | 1 | The service did not read its input for 5 s; some bytes were not written. |
+| `E_UNSUPPORTED` | 1 | Not available on this platform yet: interactive services and `signal` on Windows ([#79](https://github.com/Buchi-dev-dzn/taba/issues/79)). |
 | `E_SIGNAL_FAILED` | 1 | taba could not signal a verified service; inspect the result and ask the human rather than using raw process controls. |
 | `E_UPDATE_FAILED` | 1 | `taba update` could not reach, read or verify the release. The installed binary is unchanged. |
 
@@ -748,6 +819,7 @@ $TABA_HOME (default ~/.taba)
 ├── borrows/<borrow-id>.json        # shared and exclusive borrow records
 ├── logs/<scope>/<name>.log        # stdout + stderr, appended across runs
 ├── ops/<scope>/<name>.json        # in-flight stop or start of that service (operation lock)
+├── inputs/<scope>/<name>.fifo     # input of an interactive service, read by its holder (macOS, Linux)
 ├── events.jsonl                   # append-only created, moved, cleanup, hook and audited override events
 ├── version                        # state schema version (2)
 ├── btime/                         # Linux boot-time cache and recovery copies
@@ -840,6 +912,10 @@ taba is an early prototype:
 - **Some children are not tracked.** Children that move into a different
   process group or session (Windows: break away from the job) are not
   tracked, and `stop` won't reach them.
+- **Interactive services: macOS and Linux only.** No ConPTY on Windows yet
+  ([#79](https://github.com/Buchi-dev-dzn/taba/issues/79)). Logs keep the
+  service's output as written; taba does not strip colors or `\r` progress
+  lines.
 - **No log rotation.** Logs grow across runs until you `taba rm` the service.
 - **Ownership is a convention, not security.** `--scope`, `$TABA_SCOPE` and
   `$TABA_AGENT` are claims, not credentials. Leases prevent accidental

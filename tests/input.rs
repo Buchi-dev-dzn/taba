@@ -1,12 +1,16 @@
-//! Interactive input (#68): `run --interactive`, `send`, `attach`, `signal`.
+//! Interactive services (#68): `run --interactive`, `send`, `attach`,
+//! `reload`, `signal`, and input mode in `logs -f`.
 mod common;
 use common::*;
 
-/// Echoes each stdin line as `got:LINE`, reports SIGUSR1 and EOF.
+/// Reports whether stdin is a terminal with echo, then echoes each stdin
+/// line as `got:LINE`; reports SIGUSR1 and EOF.
 #[cfg(unix)]
 const ECHO: &str = r#"
-import signal, sys
+import signal, sys, termios
 signal.signal(signal.SIGUSR1, lambda *a: print("usr1", flush=True))
+echo = bool(termios.tcgetattr(0)[3] & termios.ECHO) if sys.stdin.isatty() else None
+print("tty=%s echo=%s" % (sys.stdin.isatty(), echo), flush=True)
 print("ready", flush=True)
 for line in sys.stdin:
     print("got:" + line.rstrip("\n"), flush=True)
@@ -64,6 +68,34 @@ mod unix {
             .to_string()
     }
 
+    /// The holder pid from the service record.
+    fn holder_pid(f: &Fixture, svc: &Value) -> i32 {
+        let rec = f
+            .home()
+            .join("services")
+            .join(svc["scope"].as_str().unwrap())
+            .join(format!("{}.json", svc["name"].as_str().unwrap()));
+        let rec: Value = serde_json::from_slice(&std::fs::read(rec).unwrap()).unwrap();
+        rec["input"]["holder_pid"].as_i64().expect("holder_pid") as i32
+    }
+
+    fn alive(pid: i32) -> bool {
+        // kill(pid, 0) succeeds for zombies too; the holder is reparented
+        // and reaped once it exits.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// An executable `name` in a fresh bin dir, running the Python `body`.
+    fn fake_tool(f: &Fixture, name: &str, body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = f.root.join("bin");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/usr/bin/env python3\n{body}")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
     #[test]
     fn send_reaches_stdin_and_stdin_stays_open_without_a_writer() {
         let f = Fixture::new("input-send");
@@ -75,7 +107,10 @@ mod unix {
         assert!(!log(&f, &f.wt_a, &id).contains("EOF"));
         let row = f.ps(&[]).into_iter().find(|r| r["service"] == id).unwrap();
         assert_eq!(row["status"], "running");
-        assert_eq!(row["input"], true);
+        assert_eq!(row["interactive"], true);
+        assert_eq!(svc["interactive"], true);
+        // stdin is a terminal with echo off; stdout is still the log file.
+        assert!(log(&f, &f.wt_a, &id).contains("tty=True echo=False"));
 
         let out = f.taba(&f.wt_a, &["send", &id, "hello", "--json"]);
         assert_eq!(exit(&out), 0, "{}", text(&out));
@@ -142,8 +177,12 @@ mod unix {
         assert_eq!(exit(&out), 3, "{}", text(&out));
         assert_eq!(code(&out), "E_CONFLICT");
 
-        // After stop: E_NOT_RUNNING; rm removes the FIFO.
+        // After stop: the holder exits too, send gives E_NOT_RUNNING, and
+        // rm removes the FIFO.
+        let holder = holder_pid(&f, &svc);
+        assert!(alive(holder), "holder {holder} runs while the service does");
         assert_eq!(exit(&f.taba(&f.wt_a, &["stop", &id])), 0);
+        wait_until("the holder to exit", || !alive(holder));
         let out = f.taba(&f.wt_a, &["send", &id, "late", "--json"]);
         assert_eq!(exit(&out), 3, "{}", text(&out));
         assert_eq!(code(&out), "E_NOT_RUNNING");
@@ -174,7 +213,7 @@ mod unix {
         assert_eq!(exit(&out), 3, "{}", text(&out));
         assert_eq!(code(&out), "E_NO_INPUT");
         let row = f.ps(&[]).into_iter().find(|r| r["service"] == id).unwrap();
-        assert_eq!(row["input"], false);
+        assert_eq!(row["interactive"], false);
         // signal does not need --interactive.
         let out = f.taba(&f.wt_a, &["signal", id, "usr1"]);
         assert_eq!(exit(&out), 0, "{}", text(&out));
@@ -236,6 +275,217 @@ mod unix {
         let out = f.taba(&f.wt_a, &["send", id, "owner", "--json"]);
         assert_eq!(exit(&out), 0, "{}", text(&out));
         wait_log(&f, &f.wt_a, id, "got:owner");
+    }
+
+    /// Like `flutter run`: keys in cbreak mode, hot reload on SIGUSR1 and
+    /// hot restart on SIGUSR2.
+    const FAKE_FLUTTER: &str = r#"
+import os, signal, sys, tty
+signal.signal(signal.SIGUSR1, lambda *a: print("reloaded", flush=True))
+signal.signal(signal.SIGUSR2, lambda *a: print("restarted", flush=True))
+print("args=" + " ".join(sys.argv[1:]), flush=True)
+if sys.stdin.isatty():
+    tty.setcbreak(0)
+print("Flutter run key commands.", flush=True)
+while True:
+    c = os.read(0, 1)
+    if not c:
+        print("EOF", flush=True)
+        signal.pause()
+    print("key:" + c.decode(), flush=True)
+"#;
+
+    /// Like `vite`: line-based shortcuts.
+    const FAKE_VITE: &str = r#"
+import sys
+print("tty=%s" % sys.stdin.isatty(), flush=True)
+print("VITE ready", flush=True)
+for line in sys.stdin:
+    print("shortcut:" + line.strip(), flush=True)
+"#;
+
+    #[test]
+    fn flutter_run_is_interactive_by_default_and_reloads_by_signal() {
+        let f = Fixture::new("input-flutter");
+        let flutter = fake_tool(&f, "flutter", FAKE_FLUTTER);
+        let out = f.taba(
+            &f.wt_a,
+            &[
+                "run",
+                "--name",
+                "app",
+                "--wait",
+                "--ready",
+                "log:Flutter run key commands",
+                "--",
+                &flutter,
+                "run",
+                "-d",
+                "chrome",
+            ],
+        );
+        assert_eq!(exit(&out), 0, "{}", text(&out));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("interactive: yes"), "{stdout}");
+        let id = format!("{}/app", f.scope_of(&f.wt_a));
+        let row = f.ps(&[]).into_iter().find(|r| r["service"] == id).unwrap();
+        assert_eq!(row["interactive"], true);
+
+        // A single key arrives without Enter.
+        assert_eq!(exit(&f.taba(&f.wt_a, &["send", &id, "--key", "r"])), 0);
+        wait_log(&f, &f.wt_a, &id, "key:r");
+
+        let out = f.taba(&f.wt_a, &["reload", &id, "--json"]);
+        assert_eq!(exit(&out), 0, "{}", text(&out));
+        let v = json(&out);
+        assert_eq!(v["kind"], "flutter");
+        assert_eq!(v["method"], "SIGUSR1");
+        wait_log(&f, &f.wt_a, &id, "reloaded");
+        let out = f.taba(&f.wt_a, &["reload", &id, "--restart", "--json"]);
+        assert_eq!(exit(&out), 0, "{}", text(&out));
+        assert_eq!(json(&out)["method"], "SIGUSR2");
+        wait_log(&f, &f.wt_a, &id, "restarted");
+
+        // Another scope may not reload it.
+        let out = f.taba(&f.wt_b, &["reload", &id, "--json"]);
+        assert_eq!(code(&out), "E_NOT_OWNER");
+
+        // --no-interactive: stdin is /dev/null (EOF), but reload still works.
+        let out = f.taba(
+            &f.wt_a,
+            &[
+                "run",
+                "--name",
+                "plain",
+                "--no-interactive",
+                "--wait",
+                "--ready",
+                "log:Flutter run key commands",
+                "--json",
+                "--",
+                &flutter,
+                "run",
+            ],
+        );
+        assert_eq!(exit(&out), 0, "{}", text(&out));
+        assert_eq!(json(&out)["interactive"], false);
+        let plain = format!("{}/plain", f.scope_of(&f.wt_a));
+        wait_log(&f, &f.wt_a, &plain, "EOF");
+        let out = f.taba(&f.wt_a, &["send", &plain, "x", "--json"]);
+        assert_eq!(code(&out), "E_NO_INPUT");
+    }
+
+    #[test]
+    fn vite_is_interactive_by_default_and_reloads_with_r() {
+        let f = Fixture::new("input-vite");
+        let vite = fake_tool(&f, "vite", FAKE_VITE);
+        let out = f.taba(
+            &f.wt_a,
+            &[
+                "run",
+                "--name",
+                "web",
+                "--wait",
+                "--ready",
+                "log:VITE ready",
+                "--json",
+                "--",
+                &vite,
+                "--host",
+            ],
+        );
+        assert_eq!(exit(&out), 0, "{}", text(&out));
+        assert_eq!(json(&out)["interactive"], true);
+        let id = json(&out)["service"].as_str().unwrap().to_string();
+        assert!(log(&f, &f.wt_a, &id).contains("tty=True"));
+        let out = f.taba(&f.wt_a, &["reload", &id, "--json"]);
+        assert_eq!(exit(&out), 0, "{}", text(&out));
+        assert_eq!(json(&out)["kind"], "vite");
+        assert_eq!(json(&out)["method"], "stdin");
+        wait_log(&f, &f.wt_a, &id, "shortcut:r");
+
+        // Something else: no reload method.
+        let plain = start(&f, &f.wt_a, "plain", false);
+        let out = f.taba(
+            &f.wt_a,
+            &["reload", plain["service"].as_str().unwrap(), "--json"],
+        );
+        assert_eq!(exit(&out), 3, "{}", text(&out));
+        assert_eq!(code(&out), "E_NO_RELOAD");
+    }
+
+    /// `logs -f` on a terminal: read-only until `i`, Ctrl+] stops typing,
+    /// q quits; the service keeps running.
+    #[test]
+    fn the_log_view_types_only_in_input_mode() {
+        use std::io::Read;
+        use std::os::fd::FromRawFd;
+        let f = Fixture::new("input-view");
+        let svc = start(&f, &f.wt_a, "echo", true);
+        let id = svc["service"].as_str().unwrap().to_string();
+
+        let (mut master, slave) = unsafe {
+            let m = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+            assert!(m >= 0);
+            assert_eq!(libc::grantpt(m), 0);
+            assert_eq!(libc::unlockpt(m), 0);
+            let name = std::ffi::CStr::from_ptr(libc::ptsname(m))
+                .to_string_lossy()
+                .into_owned();
+            let master = std::fs::File::from_raw_fd(m);
+            let slave = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(name)
+                .unwrap();
+            (master, slave)
+        };
+        let mut child = f
+            .cmd(&f.wt_a, &["logs", "-f", &id])
+            .stdin(slave.try_clone().unwrap())
+            .stdout(slave.try_clone().unwrap())
+            .stderr(slave.try_clone().unwrap())
+            .spawn()
+            .unwrap();
+        drop(slave);
+        let screen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let mut reader = master.try_clone().unwrap();
+        let sink = screen.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = reader.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                sink.lock()
+                    .unwrap()
+                    .push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+        });
+        let shown = |needle: &str| screen.lock().unwrap().contains(needle);
+        wait_until("the read-only banner", || shown("read-only log of"));
+        let mut key = |bytes: &[u8]| {
+            master.write_all(bytes).unwrap();
+            std::thread::sleep(Duration::from_millis(400));
+        };
+        key(b"nope\r"); // read-only: dropped
+        key(b"i");
+        wait_until("the input banner", || shown("INPUT MODE"));
+        key(b"typed\r");
+        wait_log(&f, &f.wt_a, &id, "got:typed");
+        key(&[0x1d]); // Ctrl+]: back to read-only
+        key(b"late\r");
+        key(b"q");
+        let status = child.wait().unwrap();
+        assert!(status.success());
+        let log = log(&f, &f.wt_a, &id);
+        assert!(
+            !log.contains("got:nope") && !log.contains("got:late"),
+            "{log}"
+        );
+        assert!(shown("got:typed"), "the view shows the log");
+        let row = f.ps(&[]).into_iter().find(|r| r["service"] == id).unwrap();
+        assert_eq!(row["status"], "running");
     }
 
     #[test]

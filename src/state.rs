@@ -6,7 +6,7 @@
 //! services/<scope>/<name>.json   service records (v0.1 fields + optional v0.2 fields)
 //! logs/<scope>/<name>.log         service output
 //! ops/<scope>/<name>.json         in-flight mutation of one service (operation lock)
-//! inputs/<scope>/<name>.fifo      stdin of a service started with `run --interactive` (Unix)
+//! inputs/<scope>/<name>.fifo      input of a service started with `run --interactive` (Unix)
 //! events.jsonl                    append-only audit log
 //! version                         state schema version
 //! lock                            global lock (flock / LockFileEx)
@@ -141,10 +141,21 @@ pub struct Service {
     /// seconds); a later cleanup forces it once `stop_timeout` has passed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_requested_at: Option<u64>,
-    /// `run --interactive`: the FIFO that is this instance's stdin (Unix). The
-    /// service holds it open for reading and writing, so it never sees EOF.
+    /// `run --interactive` (Unix): the input FIFO and the holder process that
+    /// forwards it to the service's terminal (see `input.rs`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input: Option<PathBuf>,
+    pub input: Option<Input>,
+}
+
+/// The input side of an interactive service. Its stdin is a pseudo-terminal;
+/// the holder keeps the terminal's master side open and copies what `send`
+/// and `attach` write to `fifo` into it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Input {
+    pub fifo: PathBuf,
+    pub holder_pid: i32,
+    /// Holder start time, in the units of `Service::start_time`.
+    pub holder_start_time: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

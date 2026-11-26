@@ -490,7 +490,10 @@ fn footer(app: &App) -> Line<'static> {
             Span::styled(format!(" /{}▏", app.filter), bold),
             Span::raw("   Enter keep · Esc clear"),
         ]),
-        Mode::Logs => Line::raw(" ↑↓ PgUp PgDn scroll   End follow   Esc back   q quit"),
+        Mode::Logs => Line::raw(format!(
+            " ↑↓ PgUp PgDn scroll   End follow{}   Esc back   q quit",
+            if app.can_attach() { "   i input" } else { "" }
+        )),
         Mode::Normal => Line::raw(format!(
             " ↑↓ move   ←→ / space collapse·expand   x {}   l logs{}   / filter   q quit",
             app.x_label(),

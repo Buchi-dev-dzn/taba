@@ -29,7 +29,7 @@ pub struct Row {
     pub pending_gc: Option<String>,
     /// Whether the owning scope's lease is expired.
     pub lease_expired: bool,
-    /// Started with `run --interactive`: `i` attaches to it.
+    /// Interactive (`run --interactive`): `i` types into it.
     pub input: bool,
 }
 
@@ -380,6 +380,29 @@ impl App {
             .is_some_and(|r| r.input && !r.is_exited())
     }
 
+    /// `i`: type into the selected service, if it is interactive.
+    fn attach_key(&mut self) -> Effect {
+        let (text, effect) = match self.selected_row() {
+            Some(r) if r.input && !r.is_exited() => {
+                (None, Effect::Attach(r.scope.clone(), r.name.clone()))
+            }
+            Some(r) if r.input => (Some(format!("{} is not running", r.id())), Effect::None),
+            Some(r) => (
+                Some(format!(
+                    "{} is not interactive (start it with --interactive); it takes no input",
+                    r.id()
+                )),
+                Effect::None,
+            ),
+            None => (
+                Some("select an interactive service".to_string()),
+                Effect::None,
+            ),
+        };
+        self.notice = text.map(|text| Notice { text, error: false });
+        effect
+    }
+
     fn selected_row(&self) -> Option<&Row> {
         match &self.cursor {
             Some(Item::Service(s, n)) => self.row(s, n),
@@ -543,6 +566,7 @@ impl App {
                         return Effect::None;
                     }
                     KeyCode::Char('q') => return Effect::Quit,
+                    KeyCode::Char('i') => return self.attach_key(),
                     _ => {}
                 }
                 let log = self.log.get_or_insert_with(LogView::default);
@@ -620,29 +644,7 @@ impl App {
                     }
                 }
             }
-            KeyCode::Char('i') => {
-                let (text, effect) = match self.selected_row() {
-                    Some(r) if r.input && !r.is_exited() => {
-                        (None, Effect::Attach(r.scope.clone(), r.name.clone()))
-                    }
-                    Some(r) if r.input => {
-                        (Some(format!("{} is not running", r.id())), Effect::None)
-                    }
-                    Some(r) => (
-                        Some(format!(
-                            "{} was not started with --interactive; it takes no input",
-                            r.id()
-                        )),
-                        Effect::None,
-                    ),
-                    None => (
-                        Some("select a service started with --interactive".to_string()),
-                        Effect::None,
-                    ),
-                };
-                self.notice = text.map(|text| Notice { text, error: false });
-                return effect;
-            }
+            KeyCode::Char('i') => return self.attach_key(),
             KeyCode::Char('l') => match self.selected_row() {
                 Some(r) => {
                     let path = r.log_path.clone();
