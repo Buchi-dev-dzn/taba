@@ -12,19 +12,19 @@ serde_json = { version = "1.0.154", features = ["preserve_order"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-webpki-roots"] }
 semver = "1"
 toml = { version = "0.8", default-features = false, features = ["parse", "preserve_order"] }
+toml_edit = { version = "0.22", default-features = false, features = ["parse", "display"] }
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+sha2 = "0.11"
+tempfile = "3"
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 flate2 = "1"
-sha2 = "0.11"
 tar = "0.4"
-tempfile = "3"
 
 [dev-dependencies]
 flate2 = "1"
 sha2 = "0.11"
 tar = "0.4"
-tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.191"

@@ -301,6 +301,8 @@ mod tests {
                     service_expires_at: None,
                     moves: Vec::new(),
                     stop_requested_at: None,
+                    env_keys: Vec::new(),
+                    env_hash: None,
                     discovered_ports: Vec::new(),
                 })
                 .unwrap();
