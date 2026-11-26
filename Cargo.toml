@@ -11,6 +11,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-webpki-roots"] }
 semver = "1"
+toml = { version = "0.8", default-features = false, features = ["parse", "preserve_order"] }
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
