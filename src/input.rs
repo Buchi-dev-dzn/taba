@@ -54,6 +54,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// How long a write waits for a service that does not read its stdin.
+#[cfg(unix)]
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// The byte that leaves input mode (Ctrl+]).
 const DETACH: u8 = 0x1d;
