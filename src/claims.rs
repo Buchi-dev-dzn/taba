@@ -244,3 +244,134 @@ pub fn disown(
     out.failure = failure;
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// A throwaway state directory whose lifetime is limited to one test.
+    struct Tmp(Store, PathBuf);
+
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.1);
+        }
+    }
+
+    fn store(test: &str) -> Tmp {
+        let dir =
+            std::env::temp_dir().join(format!("taba-claims-unit-{}-{test}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Tmp(Store::at(dir.clone()), dir)
+    }
+
+    fn caller(scope: &str) -> Caller {
+        Caller {
+            scope: Some(scope.into()),
+            source: None,
+            worktree: None,
+            branch: None,
+            agent: "human".into(),
+            agent_pid: None,
+            cwd: PathBuf::from("."),
+        }
+    }
+
+    fn service(store: &Store, scope: &str, name: &str) {
+        // Use the test process as a live service without spawning or signaling anything.
+        let pid = std::process::id() as i32;
+        store
+            .put(&Service {
+                scope: scope.into(),
+                name: name.into(),
+                command: vec!["dummy".into()],
+                cwd: PathBuf::from("."),
+                port: None,
+                pid,
+                pgid: crate::proc::pgid(pid).unwrap_or(pid),
+                start_time: crate::proc::info(pid).unwrap().start_time,
+                log_path: store.log_path(scope, name),
+                command_template: None,
+                port_request: None,
+                instance: None,
+                started_by: None,
+                ready: None,
+                service_ttl_secs: None,
+                service_expires_at: None,
+                moves: Vec::new(),
+                stop_requested_at: None,
+                discovered_ports: Vec::new(),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn cancel_removes_only_the_callers_queued_claim() {
+        let t = store("cancel");
+        let cfg = Config::load(t.1.as_path()).unwrap();
+        service(&t.0, "owner", "web");
+        let next = caller("next");
+        let later = caller("later");
+
+        let queued = claim(&t.0, &cfg, &next, "owner/web", false).unwrap();
+        assert_eq!(queued.body["position"], 1);
+        let queued = claim(&t.0, &cfg, &later, "owner/web", false).unwrap();
+        assert_eq!(queued.body["position"], 2);
+        let remaining = json!([queued.body["claims"][1]]);
+        assert_eq!(remaining[0]["scope"], "later");
+
+        let cancelled = claim(&t.0, &cfg, &next, "owner/web", true).unwrap();
+        assert!(cancelled.body["position"].is_null());
+        assert_eq!(cancelled.body["claims"], remaining);
+        let queue = || serde_json::to_value(t.0.get_claims("owner", "web").unwrap()).unwrap();
+        let after_cancel = queue();
+        assert_eq!(after_cancel["queue"].as_array().unwrap().len(), 1);
+        assert_eq!(after_cancel["queue"][0]["scope"], "later");
+        let event_log = t.1.join("events.jsonl");
+        let events_after_cancel = std::fs::read(&event_log).unwrap();
+
+        // Cancelling an absent claim is intentionally idempotent.
+        let again = claim(&t.0, &cfg, &next, "owner/web", true).unwrap();
+        assert!(again.body["position"].is_null());
+        assert_eq!(again.body["claims"], remaining);
+        assert_eq!(queue(), after_cancel);
+        assert_eq!(std::fs::read(event_log).unwrap(), events_after_cancel);
+    }
+
+    #[test]
+    fn disown_without_an_eligible_claimant_leaves_the_service_in_place() {
+        let t = store("disown-none");
+        let cfg = Config::load(t.1.as_path()).unwrap();
+        service(&t.0, "owner", "web");
+        let waiting = caller("waiting");
+        let queued = claim(&t.0, &cfg, &waiting, "owner/web", false).unwrap();
+        assert_eq!(queued.body["claims"][0]["alive"], true);
+        // A live claimant is ineligible once it has a service with the same name.
+        service(&t.0, "waiting", "web");
+        assert!(t.0.get("owner", "web").unwrap().unwrap().is_running());
+        let snapshot = || {
+            (
+                serde_json::to_value(t.0.get("owner", "web").unwrap()).unwrap(),
+                serde_json::to_value(t.0.get("waiting", "web").unwrap()).unwrap(),
+                serde_json::to_value(t.0.get_claims("owner", "web").unwrap()).unwrap(),
+                std::fs::read(t.1.join("events.jsonl")).unwrap(),
+            )
+        };
+        let before = snapshot();
+
+        let err = match disown(
+            &t.0,
+            &cfg,
+            &caller("owner"),
+            Some("owner/web".into()),
+            false,
+        ) {
+            Ok(_) => panic!("disown without an eligible claimant unexpectedly succeeded"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code, "E_NO_CLAIMANT");
+        assert_eq!(err.exit_code(), 3);
+        assert_eq!(snapshot(), before);
+    }
+}
