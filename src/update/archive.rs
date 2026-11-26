@@ -29,8 +29,19 @@ pub(super) fn verified_binary(
     checked
 }
 
+/// Lowercase hex SHA-256 digest (sha2 0.11 digests no longer implement `LowerHex`).
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::new(), |mut out, b| {
+            let _ = write!(out, "{b:02x}");
+            out
+        })
+}
+
 fn verify(archive: &[u8], expected: &str, name: &str, target: Target) -> Result<Vec<u8>> {
-    if !format!("{:x}", Sha256::digest(archive)).eq_ignore_ascii_case(expected) {
+    if !sha256_hex(archive).eq_ignore_ascii_case(expected) {
         return Err(failure(format!("SHA-256 mismatch for {name}")));
     }
     let executable = executable_from_tar_gz(archive)?;
