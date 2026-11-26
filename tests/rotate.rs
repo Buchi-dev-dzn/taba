@@ -128,7 +128,7 @@ fn running_service_keeps_logging_and_followers_keep_following_across_rotation() 
 }
 
 #[test]
-fn run_rotates_a_full_log_before_starting_and_defaults_keep_small_logs() {
+fn run_rotates_a_full_log_before_starting_and_defaults_keep_rotation_off() {
     let f = Fixture::new("rotate-run");
     let a = &f.wt_a;
     let start = |name: &str| {
@@ -143,15 +143,16 @@ fn run_rotates_a_full_log_before_starting_and_defaults_keep_small_logs() {
         log
     };
 
-    // No config: the default cap (10 MB) leaves a normal log alone.
+    // No config: rotation is opt-in, including for a log already past the
+    // documented 10 MiB example cap.
     let log = start("web");
-    let before = std::fs::read(&log).unwrap();
+    let big = vec![b'z'; 2000];
+    std::fs::write(&log, &big).unwrap();
     start("web");
     assert!(!rotated(&log).exists());
-    assert!(std::fs::read(&log).unwrap().starts_with(&before));
+    assert!(std::fs::read(&log).unwrap().starts_with(&big));
 
     configure(&f, "log_max_size = \"1KB\"\n");
-    let big = vec![b'z'; 2000];
     std::fs::write(&log, &big).unwrap();
     start("web");
     assert_eq!(std::fs::read(rotated(&log)).unwrap(), big);

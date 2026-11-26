@@ -289,8 +289,8 @@ mod tests {
             gc_grace: 600,
             log_retention: 86_400,
             stop_timeout: 5,
-            log_max_size: Some(crate::config::DEFAULT_LOG_MAX_SIZE),
-            events_max_size: Some(crate::config::DEFAULT_EVENTS_MAX_SIZE),
+            log_max_size: None,
+            events_max_size: None,
             unknown: Vec::new(),
         }
     }

@@ -84,10 +84,10 @@ pub fn parse_size(s: &str) -> std::result::Result<Option<u64>, String> {
     }
 }
 
-/// The `events.jsonl` cap of the state at `root`; the default when
+/// The `events.jsonl` cap of the state at `root`; rotation is opt-in when
 /// `config.toml` cannot be read (the command reports that itself).
 pub fn events_max_size(root: &Path) -> Option<u64> {
-    Config::load(root).map_or(Some(DEFAULT_EVENTS_MAX_SIZE), |c| c.events_max_size)
+    Config::load(root).map_or(None, |c| c.events_max_size)
 }
 
 /// Parses a lease TTL: a duration or `none`.
@@ -139,10 +139,6 @@ pub const DEFAULT_AGENT_TTL: u64 = 4 * 3_600;
 pub const DEFAULT_CLAIM_GRACE: u64 = 2 * 60;
 pub const DEFAULT_GC_GRACE: u64 = 10 * 60;
 pub const DEFAULT_LOG_RETENTION: u64 = 24 * 3_600;
-/// Size cap of one service log before it is rotated to `<name>.log.1`.
-pub const DEFAULT_LOG_MAX_SIZE: u64 = 10 * 1024 * 1024;
-/// Size cap of `events.jsonl` before it is rotated to `events.jsonl.1`.
-pub const DEFAULT_EVENTS_MAX_SIZE: u64 = 10 * 1024 * 1024;
 /// Seconds `gc` waits after the graceful stop request before forcing a
 /// service down, like `taba stop --timeout`.
 pub const DEFAULT_STOP_TIMEOUT: u64 = 5;
@@ -157,8 +153,8 @@ pub struct Config {
     pub gc_grace: u64,
     pub log_retention: u64,
     pub stop_timeout: u64,
-    /// Bytes a service log may grow to before it is rotated; `None` never
-    /// rotates (`log_max_size = "none"`).
+    /// Bytes a service log may grow to before it is rotated; `None` is the
+    /// default and never rotates.
     pub log_max_size: Option<u64>,
     /// The same for `events.jsonl` (`events_max_size`).
     pub events_max_size: Option<u64>,
@@ -183,8 +179,8 @@ impl Config {
             gc_grace: DEFAULT_GC_GRACE,
             log_retention: DEFAULT_LOG_RETENTION,
             stop_timeout: DEFAULT_STOP_TIMEOUT,
-            log_max_size: Some(DEFAULT_LOG_MAX_SIZE),
-            events_max_size: Some(DEFAULT_EVENTS_MAX_SIZE),
+            log_max_size: None,
+            events_max_size: None,
             unknown: Vec::new(),
         };
         let text = match std::fs::read_to_string(&path) {
@@ -327,8 +323,8 @@ mod tests {
         assert_eq!(c.gc_grace, 0);
         assert_eq!(c.stop_timeout, 30);
         assert_eq!(c.claim_grace, DEFAULT_CLAIM_GRACE);
-        assert_eq!(c.log_max_size, Some(DEFAULT_LOG_MAX_SIZE));
-        assert_eq!(c.events_max_size, Some(DEFAULT_EVENTS_MAX_SIZE));
+        assert_eq!(c.log_max_size, None);
+        assert_eq!(c.events_max_size, None);
         assert_eq!(c.unknown, ["other"]);
         std::fs::write(
             dir.join("config.toml"),

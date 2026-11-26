@@ -300,10 +300,10 @@ limit can start the output mid-line. `bytes_total` reports the log's original
 size in bytes, and `truncated` is true whenever the line or byte limit omits
 earlier data. Use `--tail 0 -f` to follow only new output.
 
-A log larger than `log_max_size` (default `10MB`, set in `config.toml`) is
-rotated: its contents move to `<name>.log.1`, replacing the previous one,
-and the log starts again from empty. `taba logs` reads the current file; the
-`.1` file holds the output before it. See [Log rotation](#log-rotation).
+When configured with `log_max_size`, a log larger than that cap is rotated:
+its contents move to `<name>.log.1`, replacing the previous one, and the log
+starts again from empty. Rotation is opt-in; `taba logs` reads the current
+file, while `.1` holds the output before it. See [Log rotation](#log-rotation).
 
 ![taba logs printing a service's log](docs/images/logs.svg)
 
@@ -907,21 +907,24 @@ malformed or unreadable file returns `E_CONFIG` naming the key or path.
 ```toml
 # $TABA_HOME/config.toml
 log_retention = "24h"     # keep a dropped service's logs this long (default)
-log_max_size = "10MB"     # rotate a service log above this size (default)
-events_max_size = "10MB"  # rotate events.jsonl at this size (default)
+# Optional: enable one-generation rotation. Without these, logs keep growing.
+log_max_size = "10MiB"     # rotate a service log above this size
+events_max_size = "10MiB"  # rotate events.jsonl at this size
 ```
 
 #### Log rotation
 
-Each service log and `events.jsonl` keeps one rotated generation, so after
-a rotation a service's logs take about twice `log_max_size` on disk. Sizes take `B`,
-`KB`, `MB` or `GB` (1024-based; `KiB`, `MiB` and `GiB` mean the same), and
-`"none"` turns rotation off.
+Rotation is opt-in: without `log_max_size` or `events_max_size`, taba never
+rotates that file. Each configured service log and `events.jsonl` keeps one
+rotated generation, so after a rotation a service's logs take about twice
+`log_max_size` on disk. Sizes take `B`, `KB`, `MB` or `GB` (1024-based; `KiB`,
+`MiB` and `GiB` mean the same), and `"none"` also disables a configured cap.
 
 - **When.** There is no daemon, so rotation happens inside taba commands:
   `taba run` rotates a service's log before it starts the process, and the
   cleanup inside `run`, `whoami` and `gc` rotates the logs of services that
-  are running. A log can pass the cap between those commands.
+  are running. A log can pass the cap between those commands, so this is
+  lazy rotation rather than a hard disk quota.
   `events.jsonl` is checked before each event is written.
 - **How.** A running service writes to the log through the file descriptor
   (macOS, Linux) or handle (Windows) it inherited, opened in append mode,
@@ -1000,13 +1003,14 @@ taba is an early prototype:
 - **Some children are not tracked.** Children that move into a different
   process group or session (Windows: break away from the job) are not
   tracked, and `stop` won't reach them.
-- **Log rotation is lazy and keeps one generation.** A log is rotated by
-  the next `run`, `whoami` or `gc` after it passes `log_max_size`, not at
-  the moment it does; a very chatty service can grow well past the cap in
-  between. Output written during the rotation's copy-and-truncate instant
-  can be lost. A program that reopens its own output path (rather than
-  writing to the inherited stdout/stderr) without append mode can leave a
-  gap of zero bytes after a rotation.
+- **Opt-in log rotation is lazy and keeps one generation.** Configuring
+  `log_max_size` rotates a log only at the next `run`, `whoami` or `gc`, not
+  at the moment it passes the cap; a very chatty service can grow well past
+  it in between, so it is not a hard disk quota. Active service rotation
+  uses copy-and-truncate and can lose output written in its small concurrent
+  copy/truncate window. A program that reopens its own output path (rather
+  than writing to the inherited stdout/stderr) without append mode can leave
+  a gap of zero bytes after a rotation.
 - **Ownership is a convention, not security.** `--scope`, `$TABA_SCOPE` and
   `$TABA_AGENT` are claims, not credentials. Leases prevent accidental
   concurrent mutation by cooperating agents: a live holder produces
