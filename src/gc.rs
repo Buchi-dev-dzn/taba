@@ -339,6 +339,8 @@ mod tests {
             service_expires_at: None,
             moves: Vec::new(),
             stop_requested_at: None,
+            wait_request: None,
+            env: Vec::new(),
             discovered_ports: Vec::new(),
         };
         store.put(&svc).unwrap();

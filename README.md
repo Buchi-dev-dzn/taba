@@ -322,6 +322,21 @@ taba stop billing/web --force --reason "stuck since lunch"
 
 ![taba stop --scope billing stops two services and leaves login-fix running](docs/images/stop-scope.svg)
 
+**Restart a service with the settings it was started with.** `restart` stops
+the service and starts its recorded command again, in the same directory,
+with the same port request and ready check, as one operation. With
+`--port auto` the URL stays the same when the old port is free again, so
+nothing else needs a new URL; the instance changes. It follows `stop`'s
+rules: only the owner (or the holder of an exclusive borrow) restarts a
+service, other scopes' shared borrows refuse it with `E_BORROWED`, and
+`--force --reason` overrides and is recorded. A second `restart` or `stop`
+while one is in flight gets `E_BUSY`.
+
+```sh
+taba restart web              # stop, then start the same command again
+taba restart web --wait=60    # wait up to 60 s for the new instance
+```
+
 **Clean up when the task is done.** Stopped services stay in `ps` so you can
 still read their logs. `rm` deletes their records and logs, and refuses
 services that are still running:
@@ -648,6 +663,7 @@ that. Measurements against Docker are in [docs/benchmarks.md](docs/benchmarks.md
 | `taba stop --scope S` | Stop every service in scope `S`. |
 | `taba stop ... --timeout SECS` | Seconds to wait between SIGTERM and SIGKILL (Windows: Ctrl+Break and job termination; default 5). |
 | `taba stop ... --force --reason TEXT` | Stop a service of another scope; recorded in `events.jsonl`. |
+| `taba restart S/N [--wait[=SECS]] [--ready CHECK] [--timeout SECS] [--json]` (or `N` in your scope) | Stop a service of your own scope and start it again with its recorded command, directory, port request and `--wait`/`--ready`. The port stays when it is free again; the instance changes and shared borrows become dangling. Same refusals as `stop`; `--force --reason TEXT` for another scope's service, recorded as `force_restart`. |
 | `taba rm S/N` (or `N` in your scope) | Delete a stopped service's record and log. Refuses a running service, and another scope's service without `--force --reason`. |
 | `taba rm --scope S` | Delete the records and logs of every stopped service in scope `S`; running ones are kept and reported. |
 | `taba renew [--scope S] [--ttl DURATION] [--json]` | Renew the caller's scope lease. |
@@ -667,8 +683,8 @@ that. Measurements against Docker are in [docs/benchmarks.md](docs/benchmarks.md
 | `taba update [--json]` | Check, then replace an eligible official standalone Linux or macOS install. Otherwise, report the manual upgrade path. See [Updating](#updating). |
 
 `--ready` is `tcp` (default when there is a port), `http:PATH` or
-`log:REGEX`, and needs `--wait`. `--agent NAME` on `run`, `stop`, `rm` and
-`whoami` overrides `$TABA_AGENT`. Run `taba <command> --help` to see all
+`log:REGEX`, and needs `--wait`. `--agent NAME` on `run`, `restart`, `stop`,
+`rm` and `whoami` overrides `$TABA_AGENT`. Run `taba <command> --help` to see all
 flags.
 
 ### Errors
@@ -694,10 +710,10 @@ single quotes). The exit status follows the code:
 | `E_NOT_OWNER` | 3 | The service belongs to another scope. Use it read-only, borrow it, or coordinate with its owner. |
 | `E_SCOPE_HELD` | 3 | Another agent identity has a live lease on the scope. Wait for the normal hand-off or ask the coordinator; do not impersonate the holder. |
 | `E_LEASE_LIVE` | 3 | `move --take` found a live holder. Wait for expiry or a planned hand-off. |
-| `E_BORROWED` | 3 | The owner tried to stop or replace a service with live borrowers. Coordinate release or disown it to a claimant. |
+| `E_BORROWED` | 3 | The owner tried to stop, restart or replace a service with live borrowers. Coordinate release or disown it to a claimant. |
 | `E_LOCKED` | 3 | Another scope has an exclusive maintenance borrow. Retry later or use `--wait-lock` for a legitimate maintenance operation. |
 | `E_NO_CLAIMANT` | 3 | `disown` found no eligible claimant. Arrange a claim before disowning. |
-| `E_BUSY` | 3 | Another `stop` or starting `run` of that service is in progress, or another taba process held the state lock for the whole lock timeout (`details.holder_pid` when recorded). |
+| `E_BUSY` | 3 | Another `stop`, `restart` or starting `run` of that service is in progress, or another taba process held the state lock for the whole lock timeout (`details.holder_pid` when recorded). |
 | `E_CONFLICT` | 3 | Same name already running with a different command, directory or port. |
 | `E_STILL_RUNNING` | 3 | `rm` of a running service. |
 | `E_PORT_IN_USE`, `E_PORT_CLAIMED` | 4 | The port is held by a process, or reserved by another taba service. |

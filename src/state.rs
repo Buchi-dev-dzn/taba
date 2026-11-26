@@ -140,11 +140,31 @@ pub struct Service {
     /// seconds); a later cleanup forces it once `stop_timeout` has passed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_requested_at: Option<u64>,
+    /// The `--wait` and `--ready` this instance was started with, so that
+    /// `restart` waits the same way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_request: Option<WaitRequest>,
+    /// Extra environment variables the command was started with (from
+    /// `taba.toml`). These private state values are neither printed nor
+    /// included in command JSON envelopes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<(String, String)>,
     /// TCP ports the service's processes were found listening on when `run`
     /// reported it (ascending). The URL falls back to the first one when the
     /// service has no `--port`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub discovered_ports: Vec<u16>,
+}
+
+/// `run --wait[=SECS] [--ready SPEC]` as given.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WaitRequest {
+    /// The `--wait` timeout in milliseconds.
+    pub ms: u64,
+    /// `--ready` as given (`tcp`, `http:PATH`, `log:REGEX`), or `port`
+    /// for the short form's discovered-listener wait.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

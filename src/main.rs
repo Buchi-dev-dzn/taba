@@ -13,6 +13,7 @@ mod ports;
 mod proc;
 mod project;
 mod ready;
+mod restart;
 mod runform;
 mod scope;
 mod state;
@@ -216,6 +217,9 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Stop a service and start it again with its recorded command, directory,
+    /// port and ready check; the URL stays when the port is free again
+    Restart(restart::Args),
     /// Remove stopped services' records and logs (SCOPE/NAME, or --scope)
     Rm {
         /// SCOPE/NAME, or NAME in the caller's scope
@@ -555,10 +559,16 @@ fn main() -> ExitCode {
         let json = env_json();
         return ExitCode::from(emit(json, cmd_ps(None, false)));
     };
+    ExitCode::from(dispatch(cmd, shape, raw))
+}
+
+/// Keep clap's large command dispatch frame out of `main` on Windows.
+#[inline(never)]
+fn dispatch(cmd: Cmd, shape: runform::Shape, raw: Vec<String>) -> u8 {
     let (json_mode, res): (bool, Result<Option<Output>>) = match cmd {
         #[cfg(windows)]
         Cmd::CtrlBreak { attach, pgid } => {
-            return ExitCode::from(proc::ctrl_break_helper(attach, pgid));
+            return proc::ctrl_break_helper(attach, pgid);
         }
         Cmd::Run {
             scope,
@@ -708,11 +718,11 @@ fn main() -> ExitCode {
                     if let Some(value) = value {
                         error::print_json(&value);
                     }
-                    ExitCode::SUCCESS
+                    0
                 }
                 Err(e) => {
                     eprintln!("taba hook: {}", e.message);
-                    ExitCode::from(1)
+                    1
                 }
             };
         }
@@ -782,7 +792,7 @@ fn main() -> ExitCode {
         } => {
             let json = json || env_json();
             if watch {
-                return ExitCode::from(watch::run(json, scope, running, interval));
+                return watch::run(json, scope, running, interval);
             }
             let res = if all {
                 listing::cmd_ps_all()
@@ -813,6 +823,7 @@ fn main() -> ExitCode {
             json || env_json(),
             cmd_stop(target, scope, agent, timeout, force, reason).map(Some),
         ),
+        Cmd::Restart(a) => (a.json || env_json(), restart::cmd(a).map(Some)),
         Cmd::Rm {
             target,
             scope,
@@ -825,12 +836,11 @@ fn main() -> ExitCode {
             cmd_rm(target, scope, agent, force, reason).map(Some),
         ),
     };
-    let code = match res {
+    match res {
         Ok(None) => 0,
         Ok(Some(out)) => emit(json_mode, Ok(out)),
         Err(e) => emit(json_mode, Err(e)),
-    };
-    ExitCode::from(code)
+    }
 }
 
 /// Parses `SCOPE/NAME`, or `NAME` in the caller's scope.
@@ -1281,6 +1291,15 @@ fn run_service(a: RunArgs, form: runform::RunForm) -> Result<Output> {
             .map(|t| util::rfc3339(util::now_secs().saturating_add(t))),
         moves: Vec::new(),
         stop_requested_at: None,
+        wait_request: wait.map(|w| state::WaitRequest {
+            ms: w.as_millis() as u64,
+            ready: a.ready.as_ref().map(ReadySpec::request).or_else(|| {
+                short
+                    .is_some_and(|s| s.port_wait)
+                    .then(|| ReadySpec::Port.request())
+            }),
+        }),
+        env: a.env,
         discovered_ports: Vec::new(),
     };
     store.put(&svc)?;
@@ -1350,6 +1369,151 @@ fn save_if_current(store: &Store, svc: &Service) -> Result<()> {
         store.put(svc)?;
     }
     Ok(())
+}
+
+/// Recorded launch settings used by `restart`. Keeping this separate from
+/// `run`'s short-form handling ensures a restart is always the recorded,
+/// explicit service operation.
+pub(crate) struct RestartLaunch<'a> {
+    pub scope: &'a str,
+    pub name: &'a str,
+    pub template: Vec<String>,
+    pub cwd: &'a std::path::Path,
+    pub env: Vec<(String, String)>,
+    pub port: Option<u16>,
+    pub port_request: Option<String>,
+    pub agent: &'a str,
+    pub service_ttl: Option<u64>,
+    pub moves: Vec<Value>,
+    pub wait_request: Option<state::WaitRequest>,
+}
+
+/// Starts a replacement from its private recorded settings. Call under the
+/// state lock; environment values are deliberately never written to logs or
+/// emitted as JSON.
+pub(crate) fn restart_launch(store: &Store, l: RestartLaunch) -> Result<(Service, u64)> {
+    let id = format!("{}/{}", l.scope, l.name);
+    let command: Vec<String> = match l.port {
+        Some(p) => l
+            .template
+            .iter()
+            .map(|x| x.replace("{port}", &p.to_string()))
+            .collect(),
+        None => l.template.clone(),
+    };
+    let log_path = store.log_path(l.scope, l.name);
+    state::create_private_dir_all(log_path.parent().expect("log has parent"))?;
+    let mut log = state::private_file()
+        .append(true)
+        .open(&log_path)
+        .map_err(|e| TabaError::state(format!("cannot open log {}: {e}", log_path.display())))?;
+    writeln!(
+        log,
+        "--- taba: {} starting {:?} in {} ---",
+        local_timestamp(),
+        command,
+        l.cwd.display()
+    )?;
+    let log_offset = log.metadata()?.len();
+    let log_err = log.try_clone()?;
+    let mut cmd = Command::new(proc::resolve_program(&command[0]));
+    #[cfg(windows)]
+    if let Some(line) = runform::shell_line(&command) {
+        use std::os::windows::process::CommandExt;
+        cmd.arg("/C").raw_arg(line);
+    } else {
+        cmd.args(&command[1..]);
+    }
+    #[cfg(not(windows))]
+    cmd.args(&command[1..]);
+    cmd.current_dir(l.cwd)
+        .envs(l.env.iter().map(|(k, v)| (k, v)))
+        .env("TABA_SCOPE", l.scope)
+        .env("TABA_SERVICE", l.name)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err));
+    if let Some(port) = l.port {
+        cmd.env("PORT", port.to_string());
+    }
+    let start_failed = |message: String| {
+        TabaError::new("E_START_FAILED", message)
+            .details(
+                json!({ "service": id, "log_path": log_path, "log_tail": log_tail(&log_path, 20) }),
+            )
+            .next(Next::run("read the log", format!("taba logs {id}")))
+    };
+    let spawned = proc::spawn_detached(cmd).map_err(|e| match e {
+        proc::SpawnError::Start(e) => start_failed(format!("cannot start {:?}: {e}", command[0])),
+        proc::SpawnError::Vanished => {
+            start_failed(format!("{id} exited immediately; see taba logs {id}"))
+        }
+    })?;
+    let pid = spawned.pid;
+    Ok((
+        Service {
+            scope: l.scope.to_string(),
+            name: l.name.to_string(),
+            command,
+            cwd: l.cwd.to_path_buf(),
+            port: l.port,
+            pid,
+            pgid: spawned.pgid,
+            start_time: spawned.start_time,
+            log_path,
+            command_template: Some(l.template),
+            port_request: l.port_request,
+            instance: Some(format!("{pid}-{}", spawned.start_time)),
+            started_by: Some(l.agent.to_string()),
+            ready: None,
+            service_ttl_secs: l.service_ttl,
+            service_expires_at: l
+                .service_ttl
+                .map(|t| util::rfc3339(util::now_secs().saturating_add(t))),
+            moves: l.moves,
+            stop_requested_at: None,
+            wait_request: l.wait_request,
+            env: l.env,
+            discovered_ports: Vec::new(),
+        },
+        log_offset,
+    ))
+}
+
+/// Completes a restart with its recorded ready check, recording readiness
+/// and discovered ports before releasing the operation lock.
+pub(crate) fn restart_await_ready(
+    store: &Store,
+    mut svc: Service,
+    check: Option<&ReadySpec>,
+    wait: Option<Duration>,
+    log_offset: u64,
+) -> Result<(Service, Outcome)> {
+    let outcome = match (check, wait) {
+        (Some(ReadySpec::Port), Some(w)) => ready::wait_for_port(&mut svc, w),
+        (Some(c), Some(w)) => ready::wait(&svc, c, w, log_offset),
+        _ => {
+            thread::sleep(Duration::from_millis(200));
+            if svc.is_running() {
+                Outcome::Ready { ms: 200 }
+            } else {
+                Outcome::Exited
+            }
+        }
+    };
+    if matches!(outcome, Outcome::Ready { .. }) && svc.discovered_ports.is_empty() {
+        svc.discovered_ports = ready::discover_ports(&svc);
+    }
+    let _lock = store.lock()?;
+    if let (Outcome::Ready { .. }, Some(check)) = (&outcome, check) {
+        svc.ready = Some(state::Ready {
+            check: check.name().to_string(),
+            ready_at: util::now_micros(),
+        });
+    }
+    save_if_current(store, &svc)?;
+    store.release_op(&svc.scope, &svc.name)?;
+    Ok((svc, outcome))
 }
 
 /// `run` found the same service already running: report it, after the
@@ -1437,7 +1601,7 @@ fn run_result(
     short: Option<&Short>,
 ) -> Result<Output> {
     let id = svc.id();
-    let port_wait = short.is_some_and(|s| s.port_wait);
+    let port_wait = short.is_some_and(|s| s.port_wait) || matches!(check, Some(ReadySpec::Port));
     // The short form's port wait ends without an error when no port showed
     // up in time: the service runs, it has no port yet.
     let (outcome, port_found) = match outcome {
@@ -1447,6 +1611,7 @@ fn run_result(
     match outcome {
         Outcome::Ready { ms } => {
             let ready = match check {
+                Some(ReadySpec::Port) if !port_found => None,
                 Some(c) => Some(json!({ "check": c.name(), "ms": ms })),
                 None if port_found => Some(json!({ "check": "port", "ms": ms })),
                 None => None,
@@ -1470,13 +1635,15 @@ fn run_result(
                 out.warnings = warnings;
                 return Ok(out);
             }
-            let verb = if status == "started" {
-                "started"
-            } else {
-                "already running"
+            let verb = match status {
+                "started" => "started",
+                "restarted" => "restarted",
+                _ => "already running",
             };
             let mut text = describe(verb, &svc);
-            if let Some(c) = check {
+            if let Some(c) = check
+                && (!matches!(c, ReadySpec::Port) || port_found)
+            {
                 text.push_str(&format!("\n  ready {} check passed in {ms} ms", c.name()));
             }
             let mut out = Output::new(body, text);
@@ -2562,6 +2729,8 @@ mod stop_tests {
                 service_expires_at: None,
                 moves: Vec::new(),
                 stop_requested_at: None,
+                wait_request: None,
+                env: Vec::new(),
                 discovered_ports: Vec::new(),
             })
             .unwrap();
