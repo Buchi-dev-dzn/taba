@@ -2280,6 +2280,24 @@ are kept so that "decision N" references above stay valid.
    support "ask" (Codex: not confirmed), its hook keeps denying. (Section
    2, rule 8; section 3, "Hand-off"; section 5, "Claude Code hooks".)
 
+10. **A short human form of `run`, with no hidden rules** (2026-11-26,
+    #67). `taba run npm run dev` without `--name` derives the name from
+    the command (`npm|pnpm|yarn|bun run X` and `pnpm X` → `X`,
+    `flutter run -d D` → `flutter-D`, else the program's basename). It
+    assigns no port: it waits up to 30 s for the service's processes to
+    listen and reports the port the app chose, or says "no port yet" and
+    succeeds. The same command in the same directory reuses the service; a
+    derived name already used by another command or directory is refused
+    (`E_CONFLICT`, both commands shown). How the command is written: with
+    no taba options, all of it is the command; one quoted argument with
+    spaces is a shell command line, with taba options before or after it;
+    taba options before an unquoted command need `--`, and a missing `--`
+    is an error with the corrected line (offered to run in a terminal).
+    taba always prints the command it understood. `taba` alone lists
+    services. The explicit form (`--name ... --`) that agents use is
+    unchanged, except that its JSON gains `discovered_ports`. One-letter
+    aliases were considered and left out for discoverability.
+
 ### Still open
 
 - **Does a usage-limited agent's process exit?** Automatic take-over

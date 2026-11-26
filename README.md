@@ -146,10 +146,79 @@ GitHub and on the security of the repository for authenticity.
 
 ## Quick start
 
-**Start services**, each owned by a scope and a name. `run` returns right away,
-and the process keeps running after you close the terminal. Running the same
-command a second time reuses the service that is already running and does not
-start a copy.
+**Start a dev server** with the command you already use. `run` returns once
+the server listens, and the process keeps running after you close the
+terminal:
+
+```console
+$ taba run npm run dev
+started dev → http://localhost:5173
+  command: npm run dev
+  name "dev" (from "npm run dev"; set another with --name)
+  logs: taba logs dev · stop: taba stop dev
+```
+
+- **The name** comes from the command: `npm|pnpm|yarn|bun run X` and
+  `pnpm X` give `X`, `flutter run -d D` gives `flutter-D`, and anything else
+  gives the program's name (`vite`, `python3`). taba prints where the name
+  came from; `--name` sets another one.
+- **The port** is the one the app chose. taba sets no port; it watches the
+  service's processes for up to 30 seconds (`--wait=SECS` changes that) and
+  reports the first port they listen on, as `ps --all` sees it. If none
+  shows up in time, `run` still succeeds and says so:
+  `started dev, running, no port yet (see: taba logs dev)`.
+- **Running the same command again** in the same directory reuses the
+  running server instead of starting a copy:
+
+  ```console
+  $ taba run npm run dev
+  already running: dev → http://localhost:5173
+    command: npm run dev
+    name "dev" (from "npm run dev"; set another with --name)
+    logs: taba logs dev · stop: taba stop dev
+  ```
+
+  If the name is already taken in this worktree by another command or
+  another directory (two packages that both have `npm run dev`), taba
+  starts nothing, shows both commands and suggests `--name`.
+- **`taba`** on its own lists services, like `taba ps`.
+- **Several services for one project?** Declare them once in `taba.toml`
+  and start them all with `taba up` (stop them with `taba down`); see
+  [Project services](#project-services-tabatoml).
+
+### Writing the command
+
+```sh
+taba run npm run dev -- --host                    # 1. no taba options: all of it is the command
+taba run "npm run dev -- --open" --name web       # 2. a quoted command, taba options after it...
+taba run --name web "npm run dev && npm run e2e"  #    ... or before it; the shell runs it
+taba run --name web -- npm run dev -- --open      # 3. taba options, then --, then the command
+```
+
+1. **No taba options:** everything after `run` is the command, with its own
+   options and its own `--`. Above, npm gets `run dev -- --host`. An option
+   named like a taba flag still goes to the command: in
+   `taba run node server.js --port 4000 --json`, node gets both.
+2. **A quoted command** (one argument with spaces) is a command line, run by
+   the shell (`/bin/sh -c`; `cmd /C` on Windows), so `&&`, `|` and `>` work
+   as typed. taba's options may come before or after the quotes. Anything
+   else outside the quotes is refused with the fix:
+   `--open is not a taba option; if it is for your command, put it inside the quotes: taba run "npm run dev -- --open" --name web`.
+3. **taba options and an unquoted command** need `--` between them. After
+   it the command is passed on untouched; any later `--` is the command's.
+4. **Forgetting that `--`** (`taba run --name web npm run dev`) is an error
+   that shows the corrected command. In a terminal (without `--json` or
+   `TABA_AGENT`), taba asks `Run it? [Y/n]` and runs it on Enter.
+
+taba prints the command it understood (`command: ...`, with `(via sh)` for
+a quoted one) whenever it starts or finds a service. Quote only for the
+shell's sake: values with spaces, and `&&`, `|` or `>`. In fish, quote
+`'{port}'`.
+
+**Pin the port, as agents and scripts do.** The explicit form names the
+service and asks taba for a port. It adds no defaults: it waits only with
+`--wait`, and JSON output stays the same apart from a `discovered_ports`
+field:
 
 ```sh
 # Inside a git worktree, the worktree is the scope: no --scope needed.
@@ -183,7 +252,7 @@ taba run --scope login-fix --name web --port 5173 -- npm run dev -- --port {port
 scope, name, directory and port, sends stdout and stderr to a log file, and
 gives you the prompt back. The server itself runs unchanged.
 
-| | `npm run dev` | `taba run … -- npm run dev` |
+| | `npm run dev` | `taba run npm run dev` |
 | --- | --- | --- |
 | Terminal | busy until you press Ctrl-C | free again right away |
 | Close the terminal | the server stops | the server keeps running |
@@ -312,8 +381,9 @@ its parents. The scope is still yours (the git worktree, `$TABA_SCOPE` or
 `--scope`), so two worktrees of the same project get separate services from
 one file. Each service goes through `taba run` with `--wait`: `port` and
 `ready` take the same values as `--port` and `--ready`, and `service_ttl`
-the same as `--service-ttl`. `cmd` is an array, or a plain string split on
-spaces; taba runs no shell. `taba up` stops at the first service that fails
+the same as `--service-ttl`. The table's key is the service name, and `cmd`
+is an array, or a plain string split on spaces; taba runs no shell (unlike a
+quoted `taba run` command). `taba up` stops at the first service that fails
 to start or become ready, leaves the ones already started running, and lists
 what it did. `taba down` leaves services the file doesn't declare alone.
 
@@ -385,7 +455,10 @@ taba is meant for AI coding agents as much as for people:
   ```
 
   Running the same command again returns `"status": "already_running"` with
-  the same URL, so it is safe to repeat.
+  the same URL, so it is safe to repeat. Agents use this explicit form
+  (`--name`, `--`, `--json`): its output does not depend on a name derived
+  from the command or on which port the app happens to pick. The short
+  `taba run npm run dev` is for people at a terminal.
 - **Each worktree is its own scope.** Agents in separate git worktrees get
   separate scopes without configuring anything, and successive agents in one
   worktree share its services. `$TABA_SCOPE` or `--scope` still override
@@ -575,9 +648,11 @@ that. Measurements against Docker are in [docs/benchmarks.md](docs/benchmarks.md
 
 | Command | What it does |
 | --- | --- |
-| `taba run [--scope S] --name N [--port P \| auto \| auto:START] [--wait[=SECS]] [--ready CHECK] [--json] -- CMD...` | Start `CMD` detached as service `S/N`, in its own process group, with output appended to its log. `{port}` in `CMD` is replaced by the port, and `PORT` is set. |
+| `taba run CMD...` | The short form. Start `CMD` with a name taken from it (`npm run dev` → `dev`) and wait up to 30 s for the port it listens on. See [Quick start](#quick-start) and [Writing the command](#writing-the-command). |
+| `taba run [--scope S] --name N [--port P \| auto \| auto:START] [--wait[=SECS]] [--ready CHECK] [--json] -- CMD...` | Start `CMD` detached as service `S/N`, in its own process group, with output appended to its log. `{port}` in `CMD` is replaced by the port, and `PORT` is set. `discovered_ports` in the reply lists the ports its processes listen on. |
 | `taba up [NAME...] [--scope S] [--ttl DURATION] [--json]` | Start the services declared in the nearest `taba.toml` (all, or `NAME...` in that order), each like `run --wait`, reusing ones already running. Stops at the first failure and leaves started ones running. See [Project services](#project-services-tabatoml). |
 | `taba down [NAME...] [--scope S] [--timeout SECS] [--json]` | Stop your scope's services that the nearest `taba.toml` declares (all, or `NAME...`). |
+| `taba` | List services, like `taba ps`. |
 | `taba whoami [--scope S] [--json]` | Show the scope taba uses here, its source (`flag`, `env`, `git`), worktree, branch, agent and services. |
 | `taba ps [--scope S] [--running] [--json]` | List services with status `running`, `starting`, `stopping` or `exited`, plus URL and directory (`~` for your home; absolute in `--json`). `--running` hides exited ones. |
 | `taba ps --watch --json [--scope S] [--running] [--interval DURATION]` | Keep running and print the `ps --json` document as one line (NDJSON) at once and again whenever it changes, until interrupted. Read-only. See [Watching for changes](#watching-for-changes). |
@@ -867,6 +942,8 @@ On Windows:
   `"KILL"` for the two steps.
 - Programs are looked up with `PATHEXT`, so `taba run -- npm run dev` runs
   `npm.cmd`.
+- A quoted command (`taba run "npm run dev && npm run e2e"`) runs through
+  `cmd /C`, with the command line passed as typed.
 - `python3` is often only the Microsoft Store stub; use `python`.
 - Paths print as `C:\...`, with `~` for `%USERPROFILE%`, and `next`
   commands are quoted for POSIX shells (Git Bash, WSL).

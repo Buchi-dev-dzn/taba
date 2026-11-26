@@ -14,6 +14,7 @@ mod proc;
 mod project;
 mod ready;
 mod restart;
+mod runform;
 mod scope;
 mod state;
 mod ui;
@@ -29,7 +30,7 @@ use scope::{Caller, ScopeSource, check_ident};
 use serde_json::{Value, json};
 use state::{OpLock, Service, Store};
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, IsTerminal, Read, Seek, SeekFrom, Write};
 use std::process::{Command, ExitCode, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -42,13 +43,23 @@ use util::{local_timestamp, log_tail, tilde};
     about = "Start, list and stop local processes, bundled by work scope"
 )]
 struct Cli {
+    /// Without a command, taba lists services (as `taba ps`)
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Start a command detached, owned by SCOPE/NAME
+    /// Start a command detached, owned by SCOPE/NAME.
+    ///
+    /// taba run [taba flags] <command...>: taba's flags come first;
+    /// everything from the first word that is not a taba flag belongs to the
+    /// command, its own options and `--` included. In
+    /// `taba run npm run dev -- --host`, npm gets `run dev -- --host`.
+    ///
+    /// Without --name, the name comes from the command (`npm run dev` →
+    /// dev), and run waits up to 30 s for the first port the service
+    /// listens on and prints its URL.
     Run {
         /// Work scope that owns the service (default: $TABA_SCOPE, else the git worktree)
         #[arg(long)]
@@ -56,9 +67,11 @@ enum Cmd {
         /// Agent acting (default: $TABA_AGENT, else "human")
         #[arg(long)]
         agent: Option<String>,
-        /// Service name, unique within the scope
+        /// Service name, unique within the scope. Without it, the name comes
+        /// from the command: `npm|pnpm|yarn|bun run X` and `pnpm X` give X,
+        /// `flutter run -d D` gives flutter-D, anything else the program name
         #[arg(long)]
-        name: String,
+        name: Option<String>,
         /// Port: a number, `auto` (a free port in 4100-4999) or `auto:START`.
         /// taba replaces `{port}` in the command and sets PORT
         #[arg(long, value_parser = ports::parse_port_spec, value_name = "PORT|auto|auto:START")]
@@ -82,8 +95,9 @@ enum Cmd {
         /// Print one JSON document (also: TABA_OUTPUT=json)
         #[arg(long)]
         json: bool,
-        /// Command to run, after `--`
-        #[arg(last = true, required = true, value_name = "CMD")]
+        /// The command: everything from the first word that is not a taba
+        /// flag, passed on unchanged (`--` before it is optional)
+        #[arg(required = true, trailing_var_arg = true, value_name = "CMD")]
         command: Vec<String>,
     },
     /// Start the services declared in the nearest taba.toml (all, or NAME...
@@ -517,7 +531,12 @@ fn usage_error(e: &clap::Error, args: &[String]) -> TabaError {
 }
 
 fn main() -> ExitCode {
-    let cli = match Cli::try_parse() {
+    let raw: Vec<String> = std::env::args().collect();
+    let (args, shape) = match runform::prepare(raw.clone()) {
+        Ok(prepared) => prepared,
+        Err(e) => return ExitCode::from(emit(json_requested_raw(), Err(e))),
+    };
+    let cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
         Err(e) => {
             use clap::error::ErrorKind;
@@ -535,15 +554,17 @@ fn main() -> ExitCode {
         }
     };
 
-    ExitCode::from(dispatch(cli.cmd))
+    let Some(cmd) = cli.cmd else {
+        // `taba` alone lists services, as `taba ps` does.
+        let json = env_json();
+        return ExitCode::from(emit(json, cmd_ps(None, false)));
+    };
+    ExitCode::from(dispatch(cmd, shape, raw))
 }
 
-/// Runs one subcommand and returns its exit code. It is kept out of `main`
-/// so that `main`'s own frame stays small while clap parses and reports
-/// usage errors: in a debug build this frame holds the temporaries of every
-/// arm, and the main thread on Windows has a 1 MiB stack.
+/// Keep clap's large command dispatch frame out of `main` on Windows.
 #[inline(never)]
-fn dispatch(cmd: Cmd) -> u8 {
+fn dispatch(cmd: Cmd, shape: runform::Shape, raw: Vec<String>) -> u8 {
     let (json_mode, res): (bool, Result<Option<Output>>) = match cmd {
         #[cfg(windows)]
         Cmd::CtrlBreak { attach, pgid } => {
@@ -560,23 +581,33 @@ fn dispatch(cmd: Cmd) -> u8 {
             service_ttl,
             json,
             command,
-        } => (
-            json || env_json(),
-            cmd_run(RunArgs {
-                scope,
-                agent,
-                name,
-                port,
-                wait,
-                ready,
-                ttl,
-                service_ttl,
-                command,
-                cwd: None,
-                env: Vec::new(),
-            })
-            .map(Some),
-        ),
+        } => {
+            let json = json || env_json();
+            let interactive = !json
+                && std::env::var_os("TABA_AGENT").is_none_or(|a| a.is_empty())
+                && io::stdin().is_terminal()
+                && io::stderr().is_terminal();
+            (
+                json,
+                cmd_run(RunArgs {
+                    scope,
+                    agent,
+                    name,
+                    port,
+                    wait,
+                    ready,
+                    ttl,
+                    service_ttl,
+                    command,
+                    cwd: None,
+                    env: Vec::new(),
+                    shape,
+                    raw,
+                    interactive,
+                })
+                .map(Some),
+            )
+        }
         Cmd::Up {
             names,
             scope,
@@ -928,6 +959,7 @@ fn record_force(
 ///
 /// ```text
 /// started login-fix/web → http://localhost:5173
+///   command: npm run dev -- --port 5173
 ///   dir  ~/dev/app-login
 ///   logs taba logs login-fix/web
 /// ```
@@ -937,7 +969,8 @@ fn describe(verb: &str, svc: &Service) -> String {
         None => format!("{verb} {}", svc.id()),
     };
     format!(
-        "{head}\n  dir  {}\n  logs taba logs {}",
+        "{head}\n  command: {}\n  dir  {}\n  logs taba logs {}",
+        runform::display_command(svc.template()),
         tilde(&svc.cwd),
         svc.id()
     )
@@ -948,26 +981,93 @@ fn describe(verb: &str, svc: &Service) -> String {
 struct RunArgs {
     scope: Option<String>,
     agent: Option<String>,
-    name: String,
+    /// `None` for the short form: see [`runform`].
+    name: Option<String>,
     port: Option<PortSpec>,
     wait: Option<f64>,
     ready: Option<ReadySpec>,
     ttl: Option<config::Ttl>,
     service_ttl: Option<u64>,
+    /// The command as clap collected it; [`runform::command_spec`] turns it
+    /// into the argv to start.
     command: Vec<String>,
     /// Working directory (default: the caller's current directory).
     cwd: Option<std::path::PathBuf>,
     /// Extra environment variables for the command.
     env: Vec<(String, String)>,
+    shape: runform::Shape,
+    /// The original arguments, program name first (for corrections).
+    raw: Vec<String>,
+    /// A person at a terminal: a correctable command is offered to run.
+    interactive: bool,
 }
 
-fn cmd_run(a: RunArgs) -> Result<Output> {
+fn cmd_run(mut a: RunArgs) -> Result<Output> {
+    let command = std::mem::take(&mut a.command);
+    let spec = match runform::command_spec(a.shape, command.clone(), &a.raw) {
+        Ok(spec) => spec,
+        Err(e) => {
+            let fixed = e
+                .details
+                .as_ref()
+                .and_then(|d| d["corrected"].as_str())
+                .map(String::from);
+            match fixed {
+                Some(fixed) if a.interactive && confirm_corrected(&fixed) => {
+                    let shape = runform::Shape {
+                        separator: true,
+                        ..a.shape
+                    };
+                    runform::command_spec(shape, command, &a.raw)?
+                }
+                _ => return Err(e),
+            }
+        }
+    };
+    a.command = spec.template;
+    let form = runform::resolve(a.name.clone(), a.wait, a.ready.is_some(), &spec.words)?;
+    run_service(a, form)
+}
+
+/// Offers the corrected command line on the terminal; Enter or `y` runs it.
+fn confirm_corrected(fixed: &str) -> bool {
+    eprint!("taba: with taba options, put -- before the command:\n  {fixed}\nRun it? [Y/n] ");
+    let _ = io::stderr().flush();
+    let mut line = String::new();
+    io::stdin().read_line(&mut line).is_ok()
+        && matches!(line.trim().to_ascii_lowercase().as_str(), "" | "y" | "yes")
+}
+
+/// How a short-form run reports itself (see [`runform`]).
+struct Short {
+    derived: runform::Derived,
+    /// How to refer to the service in the printed hints: its name, or
+    /// SCOPE/NAME when the scope came from `--scope`.
+    label: String,
+    /// It waited for a listening port rather than a ready check.
+    port_wait: bool,
+}
+
+/// Starts (or reuses) service `form.name` of the caller's scope. `form`
+/// carries the short form's name and wait (see [`runform`]); the explicit
+/// form passes `a`'s flags through as they are.
+fn run_service(a: RunArgs, form: runform::RunForm) -> Result<Output> {
+    let name = form.name;
     let caller = scope::resolve(a.scope.clone(), a.agent.clone())?;
     let scope = caller.require_scope()?;
-    check_ident("name", &a.name)?;
+    check_ident("name", &name)?;
     let dir = a.cwd.clone().unwrap_or_else(|| caller.cwd.clone());
-    let name = a.name.clone();
-    let wait = match a.wait {
+    let short = form.derived.map(|derived| Short {
+        derived,
+        label: if caller.source == Some(ScopeSource::Flag) {
+            format!("{scope}/{name}")
+        } else {
+            name.clone()
+        },
+        port_wait: form.wait_for_port,
+    });
+    let short = short.as_ref();
+    let wait = match form.wait {
         None => None,
         Some(s) if s.is_finite() && s > 0.0 => Some(Duration::from_secs_f64(s)),
         Some(_) => {
@@ -986,8 +1086,9 @@ fn cmd_run(a: RunArgs) -> Result<Output> {
         )));
     }
     // The ready check: --ready, else tcp when there is a port. Without
-    // either, --wait keeps v0.1's "still alive after 200 ms" check.
-    let check = wait.and_then(|_| {
+    // either, --wait keeps v0.1's "still alive after 200 ms" check. The
+    // short form instead waits for any listening port.
+    let check = wait.filter(|_| !form.wait_for_port).and_then(|_| {
         a.ready
             .clone()
             .or_else(|| a.port.as_ref().map(|_| ReadySpec::Tcp))
@@ -1008,6 +1109,12 @@ fn cmd_run(a: RunArgs) -> Result<Output> {
     let lock = store.lock()?;
     store.mark_version()?;
     let existing = store.get(&scope, &name)?;
+    if let Some(short) = short
+        && let Some(ex) = &existing
+        && let Some(err) = runform::derived_name_clash(ex, &short.derived, &template, &dir)
+    {
+        return Err(err);
+    }
     let mut delegation = None;
     if a.scope.is_some()
         && a.ttl.is_none()
@@ -1052,7 +1159,7 @@ fn cmd_run(a: RunArgs) -> Result<Output> {
                 store.put(&ex)?;
             }
             drop(lock);
-            let mut out = finish_existing(ex, check, wait)?;
+            let mut out = finish_existing(&store, ex, check, wait, short)?;
             out.warnings.extend(touched.warnings);
             return Ok(out);
         }
@@ -1102,26 +1209,95 @@ fn cmd_run(a: RunArgs) -> Result<Output> {
             ),
         });
     }
-    let wait_request = wait.map(|w| state::WaitRequest {
-        ms: w.as_millis() as u64,
-        ready: a.ready.as_ref().map(ReadySpec::request),
-    });
-    let (svc, log_offset) = launch(
-        &store,
-        Launch {
-            scope: &scope,
-            name: &name,
-            template,
-            cwd: &dir,
-            env: a.env.clone(),
-            port,
-            port_request,
-            agent: &caller.agent,
-            service_ttl: a.service_ttl,
-            moves: Vec::new(),
-            wait_request,
-        },
+    let command: Vec<String> = match port {
+        Some(p) => template
+            .iter()
+            .map(|x| x.replace("{port}", &p.to_string()))
+            .collect(),
+        None => template.clone(),
+    };
+
+    let log_path = store.log_path(&scope, &name);
+    state::create_private_dir_all(log_path.parent().expect("log has parent"))?;
+    let mut log = state::private_file()
+        .append(true)
+        .open(&log_path)
+        .map_err(|e| TabaError::state(format!("cannot open log {}: {e}", log_path.display())))?;
+    writeln!(
+        log,
+        "--- taba: {} starting {:?} in {} ---",
+        local_timestamp(),
+        command,
+        dir.display()
     )?;
+    let log_offset = log.metadata()?.len();
+    let log_err = log.try_clone()?;
+
+    let mut cmd = Command::new(proc::resolve_program(&command[0]));
+    #[cfg(windows)]
+    if let Some(line) = runform::shell_line(&command) {
+        // cmd.exe parses its own command line: pass the line as typed.
+        use std::os::windows::process::CommandExt;
+        cmd.arg("/C").raw_arg(line);
+    } else {
+        cmd.args(&command[1..]);
+    }
+    #[cfg(not(windows))]
+    cmd.args(&command[1..]);
+    cmd.current_dir(&dir)
+        .envs(a.env.iter().map(|(k, v)| (k, v)))
+        .env("TABA_SCOPE", &scope)
+        .env("TABA_SERVICE", &name)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err));
+    if let Some(p) = port {
+        cmd.env("PORT", p.to_string());
+    }
+    let start_failed = |message: String| {
+        TabaError::new("E_START_FAILED", message)
+            .details(json!({
+                "service": id, "log_path": log_path, "log_tail": log_tail(&log_path, 20),
+            }))
+            .next(Next::run("read the log", format!("taba logs {id}")))
+    };
+    // Detached: its own session / process group (Unix) or console and job
+    // (Windows), so closing the launching terminal does not stop it.
+    let spawned = proc::spawn_detached(cmd).map_err(|e| match e {
+        proc::SpawnError::Start(e) => start_failed(format!("cannot start {:?}: {e}", command[0])),
+        proc::SpawnError::Vanished => {
+            start_failed(format!("{id} exited immediately; see taba logs {id}"))
+        }
+    })?;
+    let pid = spawned.pid;
+    let mut svc = Service {
+        scope: scope.clone(),
+        name: name.clone(),
+        command,
+        cwd: dir.clone(),
+        port,
+        pid,
+        pgid: spawned.pgid,
+        start_time: spawned.start_time,
+        log_path: log_path.clone(),
+        command_template: Some(template),
+        port_request,
+        instance: Some(format!("{pid}-{}", spawned.start_time)),
+        started_by: Some(caller.agent.clone()),
+        ready: None,
+        service_ttl_secs: a.service_ttl,
+        service_expires_at: a
+            .service_ttl
+            .map(|t| util::rfc3339(util::now_secs().saturating_add(t))),
+        moves: Vec::new(),
+        stop_requested_at: None,
+        wait_request: wait.map(|w| state::WaitRequest {
+            ms: w.as_millis() as u64,
+            ready: a.ready.as_ref().map(ReadySpec::request),
+        }),
+        env: a.env,
+        discovered_ports: Vec::new(),
+    };
     store.put(&svc)?;
     if let Some(borrow) = &delegation {
         borrows::rebind(&store, borrow, &svc)?;
@@ -1130,30 +1306,88 @@ fn cmd_run(a: RunArgs) -> Result<Output> {
     store.put_op(&scope, &name, &OpLock::mine(op, &caller.agent))?;
     // The port is reserved by the record now; wait without the global lock.
     drop(lock);
-    let (svc, outcome) = await_ready(&store, svc, check.as_ref(), wait, log_offset)?;
-    run_result(svc, "started", check.as_ref(), wait, outcome, warnings)
+
+    let outcome = match (&check, wait) {
+        (_, Some(w)) if short.is_some_and(|s| s.port_wait) => ready::wait_for_port(&mut svc, w),
+        (Some(c), Some(w)) => ready::wait(&svc, c, w, log_offset),
+        _ => {
+            thread::sleep(Duration::from_millis(200));
+            if svc.is_running() {
+                Outcome::Ready { ms: 200 }
+            } else {
+                Outcome::Exited
+            }
+        }
+    };
+
+    if matches!(outcome, Outcome::Ready { .. }) && svc.discovered_ports.is_empty() {
+        svc.discovered_ports = ready::discover_ports(&svc);
+    }
+
+    {
+        let _lock = store.lock()?;
+        if let Outcome::Ready { .. } = &outcome {
+            let check_name = match &check {
+                Some(c) => Some(c.name()),
+                None if short.is_some_and(|s| s.port_wait) => Some("port"),
+                None => None,
+            };
+            if let Some(check) = check_name {
+                svc.ready = Some(state::Ready {
+                    check: check.to_string(),
+                    ready_at: util::now_micros(),
+                });
+            }
+        }
+        if svc.ready.is_some() || !svc.discovered_ports.is_empty() {
+            save_if_current(&store, &svc)?;
+        }
+        store.release_op(&scope, &name)?;
+    }
+    run_result(
+        svc,
+        "started",
+        check.as_ref(),
+        wait,
+        outcome,
+        warnings,
+        short,
+    )
 }
 
-/// What `launch` starts: the recorded settings of one service instance.
-struct Launch<'a> {
-    scope: &'a str,
-    name: &'a str,
-    template: Vec<String>,
-    cwd: &'a std::path::Path,
-    /// Extra environment variables (`taba.toml` `env`).
-    env: Vec<(String, String)>,
-    port: Option<u16>,
-    port_request: Option<String>,
-    agent: &'a str,
-    service_ttl: Option<u64>,
-    moves: Vec<Value>,
-    wait_request: Option<state::WaitRequest>,
+/// Writes `svc` back, but only if the record still describes this
+/// instance. Call under the global lock.
+fn save_if_current(store: &Store, svc: &Service) -> Result<()> {
+    if store
+        .get(&svc.scope, &svc.name)?
+        .is_some_and(|cur| cur.instance() == svc.instance())
+    {
+        store.put(svc)?;
+    }
+    Ok(())
 }
 
-/// Starts one instance detached, logging to its log file, and returns its
-/// record (not yet stored) and the log offset where its output begins.
-/// Shared by `run` and `restart`. Call under the global lock.
-fn launch(store: &Store, l: Launch) -> Result<(Service, u64)> {
+/// Recorded launch settings used by `restart`. Keeping this separate from
+/// `run`'s short-form handling ensures a restart is always the recorded,
+/// explicit service operation.
+pub(crate) struct RestartLaunch<'a> {
+    pub scope: &'a str,
+    pub name: &'a str,
+    pub template: Vec<String>,
+    pub cwd: &'a std::path::Path,
+    pub env: Vec<(String, String)>,
+    pub port: Option<u16>,
+    pub port_request: Option<String>,
+    pub agent: &'a str,
+    pub service_ttl: Option<u64>,
+    pub moves: Vec<Value>,
+    pub wait_request: Option<state::WaitRequest>,
+}
+
+/// Starts a replacement from its private recorded settings. Call under the
+/// state lock; environment values are deliberately never written to logs or
+/// emitted as JSON.
+pub(crate) fn restart_launch(store: &Store, l: RestartLaunch) -> Result<(Service, u64)> {
     let id = format!("{}/{}", l.scope, l.name);
     let command: Vec<String> = match l.port {
         Some(p) => l
@@ -1178,28 +1412,33 @@ fn launch(store: &Store, l: Launch) -> Result<(Service, u64)> {
     )?;
     let log_offset = log.metadata()?.len();
     let log_err = log.try_clone()?;
-
     let mut cmd = Command::new(proc::resolve_program(&command[0]));
-    cmd.args(&command[1..])
-        .current_dir(l.cwd)
+    #[cfg(windows)]
+    if let Some(line) = runform::shell_line(&command) {
+        use std::os::windows::process::CommandExt;
+        cmd.arg("/C").raw_arg(line);
+    } else {
+        cmd.args(&command[1..]);
+    }
+    #[cfg(not(windows))]
+    cmd.args(&command[1..]);
+    cmd.current_dir(l.cwd)
         .envs(l.env.iter().map(|(k, v)| (k, v)))
         .env("TABA_SCOPE", l.scope)
         .env("TABA_SERVICE", l.name)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));
-    if let Some(p) = l.port {
-        cmd.env("PORT", p.to_string());
+    if let Some(port) = l.port {
+        cmd.env("PORT", port.to_string());
     }
     let start_failed = |message: String| {
         TabaError::new("E_START_FAILED", message)
-            .details(json!({
-                "service": id, "log_path": log_path, "log_tail": log_tail(&log_path, 20),
-            }))
+            .details(
+                json!({ "service": id, "log_path": log_path, "log_tail": log_tail(&log_path, 20) }),
+            )
             .next(Next::run("read the log", format!("taba logs {id}")))
     };
-    // Detached: its own session / process group (Unix) or console and job
-    // (Windows), so closing the launching terminal does not stop it.
     let spawned = proc::spawn_detached(cmd).map_err(|e| match e {
         proc::SpawnError::Start(e) => start_failed(format!("cannot start {:?}: {e}", command[0])),
         proc::SpawnError::Vanished => {
@@ -1207,36 +1446,39 @@ fn launch(store: &Store, l: Launch) -> Result<(Service, u64)> {
         }
     })?;
     let pid = spawned.pid;
-    let svc = Service {
-        scope: l.scope.to_string(),
-        name: l.name.to_string(),
-        command,
-        cwd: l.cwd.to_path_buf(),
-        port: l.port,
-        pid,
-        pgid: spawned.pgid,
-        start_time: spawned.start_time,
-        log_path: log_path.clone(),
-        command_template: Some(l.template),
-        port_request: l.port_request,
-        instance: Some(format!("{pid}-{}", spawned.start_time)),
-        started_by: Some(l.agent.to_string()),
-        ready: None,
-        service_ttl_secs: l.service_ttl,
-        service_expires_at: l
-            .service_ttl
-            .map(|t| util::rfc3339(util::now_secs().saturating_add(t))),
-        moves: l.moves,
-        stop_requested_at: None,
-        wait_request: l.wait_request,
-        env: l.env,
-    };
-    Ok((svc, log_offset))
+    Ok((
+        Service {
+            scope: l.scope.to_string(),
+            name: l.name.to_string(),
+            command,
+            cwd: l.cwd.to_path_buf(),
+            port: l.port,
+            pid,
+            pgid: spawned.pgid,
+            start_time: spawned.start_time,
+            log_path,
+            command_template: Some(l.template),
+            port_request: l.port_request,
+            instance: Some(format!("{pid}-{}", spawned.start_time)),
+            started_by: Some(l.agent.to_string()),
+            ready: None,
+            service_ttl_secs: l.service_ttl,
+            service_expires_at: l
+                .service_ttl
+                .map(|t| util::rfc3339(util::now_secs().saturating_add(t))),
+            moves: l.moves,
+            stop_requested_at: None,
+            wait_request: l.wait_request,
+            env: l.env,
+            discovered_ports: Vec::new(),
+        },
+        log_offset,
+    ))
 }
 
-/// Waits for a just-launched instance (without the global lock), records
-/// a passed ready check and releases the operation lock.
-fn await_ready(
+/// Completes a restart without short-form run behaviour, recording readiness
+/// and discovered ports before releasing the operation lock.
+pub(crate) fn restart_await_ready(
     store: &Store,
     mut svc: Service,
     check: Option<&ReadySpec>,
@@ -1254,20 +1496,17 @@ fn await_ready(
             }
         }
     };
+    if matches!(outcome, Outcome::Ready { .. }) {
+        svc.discovered_ports = ready::discover_ports(&svc);
+    }
     let _lock = store.lock()?;
-    if let (Outcome::Ready { .. }, Some(c)) = (&outcome, check) {
+    if let (Outcome::Ready { .. }, Some(check)) = (&outcome, check) {
         svc.ready = Some(state::Ready {
-            check: c.name().to_string(),
+            check: check.name().to_string(),
             ready_at: util::now_micros(),
         });
-        // Only update the record if it still describes this instance.
-        if store
-            .get(&svc.scope, &svc.name)?
-            .is_some_and(|cur| cur.instance() == svc.instance())
-        {
-            store.put(&svc)?;
-        }
     }
+    save_if_current(store, &svc)?;
     store.release_op(&svc.scope, &svc.name)?;
     Ok((svc, outcome))
 }
@@ -1275,14 +1514,25 @@ fn await_ready(
 /// `run` found the same service already running: report it, after the
 /// ready check when --wait was given.
 fn finish_existing(
-    svc: Service,
+    store: &Store,
+    mut svc: Service,
     check: Option<ReadySpec>,
     wait: Option<Duration>,
+    short: Option<&Short>,
 ) -> Result<Output> {
     let outcome = match (&check, wait) {
+        (_, Some(w)) if short.is_some_and(|s| s.port_wait) => ready::wait_for_port(&mut svc, w),
         (Some(c), Some(w)) => ready::wait(&svc, c, w, 0),
         _ => Outcome::Ready { ms: 0 },
     };
+    if matches!(outcome, Outcome::Ready { .. }) {
+        let ports = ready::discover_ports(&svc);
+        if !ports.is_empty() && ports != svc.discovered_ports {
+            svc.discovered_ports = ports;
+            let _lock = store.lock()?;
+            save_if_current(store, &svc)?;
+        }
+    }
     run_result(
         svc,
         "already_running",
@@ -1290,6 +1540,49 @@ fn finish_existing(
         wait,
         outcome,
         Vec::new(),
+        short,
+    )
+}
+
+/// The text a short-form `run` prints:
+///
+/// ```text
+/// started dev → http://localhost:5173
+///   command: npm run dev
+///   name "dev" (from "npm run dev"; set another with --name)
+///   logs: taba logs dev · stop: taba stop dev
+/// ```
+fn short_text(svc: &Service, started: bool, short: &Short) -> String {
+    let label = &short.label;
+    let mut head = if started {
+        format!("started {label}")
+    } else {
+        format!("already running: {label}")
+    };
+    match svc.url() {
+        Some(url) => {
+            head.push_str(&format!(" → {url}"));
+            let shown = svc.port.or_else(|| svc.discovered_ports.first().copied());
+            let others: Vec<String> = svc
+                .discovered_ports
+                .iter()
+                .filter(|p| Some(**p) != shown)
+                .map(u16::to_string)
+                .collect();
+            if !others.is_empty() {
+                head.push_str(&format!(" (also listening on {})", others.join(", ")));
+            }
+        }
+        None if short.port_wait => {
+            head.push_str(&format!(", running, no port yet (see: taba logs {label})"));
+        }
+        None => {}
+    }
+    format!(
+        "{head}\n  command: {}\n  name {:?} (from {:?}; set another with --name)\n  logs: taba logs {label} · stop: taba stop {label}",
+        runform::display_command(svc.template()),
+        svc.name,
+        short.derived.source_text(),
     )
 }
 
@@ -1300,11 +1593,23 @@ fn run_result(
     wait: Option<Duration>,
     outcome: Outcome,
     warnings: Vec<Warning>,
+    short: Option<&Short>,
 ) -> Result<Output> {
     let id = svc.id();
+    let port_wait = short.is_some_and(|s| s.port_wait);
+    // The short form's port wait ends without an error when no port showed
+    // up in time: the service runs, it has no port yet.
+    let (outcome, port_found) = match outcome {
+        Outcome::TimedOut { ms } if port_wait => (Outcome::Ready { ms }, false),
+        o => (o, port_wait),
+    };
     match outcome {
         Outcome::Ready { ms } => {
-            let ready = check.map(|c| json!({ "check": c.name(), "ms": ms }));
+            let ready = match check {
+                Some(c) => Some(json!({ "check": c.name(), "ms": ms })),
+                None if port_found => Some(json!({ "check": "port", "ms": ms })),
+                None => None,
+            };
             let body = json!({
                 "status": status,
                 "service": id,
@@ -1317,10 +1622,17 @@ fn run_result(
                 "pid": svc.pid,
                 "directory": svc.cwd,
                 "log_path": svc.log_path,
+                "discovered_ports": svc.discovered_ports,
             });
+            if let Some(short) = short {
+                let mut out = Output::new(body, short_text(&svc, status == "started", short));
+                out.warnings = warnings;
+                return Ok(out);
+            }
             let verb = match status {
-                "already_running" => "already running",
-                other => other,
+                "started" => "started",
+                "restarted" => "restarted",
+                _ => "already running",
             };
             let mut text = describe(verb, &svc);
             if let Some(c) = check {
@@ -1384,10 +1696,12 @@ fn cmd_up(
     let mut warnings = Vec::new();
     let mut failure = None;
     for (i, def) in selected.iter().enumerate() {
-        let res = cmd_run(RunArgs {
+        // taba.toml gives an explicit name and an argv, so the `run`
+        // command-line rules (see [`runform`]) do not apply.
+        let args = RunArgs {
             scope: scope_flag.clone(),
             agent: agent.clone(),
-            name: def.name.clone(),
+            name: Some(def.name.clone()),
             port: def.port.clone(),
             wait: Some(def.wait),
             ready: def.ready.clone(),
@@ -1396,7 +1710,17 @@ fn cmd_up(
             command: def.command.clone(),
             cwd: Some(def.cwd.clone()),
             env: def.env.clone(),
-        });
+            shape: runform::Shape::default(),
+            raw: Vec::new(),
+            interactive: false,
+        };
+        let form = runform::resolve(
+            args.name.clone(),
+            args.wait,
+            args.ready.is_some(),
+            &args.command,
+        )?;
+        let res = run_service(args, form);
         match res {
             Ok(out) => {
                 results.push(Value::Object(out.body));
@@ -1622,6 +1946,7 @@ pub(crate) fn ps_snapshot(
             "status": status,
             "url": s.url(),
             "port": s.port,
+            "discovered_ports": s.discovered_ports,
             "directory": s.cwd,
             "command": s.command,
             "pid": s.pid,
@@ -2314,6 +2639,40 @@ mod cli_tests {
         walk(&Cli::command(), "taba", &mut missing);
         assert!(missing.is_empty(), "arguments without help: {missing:?}");
     }
+
+    /// `runform::prepare` reads `run`'s raw arguments itself; its flag
+    /// lists must match the clap definition.
+    #[test]
+    fn runform_knows_every_run_flag() {
+        let cli = Cli::command();
+        let run = cli.find_subcommand("run").unwrap();
+        let mut values = Vec::new();
+        let mut switches = vec!["--help".to_string(), "-h".to_string()];
+        for a in run.get_arguments() {
+            let Some(long) = a.get_long() else { continue };
+            let takes_value = a.get_action().takes_values();
+            let equals_only = a.is_require_equals_set();
+            if takes_value && !equals_only {
+                values.push(format!("--{long}"));
+            } else if long != "help" {
+                switches.push(format!("--{long}"));
+            }
+        }
+        values.sort();
+        switches.sort();
+        let mut known_values: Vec<String> = runform::RUN_VALUE_FLAGS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut known_switches: Vec<String> = runform::RUN_SWITCHES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        known_values.sort();
+        known_switches.sort();
+        assert_eq!(values, known_values);
+        assert_eq!(switches, known_switches);
+    }
 }
 
 /// `taba stop` with a fake process layer: signal failures are deterministic
@@ -2364,6 +2723,7 @@ mod stop_tests {
                 stop_requested_at: None,
                 wait_request: None,
                 env: Vec::new(),
+                discovered_ports: Vec::new(),
             })
             .unwrap();
     }

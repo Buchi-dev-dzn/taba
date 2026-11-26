@@ -239,9 +239,9 @@ fn restart_one(
                 _ => Some(ports::pick_auto(store, first, last, s, n)?),
             },
         };
-        let (svc, log_offset) = crate::launch(
+        let (svc, log_offset) = crate::restart_launch(
             store,
-            crate::Launch {
+            crate::RestartLaunch {
                 scope: s,
                 name: n,
                 template,
@@ -281,8 +281,16 @@ fn restart_one(
     }
 
     // 4. Wait for it (without the global lock) and report as `run` does.
-    let (svc, outcome) = crate::await_ready(store, svc, check.as_ref(), wait, log_offset)?;
-    let mut out = crate::run_result(svc, "restarted", check.as_ref(), wait, outcome, warnings)?;
+    let (svc, outcome) = crate::restart_await_ready(store, svc, check.as_ref(), wait, log_offset)?;
+    let mut out = crate::run_result(
+        svc,
+        "restarted",
+        check.as_ref(),
+        wait,
+        outcome,
+        warnings,
+        None,
+    )?;
     out.body.insert(
         "previous".into(),
         json!({

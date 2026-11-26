@@ -145,10 +145,15 @@ pub struct Service {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_request: Option<WaitRequest>,
     /// Extra environment variables the command was started with (from
-    /// `taba.toml`), so that `restart` sets them again. Kept in the private
-    /// record only; `ps` does not print them.
+    /// `taba.toml`). These private state values are neither printed nor
+    /// included in command JSON envelopes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env: Vec<(String, String)>,
+    /// TCP ports the service's processes were found listening on when `run`
+    /// reported it (ascending). The URL falls back to the first one when the
+    /// service has no `--port`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discovered_ports: Vec<u16>,
 }
 
 /// `run --wait[=SECS] [--ready SPEC]` as given.
@@ -209,8 +214,11 @@ impl Service {
         format!("{}/{}", self.scope, self.name)
     }
 
+    /// `--port`'s port, else the first discovered one.
     pub fn url(&self) -> Option<String> {
-        self.port.map(|p| format!("http://localhost:{p}"))
+        self.port
+            .or_else(|| self.discovered_ports.first().copied())
+            .map(|p| format!("http://localhost:{p}"))
     }
 
     pub fn is_running(&self) -> bool {
