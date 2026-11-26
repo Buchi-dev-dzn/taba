@@ -139,6 +139,7 @@ pub fn cmd_ps_all() -> Result<Output> {
         out.warnings.push(Warning {
             code: "W_NO_LSOF",
             message: "lsof is not available, so no listeners could be listed".into(),
+            details: None,
         });
     }
     Ok(out)

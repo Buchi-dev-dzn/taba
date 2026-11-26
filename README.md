@@ -734,10 +734,16 @@ Successful JSON replies can also carry non-fatal `warnings`; agents should
 record and act on them rather than treating a successful exit as proof that
 ownership or a borrow is unchanged. `W_TOOK_OVER` means the caller adopted
 an expired scope lease, while `W_HANDED_OVER` records a service transfer to a
-claimant or borrower. `W_BORROW_BROKEN` says a borrow became dangling;
-`W_BRANCH_CHANGED` says the worktree branch changed; `W_FORCED` records an
-audited override; `W_OWNER_GONE` says a lease holder's PID ended; and
-`W_NOTICE` is another hand-off or lease notice. `W_PORT_NOT_IN_COMMAND`
+claimant or borrower. `W_SAME_SCOPE_BORROW` says a shared borrow is in the
+service's own scope and does not prevent owner stop or replacement; borrow
+from a different scope when you need that protection. Its JSON `details`
+identify the `borrow` and `service`. `W_BORROW_BROKEN` says a borrow became
+dangling and identifies the borrow ID, service, and a shell-quoted
+`taba release ID` cleanup command, also exposed as `details.borrow`,
+`details.service`, and `details.release_command`. Other warnings retain their
+existing fields; `details` is optional. `W_BRANCH_CHANGED` says the worktree
+branch changed; `W_FORCED` records an audited override; `W_OWNER_GONE` says a
+lease holder's PID ended; and `W_NOTICE` is another hand-off or lease notice. `W_PORT_NOT_IN_COMMAND`
 warns that the app may ignore the supplied port, `W_NO_LSOF` means macOS port
 listing is unavailable, and `W_STATE_SKIPPED` names unreadable state that a
 listing omitted.
@@ -829,9 +835,16 @@ borrow ends, and other borrows follow the same instance to its new name.
 Use `taba borrow S/N` to record that your scope uses another scope's service.
 The reply identifies the instance and its URL. `taba borrow --check ID`
 checks that same instance; `taba release ID` ends the borrow. A borrow ends
-when its own TTL or the borrower's lease ends. The owner cannot stop a
-borrowed service without an audited force override, which makes the borrow
-dangling.
+when its own TTL or the borrower's lease ends. A live borrow from a different
+scope prevents the owner from stopping or replacing the service without an
+audited force override, which makes the borrow dangling. A **shared borrow
+from the service's own scope does not prevent owner stop or replacement**;
+it succeeds with `W_SAME_SCOPE_BORROW` in human and JSON output. Borrow from
+the consuming scope if you need stop protection; same-scope borrows do not
+change ownership or access permissions. A dangling borrow remains until
+released or expired; `W_BORROW_BROKEN` identifies each borrow and the
+`taba release ID` command to clean it up without deleting anything
+automatically.
 
 Use `taba borrow --mut S/N -- COMMAND` for exclusive maintenance. The child
 gets `TABA_BORROWED_URL`; the lock is released when the command exits and

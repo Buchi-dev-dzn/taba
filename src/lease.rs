@@ -63,6 +63,8 @@ pub struct LeaseRec {
 pub struct Notice {
     pub code: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -377,6 +379,7 @@ pub fn touch(
                         services.join(", ")
                     }
                 ),
+                details: None,
             });
         }
     } else if access != Access::Observe && access != Access::Peek {
@@ -391,6 +394,7 @@ pub fn touch(
             out.warnings.push(Warning {
                 code: "W_BRANCH_CHANGED",
                 message: format!("the worktree's branch changed from {old} to {b}"),
+                details: None,
             });
             rec.branch = Some(b.clone());
             changed = true;
@@ -400,6 +404,7 @@ pub fn touch(
                 out.warnings.push(Warning {
                     code: notice_code(&n.code),
                     message: n.message,
+                    details: n.details,
                 });
             }
             changed = true;
@@ -424,11 +429,33 @@ fn notice_code(c: &str) -> &'static str {
 
 /// Queues a warning for the next call in `scope` (if it has a record).
 pub fn notify(store: &Store, scope: &str, code: &str, message: String) -> Result<()> {
-    if let Some(mut rec) = store.get_scope(scope)? {
-        rec.notices.push(Notice {
-            code: code.to_string(),
+    queue_notice(
+        store,
+        scope,
+        Notice {
+            code: code.into(),
             message,
-        });
+            details: None,
+        },
+    )
+}
+
+/// Queues structured warning details as well as the human-readable message.
+pub fn notify_warning(store: &Store, scope: &str, warning: Warning) -> Result<()> {
+    queue_notice(
+        store,
+        scope,
+        Notice {
+            code: warning.code.into(),
+            message: warning.message,
+            details: warning.details,
+        },
+    )
+}
+
+fn queue_notice(store: &Store, scope: &str, notice: Notice) -> Result<()> {
+    if let Some(mut rec) = store.get_scope(scope)? {
+        rec.notices.push(notice);
         store.put_scope(&rec)?;
     }
     Ok(())
@@ -585,6 +612,14 @@ mod tests {
     use super::*;
 
     const T0: u64 = 1_800_000_000;
+
+    #[test]
+    fn notices_without_details_remain_readable_and_unchanged() {
+        let old = json!({"code":"W_BORROW_BROKEN","message":"owner/db is no longer available"});
+        let notice: Notice = serde_json::from_value(old.clone()).unwrap();
+        assert!(notice.details.is_none());
+        assert_eq!(serde_json::to_value(notice).unwrap(), old);
+    }
 
     /// A record whose holder has no recorded pid, so its state depends only
     /// on the injected `now` and the lease fields.
