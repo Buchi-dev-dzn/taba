@@ -267,6 +267,47 @@ taba rm --scope billing
 The screenshots show real output from `scripts/readme-screenshots.sh`, which
 runs `python3 -m http.server` sample services under a throwaway `TABA_HOME`.
 
+## Project services (`taba.toml`)
+
+A project that needs several services can declare them once in an optional
+`taba.toml` at its root, instead of typing several `taba run` commands:
+
+```toml
+[services.api]
+cmd = ["uvicorn", "app:app", "--port", "{port}"]
+port = "auto"
+ready = "http:/health"
+
+[services.web]
+cmd = ["npm", "run", "dev", "--", "--port", "{port}", "--strictPort"]
+port = "auto"
+cwd = "frontend"                  # relative to taba.toml
+env = { NODE_ENV = "development" }
+wait = 60                         # seconds for the ready check (default 30)
+```
+
+```sh
+taba up            # start every service, in file order, and wait for each
+taba up web        # just web; already running services are reused
+taba down          # stop this scope's services declared in the file
+```
+
+`taba up` and `taba down` look for `taba.toml` in the current directory and
+its parents. The scope is still yours (the git worktree, `$TABA_SCOPE` or
+`--scope`), so two worktrees of the same project get separate services from
+one file. Each service goes through `taba run` with `--wait`: `port` and
+`ready` take the same values as `--port` and `--ready`, `service_ttl`
+the same as `--service-ttl`, and `interactive = true` / `false` is `-i` /
+`--no-interactive` (unset: `flutter run` and `vite` are
+[interactive](#interactive-dev-servers-flutter-vite)). `cmd` is an array, or a plain string split on
+spaces; taba runs no shell. `taba up` stops at the first service that fails
+to start or become ready, leaves the ones already started running, and lists
+what it did. `taba down` leaves services the file doesn't declare alone.
+
+taba.toml only lists what to start. There is no restart on crash, health
+monitoring or dependency graph; see
+[docs/design-project-file.md](docs/design-project-file.md).
+
 ## Terminal UI
 
 `taba ui` shows every scope and its services in one live view, and lets you
@@ -583,6 +624,8 @@ that. Measurements against Docker are in [docs/benchmarks.md](docs/benchmarks.md
 | Command | What it does |
 | --- | --- |
 | `taba run [--scope S] --name N [--port P \| auto \| auto:START] [--wait[=SECS]] [--ready CHECK] [-i \| --no-interactive] [--json] -- CMD...` | Start `CMD` detached as service `S/N`, in its own process group, with output appended to its log. `{port}` in `CMD` is replaced by the port, and `PORT` is set. `-i` makes it [interactive](#interactive-dev-servers-flutter-vite) (default for `flutter run` and `vite`). |
+| `taba up [NAME...] [--scope S] [--ttl DURATION] [--json]` | Start the services declared in the nearest `taba.toml` (all, or `NAME...` in that order), each like `run --wait`, reusing ones already running. Stops at the first failure and leaves started ones running. See [Project services](#project-services-tabatoml). |
+| `taba down [NAME...] [--scope S] [--timeout SECS] [--json]` | Stop your scope's services that the nearest `taba.toml` declares (all, or `NAME...`). |
 | `taba whoami [--scope S] [--json]` | Show the scope taba uses here, its source (`flag`, `env`, `git`), worktree, branch, agent and services. |
 | `taba ps [--scope S] [--running] [--json]` | List services with status `running`, `starting`, `stopping` or `exited`, plus URL and directory (`~` for your home; absolute in `--json`). `--running` hides exited ones. |
 | `taba ps --watch --json [--scope S] [--running] [--interval DURATION]` | Keep running and print the `ps --json` document as one line (NDJSON) at once and again whenever it changes, until interrupted. Read-only. See [Watching for changes](#watching-for-changes). |
@@ -658,9 +701,10 @@ single quotes). The exit status follows the code:
 | `E_START_FAILED` | 4 | The process exited before it was ready; `details.log_tail` has its last lines. |
 | `E_NOT_READY` | 4 | `--wait` timed out; the process is still running. |
 | `E_NOT_FOUND` | 5 | No such service, scope record, or borrow. List current state and use a current target. |
+| `E_NO_PROJECT` | 5 | `taba up` or `taba down` found no `taba.toml` in the current directory or its parents. |
 | `E_DANGLING` | 5 | A borrow no longer points at its recorded live instance. Borrow again and use the new reply. |
 | `E_BORROW_COMMAND` | 1 | The command run under `borrow --mut` exited unsuccessfully; inspect `exit_code` and its output. |
-| `E_CONFIG` | 1 | A `config.toml` field, `TABA_TTL`, or `TABA_LOCK_TIMEOUT` is invalid or unreadable; `details` identifies the source. |
+| `E_CONFIG` | 1 | A `config.toml` field, a `taba.toml` entry (`details.source` is `project`), `TABA_TTL`, or `TABA_LOCK_TIMEOUT` is invalid or unreadable; `details` identifies the source. |
 | `E_STATE` | 1 | State is unreadable, unavailable, damaged, or out of space. Read `details.path` and `next`; listings may instead emit `W_STATE_SKIPPED`. |
 | `E_INPUT_BLOCKED` | 1 | The service did not read its input for 5 s; some bytes were not written. |
 | `E_UNSUPPORTED` | 1 | Not available on this platform yet: interactive services and `signal` on Windows ([#79](https://github.com/Buchi-dev-dzn/taba/issues/79)). |
