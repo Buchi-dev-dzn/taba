@@ -1197,6 +1197,7 @@ fn run_service(a: RunArgs, form: runform::RunForm) -> Result<Output> {
                 "the command has no {{port}}; taba only set PORT={}, which the app may ignore",
                 port.unwrap_or(0)
             ),
+            details: None,
         });
     }
     let command: Vec<String> = match port {
