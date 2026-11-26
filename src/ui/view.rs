@@ -492,8 +492,9 @@ fn footer(app: &App) -> Line<'static> {
         ]),
         Mode::Logs => Line::raw(" ↑↓ PgUp PgDn scroll   End follow   Esc back   q quit"),
         Mode::Normal => Line::raw(format!(
-            " ↑↓ move   ←→ / space collapse·expand   x {}   l logs   / filter   q quit",
-            app.x_label()
+            " ↑↓ move   ←→ / space collapse·expand   x {}   l logs{}   / filter   q quit",
+            app.x_label(),
+            if app.can_attach() { "   i input" } else { "" }
         )),
     }
 }

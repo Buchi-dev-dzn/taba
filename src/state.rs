@@ -6,6 +6,7 @@
 //! services/<scope>/<name>.json   service records (v0.1 fields + optional v0.2 fields)
 //! logs/<scope>/<name>.log         service output
 //! ops/<scope>/<name>.json         in-flight mutation of one service (operation lock)
+//! inputs/<scope>/<name>.fifo      stdin of a service started with `run --interactive` (Unix)
 //! events.jsonl                    append-only audit log
 //! version                         state schema version
 //! lock                            global lock (flock / LockFileEx)
@@ -140,6 +141,10 @@ pub struct Service {
     /// seconds); a later cleanup forces it once `stop_timeout` has passed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_requested_at: Option<u64>,
+    /// `run --interactive`: the FIFO that is this instance's stdin (Unix). The
+    /// service holds it open for reading and writing, so it never sees EOF.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -448,6 +453,14 @@ impl Store {
             .join(format!("{name}.log"))
     }
 
+    /// The FIFO used as stdin by a service started with `run --interactive`.
+    pub fn input_path(&self, scope: &str, name: &str) -> PathBuf {
+        self.root
+            .join("inputs")
+            .join(scope)
+            .join(format!("{name}.fifo"))
+    }
+
     fn op_path(&self, scope: &str, name: &str) -> PathBuf {
         self.root
             .join("ops")
@@ -624,6 +637,16 @@ impl Store {
         if let Some(dir) = old_log.parent() {
             let _ = fs::remove_dir(dir);
         }
+        // The service keeps its open FIFO; only the name writers use moves.
+        let old_input = self.input_path(from_scope, &svc.name);
+        if old_input.symlink_metadata().is_ok() {
+            let new_input = self.input_path(&svc.scope, &svc.name);
+            create_private_dir_all(new_input.parent().expect("input has parent"))?;
+            fs::rename(&old_input, &new_input)?;
+            if let Some(dir) = old_input.parent() {
+                let _ = fs::remove_dir(dir);
+            }
+        }
         let old_claims = self.claims_path(from_scope, &svc.name);
         if old_claims.exists() {
             let new_claims = self.claims_path(&svc.scope, &svc.name);
@@ -683,6 +706,7 @@ impl Store {
             self.record_path(scope, name),
             self.op_path(scope, name),
             self.claims_path(scope, name),
+            self.input_path(scope, name),
         ] {
             remove_file_and_empty_parent(&path)?;
         }
@@ -701,6 +725,7 @@ impl Store {
             self.log_path(scope, name),
             self.op_path(scope, name),
             self.claims_path(scope, name),
+            self.input_path(scope, name),
         ] {
             remove_file_and_empty_parent(&path)?;
         }

@@ -145,7 +145,7 @@ pub fn borrowed(svc: &Service, bs: &[Borrow]) -> TabaError {
         format!("taba move {} --to {}", svc.id(), scopes[0]),
     ))
 }
-fn locked(svc: &Service, b: &Borrow) -> TabaError {
+pub(crate) fn locked(svc: &Service, b: &Borrow) -> TabaError {
     TabaError::new("E_LOCKED",format!("{} is locked by {}",svc.id(),b.scope)).details(json!({"service":svc.id(),"scope":b.scope,"holder":b.holder.agent,"expires_at":b.expires_at})).next(Next::just("retry later or use --wait-lock SECS"))
 }
 pub fn authorise(

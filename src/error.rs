@@ -161,7 +161,7 @@ pub fn exit_code(code: &str) -> u8 {
     match code {
         "E_USAGE" | "E_NO_SCOPE" | "E_INVALID_IDENT" | "E_FORCE_NEEDS_REASON" => 2,
         "E_NOT_OWNER" | "E_SCOPE_HELD" | "E_LEASE_LIVE" | "E_LOCKED" | "E_BUSY" | "E_BORROWED"
-        | "E_NO_CLAIMANT" | "E_CONFLICT" | "E_STILL_RUNNING" => 3,
+        | "E_NO_CLAIMANT" | "E_CONFLICT" | "E_STILL_RUNNING" | "E_NO_INPUT" | "E_NOT_RUNNING" => 3,
         "E_PORT_IN_USE" | "E_PORT_CLAIMED" | "E_NO_FREE_PORT" | "E_START_FAILED"
         | "E_NOT_READY" => 4,
         "E_NOT_FOUND" | "E_DANGLING" => 5,

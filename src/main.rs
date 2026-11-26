@@ -7,6 +7,7 @@ mod error;
 mod gc;
 mod handoff;
 mod hooks;
+mod input;
 mod lease;
 mod listing;
 mod ports;
@@ -77,12 +78,89 @@ enum Cmd {
         /// already_running re-run), independent of the lease
         #[arg(long, value_parser = config::parse_service_ttl_flag)]
         service_ttl: Option<u64>,
+        /// Interactive: give the service a stdin that stays open, for
+        /// `taba send` and `taba attach` (e.g. `r` for a Flutter hot reload;
+        /// Unix only)
+        #[arg(short = 'i', long = "interactive")]
+        input: bool,
         /// Print one JSON document (also: TABA_OUTPUT=json)
         #[arg(long)]
         json: bool,
         /// Command to run, after `--`
         #[arg(last = true, required = true, value_name = "CMD")]
         command: Vec<String>,
+    },
+    /// Write a line (or one key) to the stdin of a service started with --interactive
+    Send {
+        /// SCOPE/NAME, or NAME in the caller's scope
+        target: String,
+        /// Text to write; a newline is added unless --no-newline
+        #[arg(required_unless_present = "key", conflicts_with = "key")]
+        text: Option<String>,
+        /// Write one key without a newline: a character such as r, or enter,
+        /// esc, tab, space, backspace, ctrl-X
+        #[arg(long, value_parser = input::parse_key, value_name = "KEY")]
+        key: Option<input::Key>,
+        /// Do not add a newline after TEXT
+        #[arg(long, conflicts_with = "key")]
+        no_newline: bool,
+        /// The caller's scope (default: $TABA_SCOPE, else the git worktree)
+        #[arg(long)]
+        scope: Option<String>,
+        /// Agent acting (default: $TABA_AGENT, else "human")
+        #[arg(long)]
+        agent: Option<String>,
+        /// Write to a service of another scope (needs --reason; recorded)
+        #[arg(long)]
+        force: bool,
+        /// Why --force is needed (recorded in events.jsonl)
+        #[arg(long, requires = "force")]
+        reason: Option<String>,
+        /// Print one JSON document (also: TABA_OUTPUT=json)
+        #[arg(long)]
+        json: bool,
+    },
+    /// Follow a service's log and type into its stdin (--interactive services);
+    /// Ctrl+] detaches and the service keeps running
+    Attach {
+        /// SCOPE/NAME, or NAME in the caller's scope
+        target: String,
+        /// The caller's scope (default: $TABA_SCOPE, else the git worktree)
+        #[arg(long)]
+        scope: Option<String>,
+        /// Agent acting (default: $TABA_AGENT, else "human")
+        #[arg(long)]
+        agent: Option<String>,
+        /// Attach to a service of another scope (needs --reason; recorded)
+        #[arg(long)]
+        force: bool,
+        /// Why --force is needed (recorded in events.jsonl)
+        #[arg(long, requires = "force")]
+        reason: Option<String>,
+    },
+    /// Send SIGUSR1, SIGUSR2 or SIGHUP to a service's main process (Unix;
+    /// `flutter run` hot-reloads on USR1 and hot-restarts on USR2)
+    Signal {
+        /// SCOPE/NAME, or NAME in the caller's scope
+        target: String,
+        /// USR1, USR2 or HUP
+        #[arg(value_enum, ignore_case = true)]
+        signal: input::Signal,
+        /// The caller's scope (default: $TABA_SCOPE, else the git worktree)
+        #[arg(long)]
+        scope: Option<String>,
+        /// Agent acting (default: $TABA_AGENT, else "human")
+        #[arg(long)]
+        agent: Option<String>,
+        /// Signal a service of another scope (needs --reason; recorded)
+        #[arg(long)]
+        force: bool,
+        /// Why --force is needed (recorded in events.jsonl)
+        #[arg(long, requires = "force")]
+        reason: Option<String>,
+        /// Print one JSON document (also: TABA_OUTPUT=json)
+        #[arg(long)]
+        json: bool,
     },
     /// Show the caller's scope, where it came from, and its services
     Whoami {
@@ -505,6 +583,7 @@ fn main() -> ExitCode {
             ready,
             ttl,
             service_ttl,
+            input,
             json,
             command,
         } => (
@@ -518,7 +597,68 @@ fn main() -> ExitCode {
                 ready,
                 ttl,
                 service_ttl,
+                input,
                 command,
+            })
+            .map(Some),
+        ),
+        Cmd::Send {
+            target,
+            text,
+            key,
+            no_newline,
+            scope,
+            agent,
+            force,
+            reason,
+            json,
+        } => (
+            json || env_json(),
+            input::cmd_send(input::SendArgs {
+                target,
+                text,
+                key,
+                no_newline,
+                scope,
+                agent,
+                force,
+                reason,
+            })
+            .map(Some),
+        ),
+        Cmd::Attach {
+            target,
+            scope,
+            agent,
+            force,
+            reason,
+        } => (
+            env_json(),
+            input::cmd_attach(input::AttachArgs {
+                target,
+                scope,
+                agent,
+                force,
+                reason,
+            }),
+        ),
+        Cmd::Signal {
+            target,
+            signal,
+            scope,
+            agent,
+            force,
+            reason,
+            json,
+        } => (
+            json || env_json(),
+            input::cmd_signal(input::SignalArgs {
+                target,
+                signal,
+                scope,
+                agent,
+                force,
+                reason,
             })
             .map(Some),
         ),
@@ -879,6 +1019,7 @@ struct RunArgs {
     ready: Option<ReadySpec>,
     ttl: Option<config::Ttl>,
     service_ttl: Option<u64>,
+    input: bool,
     command: Vec<String>,
 }
 
@@ -896,6 +1037,11 @@ fn cmd_run(a: RunArgs) -> Result<Output> {
             ));
         }
     };
+    if a.input && cfg!(windows) {
+        return Err(input::unsupported("run --interactive").next(Next::just(
+            "start it without --interactive; Windows support is tracked in the taba issues",
+        )));
+    }
     if let Some(r) = &a.ready
         && r.needs_port()
         && a.port.is_none()
@@ -964,6 +1110,7 @@ fn cmd_run(a: RunArgs) -> Result<Output> {
         if ex.template() == template.as_slice()
             && ex.cwd == caller.cwd
             && ex.port_request() == port_request
+            && ex.input.is_some() == a.input
         {
             let mut ex = ex.clone();
             if let Some(ttl) = a.service_ttl.or(ex.service_ttl_secs) {
@@ -979,17 +1126,19 @@ fn cmd_run(a: RunArgs) -> Result<Output> {
         return Err(TabaError::new(
             "E_CONFLICT",
             format!(
-                "{} is already running with a different command, directory or port \
-                 (command {:?}, dir {}, port {}); stop it first",
+                "{} is already running with a different command, directory, port or \
+                 --interactive (command {:?}, dir {}, port {}, input {}); stop it first",
                 ex.id(),
                 ex.template(),
                 tilde(&ex.cwd),
                 ex.port_request().unwrap_or_else(|| "-".into()),
+                ex.input.is_some(),
             ),
         )
         .details(json!({
             "service": ex.id(), "command": ex.template(), "directory": ex.cwd,
             "port": ex.port, "port_request": ex.port_request(), "instance": ex.instance(),
+            "input": ex.input.is_some(),
         }))
         .next(Next::run(
             "stop it, then run again",
@@ -1046,12 +1195,22 @@ fn cmd_run(a: RunArgs) -> Result<Output> {
     let log_offset = log.metadata()?.len();
     let log_err = log.try_clone()?;
 
+    let fifo = if a.input {
+        Some(input::create(&store, &scope, &name)?)
+    } else {
+        None
+    };
+    let input_path = fifo.as_ref().map(|f| f.path.clone());
+    let stdin = match &fifo {
+        Some(f) => Stdio::from(f.stdin.try_clone()?),
+        None => Stdio::null(),
+    };
     let mut cmd = Command::new(proc::resolve_program(&command[0]));
     cmd.args(&command[1..])
         .current_dir(&caller.cwd)
         .env("TABA_SCOPE", &scope)
         .env("TABA_SERVICE", &name)
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));
     if let Some(p) = port {
@@ -1066,7 +1225,10 @@ fn cmd_run(a: RunArgs) -> Result<Output> {
     };
     // Detached: its own session / process group (Unix) or console and job
     // (Windows), so closing the launching terminal does not stop it.
-    let spawned = proc::spawn_detached(cmd).map_err(|e| match e {
+    let spawned = proc::spawn_detached(cmd);
+    // The child holds its own copies of the FIFO now.
+    drop(fifo);
+    let spawned = spawned.map_err(|e| match e {
         proc::SpawnError::Start(e) => start_failed(format!("cannot start {:?}: {e}", command[0])),
         proc::SpawnError::Vanished => {
             start_failed(format!("{id} exited immediately; see taba logs {id}"))
@@ -1094,6 +1256,7 @@ fn cmd_run(a: RunArgs) -> Result<Output> {
             .map(|t| util::rfc3339(util::now_secs().saturating_add(t))),
         moves: Vec::new(),
         stop_requested_at: None,
+        input: input_path,
     };
     store.put(&svc)?;
     if let Some(borrow) = &delegation {
@@ -1379,6 +1542,7 @@ pub(crate) fn ps_snapshot(
             "claims": claims::rows(store, &queue)?,
             "borrows": { "shared": borrows.iter().filter(|b| !b.exclusive).count(), "exclusive": usize::from(exclusive.is_some()) },
             "locked_by": exclusive.map(|b| &b.scope),
+            "input": s.input.is_some(),
         }));
         borrowers.push(borrows.iter().map(|b| b.scope.clone()).collect());
     }
@@ -2102,6 +2266,7 @@ mod stop_tests {
                 service_expires_at: None,
                 moves: Vec::new(),
                 stop_requested_at: None,
+                input: None,
             })
             .unwrap();
     }
