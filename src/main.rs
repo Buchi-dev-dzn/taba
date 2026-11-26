@@ -1293,7 +1293,11 @@ fn run_service(a: RunArgs, form: runform::RunForm) -> Result<Output> {
         stop_requested_at: None,
         wait_request: wait.map(|w| state::WaitRequest {
             ms: w.as_millis() as u64,
-            ready: a.ready.as_ref().map(ReadySpec::request),
+            ready: a.ready.as_ref().map(ReadySpec::request).or_else(|| {
+                short
+                    .is_some_and(|s| s.port_wait)
+                    .then(|| ReadySpec::Port.request())
+            }),
         }),
         env: a.env,
         discovered_ports: Vec::new(),
@@ -1476,7 +1480,7 @@ pub(crate) fn restart_launch(store: &Store, l: RestartLaunch) -> Result<(Service
     ))
 }
 
-/// Completes a restart without short-form run behaviour, recording readiness
+/// Completes a restart with its recorded ready check, recording readiness
 /// and discovered ports before releasing the operation lock.
 pub(crate) fn restart_await_ready(
     store: &Store,
@@ -1486,6 +1490,7 @@ pub(crate) fn restart_await_ready(
     log_offset: u64,
 ) -> Result<(Service, Outcome)> {
     let outcome = match (check, wait) {
+        (Some(ReadySpec::Port), Some(w)) => ready::wait_for_port(&mut svc, w),
         (Some(c), Some(w)) => ready::wait(&svc, c, w, log_offset),
         _ => {
             thread::sleep(Duration::from_millis(200));
@@ -1496,7 +1501,7 @@ pub(crate) fn restart_await_ready(
             }
         }
     };
-    if matches!(outcome, Outcome::Ready { .. }) {
+    if matches!(outcome, Outcome::Ready { .. }) && svc.discovered_ports.is_empty() {
         svc.discovered_ports = ready::discover_ports(&svc);
     }
     let _lock = store.lock()?;
@@ -1596,7 +1601,7 @@ fn run_result(
     short: Option<&Short>,
 ) -> Result<Output> {
     let id = svc.id();
-    let port_wait = short.is_some_and(|s| s.port_wait);
+    let port_wait = short.is_some_and(|s| s.port_wait) || matches!(check, Some(ReadySpec::Port));
     // The short form's port wait ends without an error when no port showed
     // up in time: the service runs, it has no port yet.
     let (outcome, port_found) = match outcome {
@@ -1606,6 +1611,7 @@ fn run_result(
     match outcome {
         Outcome::Ready { ms } => {
             let ready = match check {
+                Some(ReadySpec::Port) if !port_found => None,
                 Some(c) => Some(json!({ "check": c.name(), "ms": ms })),
                 None if port_found => Some(json!({ "check": "port", "ms": ms })),
                 None => None,
@@ -1635,7 +1641,9 @@ fn run_result(
                 _ => "already running",
             };
             let mut text = describe(verb, &svc);
-            if let Some(c) = check {
+            if let Some(c) = check
+                && (!matches!(c, ReadySpec::Port) || port_found)
+            {
                 text.push_str(&format!("\n  ready {} check passed in {ms} ms", c.name()));
             }
             let mut out = Output::new(body, text);

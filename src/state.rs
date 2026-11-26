@@ -161,7 +161,8 @@ pub struct Service {
 pub struct WaitRequest {
     /// The `--wait` timeout in milliseconds.
     pub ms: u64,
-    /// `--ready` as given (`tcp`, `http:PATH`, `log:REGEX`), if any.
+    /// `--ready` as given (`tcp`, `http:PATH`, `log:REGEX`), or `port`
+    /// for the short form's discovered-listener wait.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ready: Option<String>,
 }

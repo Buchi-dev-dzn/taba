@@ -60,6 +60,90 @@ fn restart_keeps_the_url_and_starts_a_new_instance() {
 }
 
 #[test]
+fn restart_waits_for_a_short_runs_delayed_discovered_port() {
+    let f = Fixture::new("restart_discovered_port");
+    // No --name or --port: the short run must discover a listener. On
+    // restart, the new listener is deliberately absent at the 200ms alive
+    // check, so returning early deterministically loses the URL.
+    let script = "import http.server, time\n\
+                  time.sleep(1)\n\
+                  server = http.server.HTTPServer(('127.0.0.1', 0), http.server.SimpleHTTPRequestHandler)\n\
+                  server.serve_forever()\n";
+    let (code, started) = call(&f, &f.wt_a, &["run", "--wait=10", "--", PY, "-c", script]);
+    assert_eq!(code, 0, "{started}");
+    assert_eq!(started["ready"]["check"], "port", "{started}");
+    assert!(started["url"].is_string(), "{started}");
+    let name = started["name"].as_str().unwrap();
+    let record_path = f
+        .home()
+        .join("services")
+        .join(format!("{}.json", started["service"].as_str().unwrap()));
+    // Exercise migration of the older short-run representation too.
+    let mut record: Value = serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+    record["wait_request"]
+        .as_object_mut()
+        .unwrap()
+        .remove("ready");
+    std::fs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
+
+    // Repeating this also checks that the discovery wait survives another
+    // generation, rather than being inferred only from the initial run.
+    for _ in 0..2 {
+        let (code, restarted) = call(&f, &f.wt_a, &["restart", name]);
+        assert_eq!(code, 0, "{restarted}");
+        assert_eq!(restarted["ready"]["check"], "port", "{restarted}");
+        assert!(
+            restarted["ready"]["ms"].as_u64().unwrap() >= 500,
+            "{restarted}"
+        );
+        assert!(
+            restarted["port"].is_null(),
+            "not a managed port: {restarted}"
+        );
+        let ports = restarted["discovered_ports"].as_array().unwrap();
+        assert_eq!(ports.len(), 1, "{restarted}");
+        let port = ports[0].as_u64().unwrap() as u16;
+        assert_eq!(restarted["url"], format!("http://localhost:{port}"));
+        assert!(http_ok(port), "{restarted}");
+        let ps = f.ps(&[]);
+        assert_eq!(ps[0]["discovered_ports"], restarted["discovered_ports"]);
+        assert_eq!(ps[0]["url"], restarted["url"]);
+        let record: Value = serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+        assert_eq!(record["ready"]["check"], "port");
+        assert_eq!(record["wait_request"]["ready"], "port");
+    }
+}
+
+#[test]
+fn restart_preserves_discovery_after_an_initial_port_wait_timeout() {
+    let f = Fixture::new("restart_discovery_timeout");
+    let script = "import http.server, time\n\
+                  time.sleep(1)\n\
+                  http.server.HTTPServer(('127.0.0.1', 0), http.server.SimpleHTTPRequestHandler).serve_forever()\n";
+    let (code, started) = call(&f, &f.wt_a, &["run", "--wait=0.05", "--", PY, "-c", script]);
+    assert_eq!(code, 0, "{started}");
+    assert!(started["ready"].is_null(), "{started}");
+    assert!(started["url"].is_null(), "{started}");
+    let name = started["name"].as_str().unwrap();
+
+    // A discovery timeout remains advisory on restart, as on run.
+    let (code, timed_out) = call(&f, &f.wt_a, &["restart", name]);
+    assert_eq!(code, 0, "{timed_out}");
+    assert!(timed_out["ready"].is_null(), "{timed_out}");
+    assert!(timed_out["url"].is_null(), "{timed_out}");
+    assert!(timed_out["discovered_ports"].as_array().unwrap().is_empty());
+
+    // No successful ready.check existed to infer discovery from: the
+    // recorded request itself must preserve the wait across restarts.
+    let (code, restarted) = call(&f, &f.wt_a, &["restart", name, "--wait=10"]);
+    assert_eq!(code, 0, "{restarted}");
+    assert_eq!(restarted["ready"]["check"], "port", "{restarted}");
+    assert!(restarted["url"].is_string(), "{restarted}");
+    let port = restarted["discovered_ports"][0].as_u64().unwrap() as u16;
+    assert!(http_ok(port));
+}
+
+#[test]
 fn restart_refuses_non_owners_like_stop() {
     let f = Fixture::new("restart_owner");
     let (_, web) = call(&f, &f.wt_a, &run_auto("web"));

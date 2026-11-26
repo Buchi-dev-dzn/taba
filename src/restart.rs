@@ -100,9 +100,14 @@ fn wait_settings(
     let wait = wait_flag.or_else(|| recorded.map(|w| Duration::from_millis(w.ms)));
     let ready = match ready_flag {
         Some(r) => Some(r),
-        None => recorded
-            .and_then(|w| w.ready.as_deref())
-            .and_then(|r| ready::parse_ready_spec(r).ok()),
+        None => match recorded.and_then(|w| w.ready.as_deref()) {
+            Some("port") => Some(ReadySpec::Port),
+            Some(r) => ready::parse_ready_spec(r).ok(),
+            // Older short-run records did not save the discovery check in
+            // wait_request, but a successful wait recorded ready.check.
+            None if old.ready.as_ref().is_some_and(|r| r.check == "port") => Some(ReadySpec::Port),
+            None => None,
+        },
     };
     if let Some(r) = &ready
         && r.needs_port()
@@ -195,6 +200,22 @@ fn restart_one(
     } else {
         "not_running"
     };
+    // stop_group bounds its post-kill wait, so a successful signal does
+    // not guarantee exit. Never detach borrows or overwrite the only
+    // record of a group that is still running.
+    if ops.is_running(&old) {
+        return Err(release(
+            TabaError::new(
+                "E_SIGNAL_FAILED",
+                format!(
+                    "{}: process group {} is still running after stop; it was not restarted",
+                    old.id(),
+                    old.pgid
+                ),
+            )
+            .details(json!({ "service": old.id(), "pgid": old.pgid })),
+        ));
+    }
     if let Some(p) = old.port {
         // A just-stopped server can take a moment to release its port.
         let deadline = Instant::now() + PORT_RELEASE_WAIT;
@@ -239,6 +260,15 @@ fn restart_one(
                 _ => Some(ports::pick_auto(store, first, last, s, n)?),
             },
         };
+        let mut wait_request = old.wait_request.clone();
+        if let Some(w) = &mut wait_request
+            && w.ready.is_none()
+            && old.ready.as_ref().is_some_and(|r| r.check == "port")
+        {
+            // Upgrade legacy short-run requests before ready is reset, so
+            // even a discovery timeout on this restart keeps the next wait.
+            w.ready = Some(ReadySpec::Port.request());
+        }
         let (svc, log_offset) = crate::restart_launch(
             store,
             crate::RestartLaunch {
@@ -252,7 +282,7 @@ fn restart_one(
                 agent: &caller.agent,
                 service_ttl: old.service_ttl_secs,
                 moves: old.moves.clone(),
-                wait_request: old.wait_request.clone(),
+                wait_request,
             },
         )?;
         store.put(&svc)?;
@@ -363,6 +393,128 @@ mod tests {
         let (check, _) =
             wait_settings(&svc(Some(4100), None), Some(Duration::from_secs(1)), None).unwrap();
         assert!(matches!(check, Some(ReadySpec::Tcp)));
+    }
+
+    #[test]
+    fn wait_settings_preserve_discovery_without_changing_explicit_portless_runs() {
+        let mut old = svc(
+            None,
+            Some(WaitRequest {
+                ms: 3000,
+                ready: Some("port".into()),
+            }),
+        );
+        let (check, wait) = wait_settings(&old, None, None).unwrap();
+        assert!(matches!(check, Some(ReadySpec::Port)));
+        assert_eq!(wait, Some(Duration::from_secs(3)));
+
+        // Legacy short-run records saved only the successful ready check.
+        old.wait_request.as_mut().unwrap().ready = None;
+        old.ready = Some(crate::state::Ready {
+            check: "port".into(),
+            ready_at: 1,
+        });
+        assert!(matches!(
+            wait_settings(&old, None, None).unwrap().0,
+            Some(ReadySpec::Port)
+        ));
+        let (check, wait) = wait_settings(
+            &old,
+            Some(Duration::from_secs(1)),
+            Some(ready::parse_ready_spec("log:up").unwrap()),
+        )
+        .unwrap();
+        assert!(matches!(check, Some(ReadySpec::Log(_))));
+        assert_eq!(wait, Some(Duration::from_secs(1)));
+
+        // An explicit no-port run with --wait never requested discovery.
+        old.ready = None;
+        assert!(wait_settings(&old, None, None).unwrap().0.is_none());
+    }
+
+    #[test]
+    fn a_stop_that_leaves_the_group_running_preserves_record_and_borrows() {
+        struct StillRunning(bool);
+        impl proc::Ops for StillRunning {
+            fn is_running(&self, _: &Service) -> bool {
+                true
+            }
+            fn stop_group(&self, _: &Service, _: Duration) -> std::io::Result<proc::StopResult> {
+                Ok(if self.0 {
+                    proc::StopResult::Killed
+                } else {
+                    proc::StopResult::Terminated
+                })
+            }
+        }
+
+        for killed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::at(dir.path().to_path_buf());
+            let old = svc(None, None);
+            store.put(&old).unwrap();
+            let caller = scope::Caller {
+                scope: Some("borrower".into()),
+                source: None,
+                worktree: None,
+                branch: None,
+                agent: "human".into(),
+                agent_pid: None,
+                cwd: dir.path().to_path_buf(),
+            };
+            let cfg = config::Config::load(store.root()).unwrap();
+            let touched = lease::touch(
+                &store,
+                &cfg,
+                &caller,
+                "borrower",
+                lease::Access::Create,
+                None,
+            )
+            .unwrap();
+            let borrow = borrows::Borrow {
+                id: "shared".into(),
+                service: old.id(),
+                instance: old.instance(),
+                scope: "borrower".into(),
+                holder: touched.record.unwrap().holder,
+                exclusive: false,
+                expires_at: None,
+                process: None,
+                broken: false,
+            };
+            let path = store.root().join("borrows/shared.json");
+            crate::state::write_json(&path, &borrow).unwrap();
+            let before = serde_json::to_value(&old).unwrap();
+            let borrow_before = std::fs::read(&path).unwrap();
+
+            let err = restart_one(
+                &StillRunning(killed),
+                &store,
+                &caller,
+                "s1",
+                "web",
+                Duration::ZERO,
+                None,
+                None,
+                Some("test stuck group"),
+            )
+            .err()
+            .expect("a live old group must prevent replacement");
+            assert_eq!(err.code, "E_SIGNAL_FAILED");
+            assert!(err.message.contains("still running"), "{}", err.message);
+            assert_eq!(
+                serde_json::to_value(store.get("s1", "web").unwrap().unwrap()).unwrap(),
+                before
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), borrow_before);
+            assert_eq!(borrows::live(&store, &old).unwrap().len(), 1);
+            assert!(store.live_op("s1", "web").unwrap().is_none());
+            assert!(
+                !store.log_path("s1", "web").exists(),
+                "must not launch a replacement"
+            );
+        }
     }
 
     #[test]

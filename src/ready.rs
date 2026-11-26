@@ -10,6 +10,9 @@ use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 pub enum ReadySpec {
+    /// Internal short-run check: discover a listener without an assigned port.
+    /// Recorded for restart, but not accepted by the `--ready` parser.
+    Port,
     Tcp,
     Http(String),
     Log(Regex),
@@ -18,15 +21,17 @@ pub enum ReadySpec {
 impl ReadySpec {
     pub fn name(&self) -> &'static str {
         match self {
+            ReadySpec::Port => "port",
             ReadySpec::Tcp => "tcp",
             ReadySpec::Http(_) => "http",
             ReadySpec::Log(_) => "log",
         }
     }
 
-    /// The spec as `--ready` takes it, for the service record.
+    /// The recorded check (`--ready` syntax, or the internal `port` check).
     pub fn request(&self) -> String {
         match self {
+            ReadySpec::Port => "port".into(),
             ReadySpec::Tcp => "tcp".into(),
             ReadySpec::Http(path) => format!("http:{path}"),
             ReadySpec::Log(re) => format!("log:{}", re.as_str()),
@@ -34,7 +39,7 @@ impl ReadySpec {
     }
 
     pub fn needs_port(&self) -> bool {
-        !matches!(self, ReadySpec::Log(_))
+        matches!(self, ReadySpec::Tcp | ReadySpec::Http(_))
     }
 }
 
@@ -77,6 +82,7 @@ pub fn wait(svc: &Service, check: &ReadySpec, timeout: Duration, log_offset: u64
             return Outcome::Exited;
         }
         let ok = match check {
+            ReadySpec::Port => !discover_ports(svc).is_empty(),
             ReadySpec::Tcp => svc.port.is_some_and(tcp_ready),
             ReadySpec::Http(path) => svc.port.is_some_and(|p| http_ready(p, path)),
             ReadySpec::Log(re) => log_matches(svc, re, log_offset),
@@ -208,5 +214,9 @@ mod tests {
         assert!(parse_ready_spec("http:health").is_err());
         assert!(parse_ready_spec("log:(").is_err());
         assert!(parse_ready_spec("udp").is_err());
+        assert!(
+            parse_ready_spec("port").is_err(),
+            "discovery stays internal"
+        );
     }
 }
