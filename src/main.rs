@@ -1058,7 +1058,7 @@ fn cmd_run(mut a: RunArgs) -> Result<Output> {
     };
     let mut out = run_service(a, form)?;
     if let Some(plan) = plan {
-        project::write_save(&plan)?;
+        let plan = project::write_save(&plan)?;
         let shown = project::render(
             &plan.def,
             plan.path.parent().unwrap_or(std::path::Path::new(".")),
@@ -1296,6 +1296,12 @@ fn run_service(a: RunArgs, form: runform::RunForm) -> Result<Output> {
     #[cfg(not(windows))]
     cmd.args(&command[1..]);
     cmd.current_dir(&dir)
+        // Caller identity and output preferences belong to the invoking
+        // agent, not nested taba calls made by the service. Explicit --env
+        // (or project env) remains a deliberate override.
+        .env_remove("TABA_AGENT")
+        .env_remove("TABA_AGENT_PID")
+        .env_remove("TABA_OUTPUT")
         .envs(a.env.iter().map(|(k, v)| (k, v)))
         .env("TABA_SCOPE", &scope)
         .env("TABA_SERVICE", &name)

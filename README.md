@@ -390,7 +390,13 @@ printing the value. `--save` writes the definition to the nearest
 `taba.toml` (or the worktree root); it refuses a different existing definition
 unless `--force`, and `taba up api` then starts it the same way. Saved env
 values must be written to `taba.toml` in plain text, so taba warns and secrets
-should not be saved or committed.
+should not be saved or committed. On Unix, new files are owner-only and updates
+keep the existing file's permissions. Saves serialize through a persistent
+`taba.toml.taba-lock` sibling and recheck the latest definition before writing.
+
+Services do not inherit the caller's `TABA_AGENT`, `TABA_AGENT_PID` or
+`TABA_OUTPUT`. You can deliberately set them with `--env` or project `env`;
+`PORT`, `TABA_SCOPE` and `TABA_SERVICE` remain reserved.
 
 ## Terminal UI
 

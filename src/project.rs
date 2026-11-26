@@ -328,6 +328,7 @@ pub fn ready_text(r: &ReadySpec) -> String {
 
 /// What `run --save` asks to write. `wait`, `ready` and `service_ttl` are
 /// `None` when the run did not give them: the file's value is kept.
+#[derive(Clone)]
 pub struct SaveRequest {
     pub name: String,
     pub command: Vec<String>,
@@ -342,7 +343,8 @@ pub struct SaveRequest {
 /// A checked `run --save`, written by `write_save` once the run succeeded.
 pub struct SavePlan {
     pub path: PathBuf,
-    pub exists: bool,
+    request: SaveRequest,
+    force: bool,
     pub def: ServiceDef,
     /// `created` (new file), `added`, `updated` or `unchanged`.
     pub result: &'static str,
@@ -392,6 +394,7 @@ pub fn plan_save(path: PathBuf, req: SaveRequest, force: bool) -> Result<SavePla
         None
     };
     let old = existing.as_ref().and_then(|e| e.as_ref());
+    let request = req.clone();
     let def = ServiceDef {
         name: req.name,
         command: req.command,
@@ -429,7 +432,8 @@ pub fn plan_save(path: PathBuf, req: SaveRequest, force: bool) -> Result<SavePla
         Some(_) => "updated",
     };
     Ok(SavePlan {
-        exists: existing.is_some(),
+        request,
+        force,
         path,
         def,
         result,
@@ -505,19 +509,33 @@ pub fn render(def: &ServiceDef, dir: &Path, hide_values: bool) -> String {
 }
 
 /// Writes a checked plan, keeping the rest of the file (comments included).
-pub fn write_save(plan: &SavePlan) -> Result<()> {
-    if plan.result == "unchanged" {
-        return Ok(());
-    }
+pub fn write_save(plan: &SavePlan) -> Result<SavePlan> {
+    use std::io::Write;
+
     let path = &plan.path;
     let io_err = |e: std::io::Error| {
         TabaError::new("E_CONFIG", format!("cannot write {}: {e}", path.display()))
             .details(json!({ "source": "project", "path": path }))
     };
-    let text = if plan.exists {
-        std::fs::read_to_string(path).map_err(io_err)?
-    } else {
-        String::new()
+    // Lock a stable sibling, not the config inode (which rename replaces).
+    // Keep the lock file: unlinking it would let concurrent writers lock
+    // different inodes. This also serializes callers with different TABA_HOME.
+    let lock = crate::state::private_file()
+        .write(true)
+        .truncate(false)
+        .open(path.with_extension("toml.taba-lock"))
+        .map_err(io_err)?;
+    lock.lock().map_err(io_err)?;
+    // A service can take time to start. Recheck conflicts and inherited
+    // defaults against the latest file, even for a formerly unchanged plan.
+    let plan = plan_save(path.clone(), plan.request.clone(), plan.force)?;
+    if plan.result == "unchanged" {
+        return Ok(plan);
+    }
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(io_err(e)),
     };
     let mut doc: toml_edit::DocumentMut = text
         .parse()
@@ -547,17 +565,141 @@ pub fn write_save(plan: &SavePlan) -> Result<()> {
         table.set_position(old.position().unwrap_or(0));
     }
     services.insert(&plan.def.name, toml_edit::Item::Table(table));
-    let tmp = path.with_extension("toml.taba-tmp");
-    std::fs::write(&tmp, doc.to_string()).map_err(io_err)?;
-    std::fs::rename(&tmp, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        io_err(e)
-    })
+    // NamedTempFile uses exclusive creation and owner-only Unix permissions;
+    // never truncate a predictable path that could be a preexisting symlink.
+    let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(io_err)?;
+    match std::fs::metadata(path) {
+        Ok(meta) => tmp
+            .as_file()
+            .set_permissions(meta.permissions())
+            .map_err(io_err)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(io_err(e)),
+    }
+    tmp.write_all(doc.to_string().as_bytes()).map_err(io_err)?;
+    tmp.as_file().sync_all().map_err(io_err)?;
+    tmp.persist(path).map_err(|e| io_err(e.error))?;
+    Ok(plan)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn request(dir: &Path, name: &str) -> SaveRequest {
+        SaveRequest {
+            name: name.into(),
+            command: vec!["true".into()],
+            port: None,
+            ready: None,
+            wait: None,
+            env: vec![("TOKEN".into(), "dummy-save-secret".into())],
+            cwd: crate::util::canonicalize(dir).unwrap(),
+            service_ttl: None,
+        }
+    }
+
+    #[test]
+    fn stale_new_file_plans_merge_and_report_latest_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        let a = plan_save(path.clone(), request(dir.path(), "a"), false).unwrap();
+        let b = plan_save(path.clone(), request(dir.path(), "b"), false).unwrap();
+        assert_eq!(write_save(&a).unwrap().result, "created");
+        assert_eq!(write_save(&b).unwrap().result, "added");
+        let text = std::fs::read_to_string(path).unwrap();
+        assert_eq!(p(&text).unwrap().services.len(), 2);
+    }
+
+    #[test]
+    fn concurrent_saves_preserve_every_service() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        let plans: Vec<_> = (0..8)
+            .map(|i| {
+                plan_save(path.clone(), request(dir.path(), &format!("svc{i}")), false).unwrap()
+            })
+            .collect();
+        let barrier = std::sync::Barrier::new(plans.len());
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = plans
+                .iter()
+                .map(|plan| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        write_save(plan).unwrap();
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
+        let text = std::fs::read_to_string(path).unwrap();
+        assert_eq!(p(&text).unwrap().services.len(), plans.len());
+    }
+
+    #[test]
+    fn save_rechecks_conflicts_invalid_files_and_unchanged_plans() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        let initial = plan_save(path.clone(), request(dir.path(), "a"), false).unwrap();
+        write_save(&initial).unwrap();
+        let unchanged = plan_save(path.clone(), request(dir.path(), "a"), false).unwrap();
+        assert_eq!(unchanged.result, "unchanged");
+        std::fs::write(&path, "[services.a]\ncmd = [\"different\"]\n").unwrap();
+        assert_eq!(write_save(&unchanged).err().unwrap().code, "E_CONFLICT");
+        assert_eq!(write_save(&initial).err().unwrap().code, "E_CONFLICT");
+        std::fs::write(&path, "[services.a]\ncmd = 123\n").unwrap();
+        assert_eq!(write_save(&initial).err().unwrap().code, "E_CONFIG");
+    }
+
+    #[test]
+    fn save_keeps_latest_omitted_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        let plan = plan_save(path.clone(), request(dir.path(), "a"), true).unwrap();
+        std::fs::write(&path, "[services.a]\ncmd = [\"true\"]\nwait = 99\nready = \"log:ready\"\nservice_ttl = \"1h\"\n").unwrap();
+        let saved = write_save(&plan).unwrap();
+        assert_eq!(saved.def.wait, 99.0);
+        assert_eq!(saved.def.service_ttl, Some(3600));
+        assert_eq!(
+            saved.def.ready.as_ref().map(ready_text).as_deref(),
+            Some("log:ready")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_creates_private_file_preserves_mode_and_ignores_predictable_temp() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        let victim = dir.path().join("untouched");
+        std::fs::write(&victim, "do not overwrite").unwrap();
+        symlink(&victim, path.with_extension("toml.taba-tmp")).unwrap();
+        let plan = plan_save(path.clone(), request(dir.path(), "a"), false).unwrap();
+        write_save(&plan).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let plan = plan_save(path.clone(), request(dir.path(), "b"), false).unwrap();
+        write_save(&plan).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let plan = plan_save(path.clone(), request(dir.path(), "c"), false).unwrap();
+        write_save(&plan).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(std::fs::read_to_string(victim).unwrap(), "do not overwrite");
+    }
 
     fn p(text: &str) -> Result<Project> {
         let dir = std::env::temp_dir();

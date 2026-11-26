@@ -89,6 +89,140 @@ fn run_args<'a>(
 }
 
 #[test]
+fn correction_diagnostics_do_not_echo_env_values() {
+    let f = Fixture::new("env_corrections");
+    let token = format!("API_TOKEN={SECRET}");
+    let inline = format!("--env={token}");
+    for env in [vec!["--env", token.as_str()], vec![inline.as_str()]] {
+        for quoted in [false, true] {
+            let mut args = vec!["run", "--name", "web"];
+            args.extend_from_slice(&env);
+            if quoted {
+                args.extend_from_slice(&["npm run dev", "--open"]);
+            } else {
+                args.extend_from_slice(&["npm", "run", "dev"]);
+            }
+            let (code, v) = call(&f, &f.wt_a, &args);
+            assert_eq!(code, 2, "{v}");
+            assert_eq!(v["error"]["code"], "E_USAGE");
+            let out = run(&f, &f.wt_a, &args);
+            assert_eq!(exit(&out), 2);
+            assert_no_secret("correction", &out);
+            assert!(text(&out).contains("API_TOKEN=<hidden>"));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn interactive_correction_hides_value_and_child_receives_original() {
+    let f = Fixture::new("env_prompt");
+    let token = format!("API_TOKEN={SECRET}");
+    let cmd = token_service();
+    let mut args = run_args("api", &[&token], &[], &cmd);
+    args.retain(|a| *a != "--");
+    let out = std::process::Command::new(PY)
+        .args([
+            "-c",
+            r#"
+import os, pty, select, subprocess, sys
+master, slave = pty.openpty()
+p = subprocess.Popen(sys.argv[1:], stdin=slave, stderr=slave, stdout=subprocess.PIPE)
+os.close(slave)
+chunks = []
+answered = False
+while True:
+    if not select.select([master], [], [], 30)[0]:
+        p.kill()
+        raise RuntimeError('timed out waiting for confirmation')
+    try:
+        chunk = os.read(master, 4096)
+        if not chunk: break
+        chunks.append(chunk)
+        if not answered and b'Run it? [Y/n]' in b''.join(chunks):
+            os.write(master, b'\n')
+            answered = True
+    except OSError: break
+stdout, _ = p.communicate(timeout=30)
+os.close(master)
+sys.stdout.buffer.write(stdout + b''.join(chunks))
+sys.exit(p.returncode)
+"#,
+            BIN,
+        ])
+        .args(&args)
+        .current_dir(&f.wt_a)
+        .env("TABA_HOME", f.home())
+        .env_remove("TABA_AGENT")
+        .env_remove("TABA_AGENT_PID")
+        .env_remove("TABA_SCOPE")
+        .env_remove("TABA_OUTPUT")
+        .output()
+        .unwrap();
+    assert_eq!(exit(&out), 0, "{}", text(&out));
+    assert_no_secret("interactive confirmation", &out);
+    assert!(text(&out).contains("Run it? [Y/n]"), "{}", text(&out));
+    assert!(text(&out).contains("API_TOKEN=<hidden>"));
+    let log = f.taba(&f.wt_a, &["logs", "api"]);
+    assert!(text(&log).contains(&sha256_hex(SECRET)), "{}", text(&log));
+}
+
+#[test]
+fn child_drops_caller_identity_but_honors_deliberate_env_overrides() {
+    let f = Fixture::new("child_identity");
+    let command = vec![PY.into(), "-u".into(), "-c".into(),
+        "import os, time; print('vars=' + repr([os.environ.get(k) for k in ['TABA_AGENT', 'TABA_AGENT_PID', 'TABA_OUTPUT']])); print('ready'); time.sleep(30)".into()];
+    for (name, env, expected) in [
+        ("clean", vec![], "vars=[None, None, None]"),
+        (
+            "explicit",
+            vec![
+                "TABA_AGENT=deliberate",
+                "TABA_AGENT_PID=123",
+                "TABA_OUTPUT=text",
+            ],
+            "vars=['deliberate', '123', 'text']",
+        ),
+    ] {
+        let args = run_args(name, &env, &["--save"], &command);
+        let out = f
+            .cmd(&f.wt_a, &args)
+            .env("TABA_AGENT", "agent-a")
+            .env("TABA_AGENT_PID", std::process::id().to_string())
+            .env("TABA_OUTPUT", "json")
+            .output()
+            .unwrap();
+        assert_eq!(exit(&out), 0, "{}", text(&out));
+        let v = json(&out);
+        let log = std::fs::read_to_string(v["log_path"].as_str().unwrap()).unwrap();
+        assert!(log.contains(expected), "{log}");
+        let stopped = f
+            .cmd(&f.wt_a, &["stop", name, "--json"])
+            .env("TABA_AGENT", "agent-a")
+            .env("TABA_AGENT_PID", std::process::id().to_string())
+            .output()
+            .unwrap();
+        assert_eq!(exit(&stopped), 0, "{}", text(&stopped));
+        let up = f
+            .cmd(&f.wt_a, &["up", name, "--json"])
+            .env("TABA_AGENT", "agent-a")
+            .env("TABA_AGENT_PID", std::process::id().to_string())
+            .output()
+            .unwrap();
+        assert_eq!(exit(&up), 0, "{}", text(&up));
+        let logs = f.taba(&f.wt_a, &["logs", name]);
+        assert!(text(&logs).contains(expected), "{}", text(&logs));
+        let stopped = f
+            .cmd(&f.wt_a, &["stop", name, "--json"])
+            .env("TABA_AGENT", "agent-a")
+            .env("TABA_AGENT_PID", std::process::id().to_string())
+            .output()
+            .unwrap();
+        assert_eq!(exit(&stopped), 0, "{}", text(&stopped));
+    }
+}
+
+#[test]
 fn env_values_never_reach_state_events_logs_or_output() {
     let f = Fixture::new("env_secret");
     let token = format!("API_TOKEN={SECRET}");
@@ -190,6 +324,48 @@ fn env_values_never_reach_state_events_logs_or_output() {
     assert_eq!(code, 0, "{v}");
     assert!(!f.events().is_empty());
     assert_secret_not_under(&f.home());
+}
+
+#[test]
+fn concurrent_cli_saves_merge_new_file_plans() {
+    let f = Fixture::new("concurrent_save");
+    // Neither child reports ready until both runs have passed preflight,
+    // so both save plans observed a nonexistent config file.
+    let script = "import pathlib, sys, time\na = pathlib.Path(sys.argv[1]); b = pathlib.Path(sys.argv[2]); a.touch()\ndeadline = time.monotonic() + 15\nwhile not b.exists():\n if time.monotonic() > deadline: sys.exit(1)\n time.sleep(.01)\nprint('ready', flush=True)\ntime.sleep(30)";
+    let mut children = Vec::new();
+    for (name, other) in [("first", "second"), ("second", "first")] {
+        let cmd = vec![
+            PY.into(),
+            "-u".into(),
+            "-c".into(),
+            script.into(),
+            f.root.join(name).to_string_lossy().into_owned(),
+            f.root.join(other).to_string_lossy().into_owned(),
+        ];
+        let args = run_args(name, &[], &["--save"], &cmd);
+        children.push(
+            f.cmd(&f.wt_a, &args)
+                .env("TABA_AGENT", "agent-a")
+                .env("TABA_OUTPUT", "json")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+    }
+    for child in children {
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(exit(&out), 0, "{}", text(&out));
+    }
+    let saved: toml::Table = std::fs::read_to_string(f.wt_a.join("taba.toml"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let services = saved["services"].as_table().unwrap();
+    assert!(
+        services.contains_key("first") && services.contains_key("second"),
+        "{services:?}"
+    );
 }
 
 #[test]
