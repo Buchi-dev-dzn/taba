@@ -59,6 +59,37 @@ pub fn parse_duration(s: &str) -> std::result::Result<u64, String> {
     n.checked_mul(mul).ok_or_else(bad)
 }
 
+/// Parses a size cap: `none` (never rotate), or a positive number of bytes
+/// with an optional unit `B`, `KB`, `MB` or `GB` (1024-based; `KiB`, `MiB`
+/// and `GiB` are accepted as the same).
+pub fn parse_size(s: &str) -> std::result::Result<Option<u64>, String> {
+    let s = s.trim();
+    if s == "none" {
+        return Ok(None);
+    }
+    let bad = || format!("{s:?} is not a size (use for example 512KB, 10MB, 1GB or none)");
+    let unit_at = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (num, unit) = s.split_at(unit_at);
+    let n: u64 = num.parse().map_err(|_| bad())?;
+    let mul: u64 = match unit.trim().to_ascii_uppercase().as_str() {
+        "" | "B" => 1,
+        "K" | "KB" | "KIB" => 1 << 10,
+        "M" | "MB" | "MIB" => 1 << 20,
+        "G" | "GB" | "GIB" => 1 << 30,
+        _ => return Err(bad()),
+    };
+    match n.checked_mul(mul).ok_or_else(bad)? {
+        0 => Err("a size cap must be larger than 0 (use none to never rotate)".into()),
+        n => Ok(Some(n)),
+    }
+}
+
+/// The `events.jsonl` cap of the state at `root`; the default when
+/// `config.toml` cannot be read (the command reports that itself).
+pub fn events_max_size(root: &Path) -> Option<u64> {
+    Config::load(root).map_or(Some(DEFAULT_EVENTS_MAX_SIZE), |c| c.events_max_size)
+}
+
 /// Parses a lease TTL: a duration or `none`.
 pub fn parse_ttl(s: &str) -> std::result::Result<Ttl, String> {
     if s.trim() == "none" {
@@ -108,6 +139,10 @@ pub const DEFAULT_AGENT_TTL: u64 = 4 * 3_600;
 pub const DEFAULT_CLAIM_GRACE: u64 = 2 * 60;
 pub const DEFAULT_GC_GRACE: u64 = 10 * 60;
 pub const DEFAULT_LOG_RETENTION: u64 = 24 * 3_600;
+/// Size cap of one service log before it is rotated to `<name>.log.1`.
+pub const DEFAULT_LOG_MAX_SIZE: u64 = 10 * 1024 * 1024;
+/// Size cap of `events.jsonl` before it is rotated to `events.jsonl.1`.
+pub const DEFAULT_EVENTS_MAX_SIZE: u64 = 10 * 1024 * 1024;
 /// Seconds `gc` waits after the graceful stop request before forcing a
 /// service down, like `taba stop --timeout`.
 pub const DEFAULT_STOP_TIMEOUT: u64 = 5;
@@ -122,6 +157,11 @@ pub struct Config {
     pub gc_grace: u64,
     pub log_retention: u64,
     pub stop_timeout: u64,
+    /// Bytes a service log may grow to before it is rotated; `None` never
+    /// rotates (`log_max_size = "none"`).
+    pub log_max_size: Option<u64>,
+    /// The same for `events.jsonl` (`events_max_size`).
+    pub events_max_size: Option<u64>,
     /// Unknown keys, reported as a warning.
     pub unknown: Vec<String>,
 }
@@ -143,6 +183,8 @@ impl Config {
             gc_grace: DEFAULT_GC_GRACE,
             log_retention: DEFAULT_LOG_RETENTION,
             stop_timeout: DEFAULT_STOP_TIMEOUT,
+            log_max_size: Some(DEFAULT_LOG_MAX_SIZE),
+            events_max_size: Some(DEFAULT_EVENTS_MAX_SIZE),
             unknown: Vec::new(),
         };
         let text = match std::fs::read_to_string(&path) {
@@ -178,6 +220,7 @@ impl Config {
                     config_error(&path, key, format!("{value} is not a quoted string"))
                 })?;
             let dur = |v: &str| parse_duration(v).map_err(|m| config_error(&path, key, m));
+            let size = |v: &str| parse_size(v).map_err(|m| config_error(&path, key, m));
             match key {
                 "lease_ttl" => {
                     cfg.lease_ttl = Some(parse_ttl(value).map_err(|m| config_error(&path, key, m))?)
@@ -186,6 +229,8 @@ impl Config {
                 "gc_grace" => cfg.gc_grace = dur(value)?,
                 "log_retention" => cfg.log_retention = dur(value)?,
                 "stop_timeout" => cfg.stop_timeout = dur(value)?,
+                "log_max_size" => cfg.log_max_size = size(value)?,
+                "events_max_size" => cfg.events_max_size = size(value)?,
                 other => cfg.unknown.push(other.to_string()),
             }
         }
@@ -252,6 +297,23 @@ mod tests {
     }
 
     #[test]
+    fn sizes() {
+        assert_eq!(parse_size("none"), Ok(None));
+        assert_eq!(parse_size("100"), Ok(Some(100)));
+        assert_eq!(parse_size("100B"), Ok(Some(100)));
+        assert_eq!(parse_size("512KB"), Ok(Some(512 * 1024)));
+        assert_eq!(parse_size("10MB"), Ok(Some(10 * 1024 * 1024)));
+        assert_eq!(parse_size("10 MiB"), Ok(Some(10 * 1024 * 1024)));
+        assert_eq!(parse_size("1gb"), Ok(Some(1 << 30)));
+        assert!(parse_size("0").is_err());
+        assert!(parse_size("0MB").is_err());
+        assert!(parse_size("MB").is_err());
+        assert!(parse_size("10TB").is_err());
+        assert!(parse_size("-1").is_err());
+        assert!(parse_size("99999999999999999999GB").is_err());
+    }
+
+    #[test]
     fn config_file() {
         let dir = std::env::temp_dir().join(format!("taba-cfg-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -265,7 +327,28 @@ mod tests {
         assert_eq!(c.gc_grace, 0);
         assert_eq!(c.stop_timeout, 30);
         assert_eq!(c.claim_grace, DEFAULT_CLAIM_GRACE);
+        assert_eq!(c.log_max_size, Some(DEFAULT_LOG_MAX_SIZE));
+        assert_eq!(c.events_max_size, Some(DEFAULT_EVENTS_MAX_SIZE));
         assert_eq!(c.unknown, ["other"]);
+        std::fs::write(
+            dir.join("config.toml"),
+            "log_max_size = \"1MB\"
+events_max_size = \"none\"
+",
+        )
+        .unwrap();
+        let c = Config::load(&dir).unwrap();
+        assert_eq!(c.log_max_size, Some(1 << 20));
+        assert_eq!(c.events_max_size, None);
+        std::fs::write(
+            dir.join("config.toml"),
+            "log_max_size = \"big\"
+",
+        )
+        .unwrap();
+        let e = Config::load(&dir).unwrap_err();
+        assert_eq!(e.code, "E_CONFIG");
+        assert!(e.message.contains("log_max_size"));
         std::fs::write(dir.join("config.toml"), "lease_ttl = \"soon\"\n").unwrap();
         let e = Config::load(&dir).unwrap_err();
         assert_eq!(e.code, "E_CONFIG");

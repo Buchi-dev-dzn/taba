@@ -170,6 +170,11 @@ fn log_matches(svc: &Service, re: &Regex, offset: u64) -> bool {
     let Ok(mut f) = File::open(&svc.log_path) else {
         return false;
     };
+    // A log rotated since the start (truncated in place) is read whole.
+    let offset = match f.metadata() {
+        Ok(m) if m.len() < offset => 0,
+        _ => offset,
+    };
     if f.seek(SeekFrom::Start(offset)).is_err() {
         return false;
     }
