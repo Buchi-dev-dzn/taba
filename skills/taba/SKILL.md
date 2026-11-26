@@ -14,8 +14,7 @@ in. Everything below uses only these commands:
 taba whoami [--scope S] [--agent A] [--json]
 taba run [--scope S] --name N [--port P | --port auto | --port auto:START]
          [--wait[=SECS]] [--ready tcp|http:PATH|log:REGEX] [--ttl DURATION]
-         [--service-ttl DURATION] [--env KEY=VALUE]... [--save [--force]]
-         [--json] -- CMD...
+         [--service-ttl DURATION] [--json] -- CMD...
 taba up [NAME...] [--scope S] [--json]        # services declared in taba.toml
 taba down [NAME...] [--scope S] [--json]
 taba ps [--scope S] [--running] [--json]
@@ -95,25 +94,24 @@ expiry when the human needs them.
    If the project has a `taba.toml`, `taba up --json` starts the services it
    declares (or `taba up NAME --json` for one) and replies with one entry per
    service under `results`; `taba down --json` stops them. Do not write a
-   `taba.toml` unless the human asks. When they do, `taba run ... --save`
-   starts the service and then writes it to `taba.toml` (reply: `saved`);
-   if the file already defines that name differently it fails with
-   `E_CONFLICT` and starts nothing. Add `--force` only when the human
-   wants the saved definition replaced.
+   `taba.toml` unless the human asks.
 
-   `--env KEY=VALUE` (repeatable) sets a variable for the service. taba
-   records and shows only the names (`env` in the reply), never the
-   values. Do not repeat a secret value in your own messages or logs
-   either. Re-running needs the same names and values to be
-   `already_running`; anything else is `E_CONFLICT`. With `--save` the
-   values are written to `taba.toml` in plain text (`W_ENV_SAVED`): do not
-   save secrets there unless the human asks, and never commit them.
+   With explicit `run`, `--env KEY=VALUE` is repeatable and values are never
+   returned by taba; use only values the human has authorized. `--save` writes
+   the run to `taba.toml` after it succeeds, and `--force` may replace a
+   different definition only when the human explicitly asks.
 
    Read `url` from the reply and use exactly that URL. Never invent a port,
    never use a port you did not get from taba, and make the app fail instead
    of moving to another port (`--strictPort` for Vite). taba also sets `PORT`
    in the app's environment. Re-running the same command is safe: it returns
    `"status": "already_running"` with the same URL.
+
+   Always use this explicit form: `--name`, then `--`, then the command.
+   `taba run npm run dev` without `--name` is a shorthand for people. It
+   derives the name from the command and reports whichever port the app
+   picks. Don't use it, and don't quote the command into one argument
+   (that runs it through the shell).
 4. **On an error, read `error.code` and do the first item of `error.next`.**
    Every reply is one JSON document with `"ok"`. Never answer
    `E_PORT_IN_USE`, `E_PORT_CLAIMED` or `E_NOT_OWNER` with `kill`, `pkill`,
@@ -142,7 +140,7 @@ expiry when the human needs them.
 | `E_DANGLING` | A borrow no longer refers to its recorded live instance. | Borrow the service again; do not trust the stale URL. |
 | `E_NO_CLAIMANT` | `disown` found no eligible claimant. | Keep the service, or arrange for a successor to `claim` it first. |
 | `E_NOT_FOUND` | The requested service, scope, or borrow is absent. | Run `taba ps --json` and use a current target or borrow ID. |
-| `E_CONFLICT` | A name or destination conflicts with existing state (for `run`, also other `--env` names or values; for `run --save`, a different saved definition). | Reuse the matching service, choose another name, or coordinate a transfer; use `--save --force` only if the human wants the saved definition replaced. |
+| `E_CONFLICT` | A name or destination conflicts with existing state. | Reuse the matching service, choose another name, or coordinate a transfer. |
 | `E_STILL_RUNNING` | `rm` was asked to remove a running service. | Stop only your own service first, then retry `rm`. |
 | `E_PORT_IN_USE`, `E_PORT_CLAIMED`, `E_NO_FREE_PORT` | The requested or automatic port cannot be used. | Use the `error.next` command or another `--port auto` range; never kill the holder. |
 | `E_START_FAILED` | The process exited before it was ready. | Read `error.details.log_tail` or `taba logs <name> --tail 100 --json`, fix, re-run. |

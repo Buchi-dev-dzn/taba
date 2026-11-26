@@ -13,6 +13,7 @@ mod ports;
 mod proc;
 mod project;
 mod ready;
+mod runform;
 mod scope;
 mod state;
 mod ui;
@@ -28,7 +29,7 @@ use scope::{Caller, ScopeSource, check_ident};
 use serde_json::{Value, json};
 use state::{OpLock, Service, Store};
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, IsTerminal, Read, Seek, SeekFrom, Write};
 use std::process::{Command, ExitCode, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -41,13 +42,23 @@ use util::{local_timestamp, log_tail, tilde};
     about = "Start, list and stop local processes, bundled by work scope"
 )]
 struct Cli {
+    /// Without a command, taba lists services (as `taba ps`)
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Start a command detached, owned by SCOPE/NAME
+    /// Start a command detached, owned by SCOPE/NAME.
+    ///
+    /// taba run [taba flags] <command...>: taba's flags come first;
+    /// everything from the first word that is not a taba flag belongs to the
+    /// command, its own options and `--` included. In
+    /// `taba run npm run dev -- --host`, npm gets `run dev -- --host`.
+    ///
+    /// Without --name, the name comes from the command (`npm run dev` →
+    /// dev), and run waits up to 30 s for the first port the service
+    /// listens on and prints its URL.
     Run {
         /// Work scope that owns the service (default: $TABA_SCOPE, else the git worktree)
         #[arg(long)]
@@ -55,9 +66,11 @@ enum Cmd {
         /// Agent acting (default: $TABA_AGENT, else "human")
         #[arg(long)]
         agent: Option<String>,
-        /// Service name, unique within the scope
+        /// Service name, unique within the scope. Without it, the name comes
+        /// from the command: `npm|pnpm|yarn|bun run X` and `pnpm X` give X,
+        /// `flutter run -d D` gives flutter-D, anything else the program name
         #[arg(long)]
-        name: String,
+        name: Option<String>,
         /// Port: a number, `auto` (a free port in 4100-4999) or `auto:START`.
         /// taba replaces `{port}` in the command and sets PORT
         #[arg(long, value_parser = ports::parse_port_spec, value_name = "PORT|auto|auto:START")]
@@ -78,23 +91,22 @@ enum Cmd {
         /// already_running re-run), independent of the lease
         #[arg(long, value_parser = config::parse_service_ttl_flag)]
         service_ttl: Option<u64>,
-        /// Set an environment variable for the service (repeatable). Only
-        /// the names are recorded and printed, never the values; a re-run
-        /// with other names or values is a different service
+        /// Set an environment variable for the service (repeatable). Values
+        /// are never stored in taba state or printed.
         #[arg(long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
-        /// Also write this service to taba.toml (the nearest one, else the
-        /// worktree root's), so `taba up NAME` starts it
+        /// Write this service to taba.toml after it starts.
         #[arg(long)]
         save: bool,
-        /// With --save: replace a different saved definition of NAME
+        /// With --save, replace a different saved definition.
         #[arg(long, requires = "save")]
         force: bool,
         /// Print one JSON document (also: TABA_OUTPUT=json)
         #[arg(long)]
         json: bool,
-        /// Command to run, after `--`
-        #[arg(last = true, required = true, value_name = "CMD")]
+        /// The command: everything from the first word that is not a taba
+        /// flag, passed on unchanged (`--` before it is optional)
+        #[arg(required = true, trailing_var_arg = true, value_name = "CMD")]
         command: Vec<String>,
     },
     /// Start the services declared in the nearest taba.toml (all, or NAME...
@@ -525,7 +537,12 @@ fn usage_error(e: &clap::Error, args: &[String]) -> TabaError {
 }
 
 fn main() -> ExitCode {
-    let cli = match Cli::try_parse() {
+    let raw: Vec<String> = std::env::args().collect();
+    let (args, shape) = match runform::prepare(raw.clone()) {
+        Ok(prepared) => prepared,
+        Err(e) => return ExitCode::from(emit(json_requested_raw(), Err(e))),
+    };
+    let cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
         Err(e) => {
             use clap::error::ErrorKind;
@@ -543,7 +560,12 @@ fn main() -> ExitCode {
         }
     };
 
-    let (json_mode, res): (bool, Result<Option<Output>>) = match cli.cmd {
+    let Some(cmd) = cli.cmd else {
+        // `taba` alone lists services, as `taba ps` does.
+        let json = env_json();
+        return ExitCode::from(emit(json, cmd_ps(None, false)));
+    };
+    let (json_mode, res): (bool, Result<Option<Output>>) = match cmd {
         #[cfg(windows)]
         Cmd::CtrlBreak { attach, pgid } => {
             return ExitCode::from(proc::ctrl_break_helper(attach, pgid));
@@ -562,28 +584,38 @@ fn main() -> ExitCode {
             force,
             json,
             command,
-        } => (
-            json || env_json(),
-            project::parse_env_args(&env)
-                .and_then(|env| {
-                    cmd_run(RunArgs {
-                        scope,
-                        agent,
-                        name,
-                        port,
-                        wait,
-                        ready,
-                        ttl,
-                        service_ttl,
-                        command,
-                        cwd: None,
-                        env,
-                        save,
-                        force,
+        } => {
+            let json = json || env_json();
+            let interactive = !json
+                && std::env::var_os("TABA_AGENT").is_none_or(|a| a.is_empty())
+                && io::stdin().is_terminal()
+                && io::stderr().is_terminal();
+            (
+                json,
+                project::parse_env_args(&env)
+                    .and_then(|env| {
+                        cmd_run(RunArgs {
+                            scope,
+                            agent,
+                            name,
+                            port,
+                            wait,
+                            ready,
+                            ttl,
+                            service_ttl,
+                            command,
+                            cwd: None,
+                            env,
+                            save,
+                            force,
+                            shape,
+                            raw,
+                            interactive,
+                        })
                     })
-                })
-                .map(Some),
-        ),
+                    .map(Some),
+            )
+        }
         Cmd::Up {
             names,
             scope,
@@ -935,6 +967,7 @@ fn record_force(
 ///
 /// ```text
 /// started login-fix/web → http://localhost:5173
+///   command: npm run dev -- --port 5173
 ///   dir  ~/dev/app-login
 ///   logs taba logs login-fix/web
 /// ```
@@ -944,7 +977,8 @@ fn describe(verb: &str, svc: &Service) -> String {
         None => format!("{verb} {}", svc.id()),
     };
     format!(
-        "{head}\n  dir  {}\n  logs taba logs {}",
+        "{head}\n  command: {}\n  dir  {}\n  logs taba logs {}",
+        runform::display_command(svc.template()),
         tilde(&svc.cwd),
         svc.id()
     )
@@ -955,100 +989,136 @@ fn describe(verb: &str, svc: &Service) -> String {
 struct RunArgs {
     scope: Option<String>,
     agent: Option<String>,
-    name: String,
+    /// `None` for the short form: see [`runform`].
+    name: Option<String>,
     port: Option<PortSpec>,
     wait: Option<f64>,
     ready: Option<ReadySpec>,
     ttl: Option<config::Ttl>,
     service_ttl: Option<u64>,
+    /// The command as clap collected it; [`runform::command_spec`] turns it
+    /// into the argv to start.
     command: Vec<String>,
     /// Working directory (default: the caller's current directory).
     cwd: Option<std::path::PathBuf>,
     /// Extra environment variables for the command.
     env: Vec<(String, String)>,
-    /// `--save`: write the service to taba.toml after it started.
     save: bool,
-    /// `--force` with `--save`.
     force: bool,
+    shape: runform::Shape,
+    /// The original arguments, program name first (for corrections).
+    raw: Vec<String>,
+    /// A person at a terminal: a correctable command is offered to run.
+    interactive: bool,
 }
 
-/// `taba run`, with `--save` checked before the start and written after it.
-fn cmd_run(a: RunArgs) -> Result<Output> {
+fn cmd_run(mut a: RunArgs) -> Result<Output> {
+    let command = std::mem::take(&mut a.command);
+    let spec = match runform::command_spec(a.shape, command.clone(), &a.raw) {
+        Ok(spec) => spec,
+        Err(e) => {
+            let fixed = e
+                .details
+                .as_ref()
+                .and_then(|d| d["corrected"].as_str())
+                .map(String::from);
+            match fixed {
+                Some(fixed) if a.interactive && confirm_corrected(&fixed) => {
+                    let shape = runform::Shape {
+                        separator: true,
+                        ..a.shape
+                    };
+                    runform::command_spec(shape, command, &a.raw)?
+                }
+                _ => return Err(e),
+            }
+        }
+    };
+    a.command = spec.template;
+    let form = runform::resolve(a.name.clone(), a.wait, a.ready.is_some(), &spec.words)?;
     let plan = if a.save {
         let caller = scope::resolve(a.scope.clone(), a.agent.clone())?;
-        check_ident("name", &a.name)?;
-        let dir = a.cwd.clone().unwrap_or_else(|| caller.cwd.clone());
-        let path = project::save_path(&caller.cwd, caller.worktree.as_deref());
-        let req = project::SaveRequest {
-            name: a.name.clone(),
-            command: a.command.clone(),
-            port: a.port.clone(),
-            ready: a.ready.clone(),
-            wait: a.wait,
-            env: a.env.clone(),
-            cwd: dir,
-            service_ttl: a.service_ttl,
-        };
-        Some(project::plan_save(path, req, a.force)?)
+        let cwd = a.cwd.clone().unwrap_or_else(|| caller.cwd.clone());
+        Some(project::plan_save(
+            project::save_path(&caller.cwd, caller.worktree.as_deref()),
+            project::SaveRequest {
+                name: form.name.clone(),
+                command: a.command.clone(),
+                port: a.port.clone(),
+                ready: a.ready.clone(),
+                wait: a.wait,
+                env: a.env.clone(),
+                cwd,
+                service_ttl: a.service_ttl,
+            },
+            a.force,
+        )?)
     } else {
         None
     };
-    let mut out = run_service(a)?;
+    let mut out = run_service(a, form)?;
     if let Some(plan) = plan {
         project::write_save(&plan)?;
-        let dir = plan.path.parent().unwrap_or(std::path::Path::new("."));
-        let shown = project::render(&plan.def, dir, true);
-        out.body.insert(
-            "saved".into(),
-            json!({
-                "path": plan.path,
-                "name": plan.def.name,
-                "result": plan.result,
-                "definition": shown,
-            }),
+        let shown = project::render(
+            &plan.def,
+            plan.path.parent().unwrap_or(std::path::Path::new(".")),
+            true,
         );
-        let verb = match plan.result {
-            "unchanged" => "already saved in",
-            "updated" => "updated in",
-            _ => "saved to",
-        };
-        out.text.push_str(&format!(
-            "\n  {verb} {}:\n{}",
-            tilde(&plan.path),
-            shown
-                .trim_end()
-                .lines()
-                .map(|l| format!("    {l}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        ));
+        out.body.insert("saved".into(), json!({"path": plan.path, "name": plan.def.name, "result": plan.result, "definition": shown}));
         if !plan.def.env.is_empty() && plan.result != "unchanged" {
-            let keys: Vec<&str> = plan.def.env.iter().map(|(k, _)| k.as_str()).collect();
-            out.warnings.push(Warning {
-                code: "W_ENV_SAVED",
-                message: format!(
-                    "{} now holds the values of {} in plain text; do not commit secrets",
-                    tilde(&plan.path),
-                    keys.join(", ")
-                ),
-            });
+            out.warnings.push(Warning { code: "W_ENV_SAVED", message: "environment values were saved to taba.toml in plain text; do not commit secrets".into() });
         }
     }
     Ok(out)
 }
 
-fn run_service(a: RunArgs) -> Result<Output> {
+/// Offers the corrected command line on the terminal; Enter or `y` runs it.
+fn confirm_corrected(fixed: &str) -> bool {
+    eprint!("taba: with taba options, put -- before the command:\n  {fixed}\nRun it? [Y/n] ");
+    let _ = io::stderr().flush();
+    let mut line = String::new();
+    io::stdin().read_line(&mut line).is_ok()
+        && matches!(line.trim().to_ascii_lowercase().as_str(), "" | "y" | "yes")
+}
+
+/// How a short-form run reports itself (see [`runform`]).
+struct Short {
+    derived: runform::Derived,
+    /// How to refer to the service in the printed hints: its name, or
+    /// SCOPE/NAME when the scope came from `--scope`.
+    label: String,
+    /// It waited for a listening port rather than a ready check.
+    port_wait: bool,
+}
+
+/// Starts (or reuses) service `form.name` of the caller's scope. `form`
+/// carries the short form's name and wait (see [`runform`]); the explicit
+/// form passes `a`'s flags through as they are.
+fn run_service(a: RunArgs, form: runform::RunForm) -> Result<Output> {
+    let name = form.name;
     let caller = scope::resolve(a.scope.clone(), a.agent.clone())?;
     let scope = caller.require_scope()?;
-    check_ident("name", &a.name)?;
+    check_ident("name", &name)?;
     let dir = a.cwd.clone().unwrap_or_else(|| caller.cwd.clone());
     let mut env_keys: Vec<String> = a.env.iter().map(|(k, _)| k.clone()).collect();
     env_keys.sort();
-    if let Some(w) = env_keys.windows(2).find(|w| w[0] == w[1]) {
-        return Err(TabaError::usage(format!("--env {} is given twice", w[0])));
+    if let Some(dupe) = env_keys.windows(2).find(|pair| pair[0] == pair[1]) {
+        return Err(TabaError::usage(format!(
+            "--env {} is given twice",
+            dupe[0]
+        )));
     }
-    let name = a.name.clone();
-    let wait = match a.wait {
+    let short = form.derived.map(|derived| Short {
+        derived,
+        label: if caller.source == Some(ScopeSource::Flag) {
+            format!("{scope}/{name}")
+        } else {
+            name.clone()
+        },
+        port_wait: form.wait_for_port,
+    });
+    let short = short.as_ref();
+    let wait = match form.wait {
         None => None,
         Some(s) if s.is_finite() && s > 0.0 => Some(Duration::from_secs_f64(s)),
         Some(_) => {
@@ -1067,8 +1137,9 @@ fn run_service(a: RunArgs) -> Result<Output> {
         )));
     }
     // The ready check: --ready, else tcp when there is a port. Without
-    // either, --wait keeps v0.1's "still alive after 200 ms" check.
-    let check = wait.and_then(|_| {
+    // either, --wait keeps v0.1's "still alive after 200 ms" check. The
+    // short form instead waits for any listening port.
+    let check = wait.filter(|_| !form.wait_for_port).and_then(|_| {
         a.ready
             .clone()
             .or_else(|| a.port.as_ref().map(|_| ReadySpec::Tcp))
@@ -1090,6 +1161,12 @@ fn run_service(a: RunArgs) -> Result<Output> {
     store.mark_version()?;
     let env_hash = store.env_fingerprint(&a.env)?;
     let existing = store.get(&scope, &name)?;
+    if let Some(short) = short
+        && let Some(ex) = &existing
+        && let Some(err) = runform::derived_name_clash(ex, &short.derived, &template, &dir)
+    {
+        return Err(err);
+    }
     let mut delegation = None;
     if a.scope.is_some()
         && a.ttl.is_none()
@@ -1136,24 +1213,15 @@ fn run_service(a: RunArgs) -> Result<Output> {
                 store.put(&ex)?;
             }
             drop(lock);
-            let mut out = finish_existing(ex, check, wait)?;
+            let mut out = finish_existing(&store, ex, check, wait, short)?;
             out.warnings.extend(touched.warnings);
             return Ok(out);
         }
         return Err(TabaError::new(
             "E_CONFLICT",
             format!(
-                "{} is already running with a different command, directory, port or \
-                 environment (command {:?}, dir {}, port {}, env {}); stop it first",
+                "{} is already running with a different command, directory, port or environment; stop it first",
                 ex.id(),
-                ex.template(),
-                tilde(&ex.cwd),
-                ex.port_request().unwrap_or_else(|| "-".into()),
-                if ex.env_keys.is_empty() {
-                    "-".to_string()
-                } else {
-                    format!("{} (values not shown)", ex.env_keys.join(", "))
-                },
             ),
         )
         .details(json!({
@@ -1217,8 +1285,17 @@ fn run_service(a: RunArgs) -> Result<Output> {
     let log_err = log.try_clone()?;
 
     let mut cmd = Command::new(proc::resolve_program(&command[0]));
-    cmd.args(&command[1..])
-        .current_dir(&dir)
+    #[cfg(windows)]
+    if let Some(line) = runform::shell_line(&command) {
+        // cmd.exe parses its own command line: pass the line as typed.
+        use std::os::windows::process::CommandExt;
+        cmd.arg("/C").raw_arg(line);
+    } else {
+        cmd.args(&command[1..]);
+    }
+    #[cfg(not(windows))]
+    cmd.args(&command[1..]);
+    cmd.current_dir(&dir)
         .envs(a.env.iter().map(|(k, v)| (k, v)))
         .env("TABA_SCOPE", &scope)
         .env("TABA_SERVICE", &name)
@@ -1267,6 +1344,7 @@ fn run_service(a: RunArgs) -> Result<Output> {
         stop_requested_at: None,
         env_keys,
         env_hash,
+        discovered_ports: Vec::new(),
     };
     store.put(&svc)?;
     if let Some(borrow) = &delegation {
@@ -1278,6 +1356,7 @@ fn run_service(a: RunArgs) -> Result<Output> {
     drop(lock);
 
     let outcome = match (&check, wait) {
+        (_, Some(w)) if short.is_some_and(|s| s.port_wait) => ready::wait_for_port(&mut svc, w),
         (Some(c), Some(w)) => ready::wait(&svc, c, w, log_offset),
         _ => {
             thread::sleep(Duration::from_millis(200));
@@ -1289,37 +1368,75 @@ fn run_service(a: RunArgs) -> Result<Output> {
         }
     };
 
+    if matches!(outcome, Outcome::Ready { .. }) && svc.discovered_ports.is_empty() {
+        svc.discovered_ports = ready::discover_ports(&svc);
+    }
+
     {
         let _lock = store.lock()?;
-        if let (Outcome::Ready { .. }, Some(c)) = (&outcome, &check) {
-            svc.ready = Some(state::Ready {
-                check: c.name().to_string(),
-                ready_at: util::now_micros(),
-            });
-            // Only update the record if it still describes this instance.
-            if store
-                .get(&scope, &name)?
-                .is_some_and(|cur| cur.instance() == svc.instance())
-            {
-                store.put(&svc)?;
+        if let Outcome::Ready { .. } = &outcome {
+            let check_name = match &check {
+                Some(c) => Some(c.name()),
+                None if short.is_some_and(|s| s.port_wait) => Some("port"),
+                None => None,
+            };
+            if let Some(check) = check_name {
+                svc.ready = Some(state::Ready {
+                    check: check.to_string(),
+                    ready_at: util::now_micros(),
+                });
             }
+        }
+        if svc.ready.is_some() || !svc.discovered_ports.is_empty() {
+            save_if_current(&store, &svc)?;
         }
         store.release_op(&scope, &name)?;
     }
-    run_result(svc, "started", check.as_ref(), wait, outcome, warnings)
+    run_result(
+        svc,
+        "started",
+        check.as_ref(),
+        wait,
+        outcome,
+        warnings,
+        short,
+    )
+}
+
+/// Writes `svc` back, but only if the record still describes this
+/// instance. Call under the global lock.
+fn save_if_current(store: &Store, svc: &Service) -> Result<()> {
+    if store
+        .get(&svc.scope, &svc.name)?
+        .is_some_and(|cur| cur.instance() == svc.instance())
+    {
+        store.put(svc)?;
+    }
+    Ok(())
 }
 
 /// `run` found the same service already running: report it, after the
 /// ready check when --wait was given.
 fn finish_existing(
-    svc: Service,
+    store: &Store,
+    mut svc: Service,
     check: Option<ReadySpec>,
     wait: Option<Duration>,
+    short: Option<&Short>,
 ) -> Result<Output> {
     let outcome = match (&check, wait) {
+        (_, Some(w)) if short.is_some_and(|s| s.port_wait) => ready::wait_for_port(&mut svc, w),
         (Some(c), Some(w)) => ready::wait(&svc, c, w, 0),
         _ => Outcome::Ready { ms: 0 },
     };
+    if matches!(outcome, Outcome::Ready { .. }) {
+        let ports = ready::discover_ports(&svc);
+        if !ports.is_empty() && ports != svc.discovered_ports {
+            svc.discovered_ports = ports;
+            let _lock = store.lock()?;
+            save_if_current(store, &svc)?;
+        }
+    }
     run_result(
         svc,
         "already_running",
@@ -1327,6 +1444,49 @@ fn finish_existing(
         wait,
         outcome,
         Vec::new(),
+        short,
+    )
+}
+
+/// The text a short-form `run` prints:
+///
+/// ```text
+/// started dev → http://localhost:5173
+///   command: npm run dev
+///   name "dev" (from "npm run dev"; set another with --name)
+///   logs: taba logs dev · stop: taba stop dev
+/// ```
+fn short_text(svc: &Service, started: bool, short: &Short) -> String {
+    let label = &short.label;
+    let mut head = if started {
+        format!("started {label}")
+    } else {
+        format!("already running: {label}")
+    };
+    match svc.url() {
+        Some(url) => {
+            head.push_str(&format!(" → {url}"));
+            let shown = svc.port.or_else(|| svc.discovered_ports.first().copied());
+            let others: Vec<String> = svc
+                .discovered_ports
+                .iter()
+                .filter(|p| Some(**p) != shown)
+                .map(u16::to_string)
+                .collect();
+            if !others.is_empty() {
+                head.push_str(&format!(" (also listening on {})", others.join(", ")));
+            }
+        }
+        None if short.port_wait => {
+            head.push_str(&format!(", running, no port yet (see: taba logs {label})"));
+        }
+        None => {}
+    }
+    format!(
+        "{head}\n  command: {}\n  name {:?} (from {:?}; set another with --name)\n  logs: taba logs {label} · stop: taba stop {label}",
+        runform::display_command(svc.template()),
+        svc.name,
+        short.derived.source_text(),
     )
 }
 
@@ -1337,12 +1497,24 @@ fn run_result(
     wait: Option<Duration>,
     outcome: Outcome,
     warnings: Vec<Warning>,
+    short: Option<&Short>,
 ) -> Result<Output> {
     let id = svc.id();
+    let port_wait = short.is_some_and(|s| s.port_wait);
+    // The short form's port wait ends without an error when no port showed
+    // up in time: the service runs, it has no port yet.
+    let (outcome, port_found) = match outcome {
+        Outcome::TimedOut { ms } if port_wait => (Outcome::Ready { ms }, false),
+        o => (o, port_wait),
+    };
     match outcome {
         Outcome::Ready { ms } => {
-            let ready = check.map(|c| json!({ "check": c.name(), "ms": ms }));
-            let body = json!({
+            let ready = match check {
+                Some(c) => Some(json!({ "check": c.name(), "ms": ms })),
+                None if port_found => Some(json!({ "check": "port", "ms": ms })),
+                None => None,
+            };
+            let mut body = json!({
                 "status": status,
                 "service": id,
                 "scope": svc.scope,
@@ -1354,8 +1526,16 @@ fn run_result(
                 "pid": svc.pid,
                 "directory": svc.cwd,
                 "log_path": svc.log_path,
-                "env": svc.env_keys,
+                "discovered_ports": svc.discovered_ports,
             });
+            if !svc.env_keys.is_empty() {
+                body["env"] = json!(svc.env_keys);
+            }
+            if let Some(short) = short {
+                let mut out = Output::new(body, short_text(&svc, status == "started", short));
+                out.warnings = warnings;
+                return Ok(out);
+            }
             let verb = if status == "started" {
                 "started"
             } else {
@@ -1429,10 +1609,12 @@ fn cmd_up(
     let mut warnings = Vec::new();
     let mut failure = None;
     for (i, def) in selected.iter().enumerate() {
-        let res = run_service(RunArgs {
+        // taba.toml gives an explicit name and an argv, so the `run`
+        // command-line rules (see [`runform`]) do not apply.
+        let args = RunArgs {
             scope: scope_flag.clone(),
             agent: agent.clone(),
-            name: def.name.clone(),
+            name: Some(def.name.clone()),
             port: def.port.clone(),
             wait: Some(def.wait),
             ready: def.ready.clone(),
@@ -1443,7 +1625,17 @@ fn cmd_up(
             env: def.env.clone(),
             save: false,
             force: false,
-        });
+            shape: runform::Shape::default(),
+            raw: Vec::new(),
+            interactive: false,
+        };
+        let form = runform::resolve(
+            args.name.clone(),
+            args.wait,
+            args.ready.is_some(),
+            &args.command,
+        )?;
+        let res = run_service(args, form);
         match res {
             Ok(out) => {
                 results.push(Value::Object(out.body));
@@ -1669,6 +1861,7 @@ pub(crate) fn ps_snapshot(
             "status": status,
             "url": s.url(),
             "port": s.port,
+            "discovered_ports": s.discovered_ports,
             "directory": s.cwd,
             "command": s.command,
             "pid": s.pid,
@@ -2361,6 +2554,40 @@ mod cli_tests {
         walk(&Cli::command(), "taba", &mut missing);
         assert!(missing.is_empty(), "arguments without help: {missing:?}");
     }
+
+    /// `runform::prepare` reads `run`'s raw arguments itself; its flag
+    /// lists must match the clap definition.
+    #[test]
+    fn runform_knows_every_run_flag() {
+        let cli = Cli::command();
+        let run = cli.find_subcommand("run").unwrap();
+        let mut values = Vec::new();
+        let mut switches = vec!["--help".to_string(), "-h".to_string()];
+        for a in run.get_arguments() {
+            let Some(long) = a.get_long() else { continue };
+            let takes_value = a.get_action().takes_values();
+            let equals_only = a.is_require_equals_set();
+            if takes_value && !equals_only {
+                values.push(format!("--{long}"));
+            } else if long != "help" {
+                switches.push(format!("--{long}"));
+            }
+        }
+        values.sort();
+        switches.sort();
+        let mut known_values: Vec<String> = runform::RUN_VALUE_FLAGS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut known_switches: Vec<String> = runform::RUN_SWITCHES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        known_values.sort();
+        known_switches.sort();
+        assert_eq!(values, known_values);
+        assert_eq!(switches, known_switches);
+    }
 }
 
 /// `taba stop` with a fake process layer: signal failures are deterministic
@@ -2411,6 +2638,7 @@ mod stop_tests {
                 stop_requested_at: None,
                 env_keys: Vec::new(),
                 env_hash: None,
+                discovered_ports: Vec::new(),
             })
             .unwrap();
     }

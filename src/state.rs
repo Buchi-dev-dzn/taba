@@ -150,6 +150,9 @@ pub struct Service {
     /// without storing it. `None` when no variables were set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env_hash: Option<String>,
+    /// TCP ports discovered for the short `run` form.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discovered_ports: Vec<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -201,7 +204,9 @@ impl Service {
     }
 
     pub fn url(&self) -> Option<String> {
-        self.port.map(|p| format!("http://localhost:{p}"))
+        self.port
+            .or_else(|| self.discovered_ports.first().copied())
+            .map(|p| format!("http://localhost:{p}"))
     }
 
     pub fn is_running(&self) -> bool {
