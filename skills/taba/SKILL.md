@@ -15,6 +15,8 @@ taba whoami [--scope S] [--agent A] [--json]
 taba run [--scope S] --name N [--port P | --port auto | --port auto:START]
          [--wait[=SECS]] [--ready tcp|http:PATH|log:REGEX] [--ttl DURATION]
          [--service-ttl DURATION] [--json] -- CMD...
+taba up [NAME...] [--scope S] [--json]        # services declared in taba.toml
+taba down [NAME...] [--scope S] [--json]
 taba ps [--scope S] [--running] [--json]
 taba ps --all [--json]
 taba ps --watch --json [--scope S] [--running] [--interval DURATION]
@@ -88,6 +90,11 @@ expiry when the human needs them.
    taba run --name api --port auto --wait --json -- uvicorn app:app --port {port}
    taba run --name worker --json -- npm run worker          # no port
    ```
+
+   If the project has a `taba.toml`, `taba up --json` starts the services it
+   declares (or `taba up NAME --json` for one) and replies with one entry per
+   service under `results`; `taba down --json` stops them. Do not write a
+   `taba.toml` unless the human asks.
 
    Read `url` from the reply and use exactly that URL. Never invent a port,
    never use a port you did not get from taba, and make the app fail instead

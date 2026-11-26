@@ -11,6 +11,7 @@ mod lease;
 mod listing;
 mod ports;
 mod proc;
+mod project;
 mod ready;
 mod scope;
 mod state;
@@ -83,6 +84,45 @@ enum Cmd {
         /// Command to run, after `--`
         #[arg(last = true, required = true, value_name = "CMD")]
         command: Vec<String>,
+    },
+    /// Start the services declared in the nearest taba.toml (all, or NAME...
+    /// in that order) and wait until each is ready; running ones are reused
+    Up {
+        /// Services to start, in this order (default: all, in file order)
+        #[arg(value_name = "NAME")]
+        names: Vec<String>,
+        /// Work scope that owns the services (default: $TABA_SCOPE, else the git worktree)
+        #[arg(long)]
+        scope: Option<String>,
+        /// Agent acting (default: $TABA_AGENT, else "human")
+        #[arg(long)]
+        agent: Option<String>,
+        /// Lease TTL for the caller's scope: a duration such as 4h, or none
+        #[arg(long, value_parser = config::parse_ttl_flag)]
+        ttl: Option<config::Ttl>,
+        /// Print one JSON document (also: TABA_OUTPUT=json)
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop the caller's services declared in the nearest taba.toml (all, or
+    /// NAME...)
+    Down {
+        /// Services to stop (default: all declared in taba.toml)
+        #[arg(value_name = "NAME")]
+        names: Vec<String>,
+        /// The caller's scope (default: $TABA_SCOPE, else the git worktree)
+        #[arg(long)]
+        scope: Option<String>,
+        /// Agent acting (default: $TABA_AGENT, else "human")
+        #[arg(long)]
+        agent: Option<String>,
+        /// Seconds to wait after SIGTERM (Windows: Ctrl+Break) before SIGKILL
+        /// (Windows: TerminateJobObject)
+        #[arg(long, default_value_t = 5.0)]
+        timeout: f64,
+        /// Print one JSON document (also: TABA_OUTPUT=json)
+        #[arg(long)]
+        json: bool,
     },
     /// Show the caller's scope, where it came from, and its services
     Whoami {
@@ -519,8 +559,30 @@ fn main() -> ExitCode {
                 ttl,
                 service_ttl,
                 command,
+                cwd: None,
+                env: Vec::new(),
             })
             .map(Some),
+        ),
+        Cmd::Up {
+            names,
+            scope,
+            agent,
+            ttl,
+            json,
+        } => (
+            json || env_json(),
+            cmd_up(names, scope, agent, ttl).map(Some),
+        ),
+        Cmd::Down {
+            names,
+            scope,
+            agent,
+            timeout,
+            json,
+        } => (
+            json || env_json(),
+            cmd_down(names, scope, agent, timeout).map(Some),
         ),
         Cmd::Renew {
             scope,
@@ -880,12 +942,17 @@ struct RunArgs {
     ttl: Option<config::Ttl>,
     service_ttl: Option<u64>,
     command: Vec<String>,
+    /// Working directory (default: the caller's current directory).
+    cwd: Option<std::path::PathBuf>,
+    /// Extra environment variables for the command.
+    env: Vec<(String, String)>,
 }
 
 fn cmd_run(a: RunArgs) -> Result<Output> {
     let caller = scope::resolve(a.scope.clone(), a.agent.clone())?;
     let scope = caller.require_scope()?;
     check_ident("name", &a.name)?;
+    let dir = a.cwd.clone().unwrap_or_else(|| caller.cwd.clone());
     let name = a.name.clone();
     let wait = match a.wait {
         None => None,
@@ -962,7 +1029,7 @@ fn cmd_run(a: RunArgs) -> Result<Output> {
         && ex.is_running()
     {
         if ex.template() == template.as_slice()
-            && ex.cwd == caller.cwd
+            && ex.cwd == dir
             && ex.port_request() == port_request
         {
             let mut ex = ex.clone();
@@ -1041,14 +1108,15 @@ fn cmd_run(a: RunArgs) -> Result<Output> {
         "--- taba: {} starting {:?} in {} ---",
         local_timestamp(),
         command,
-        caller.cwd.display()
+        dir.display()
     )?;
     let log_offset = log.metadata()?.len();
     let log_err = log.try_clone()?;
 
     let mut cmd = Command::new(proc::resolve_program(&command[0]));
     cmd.args(&command[1..])
-        .current_dir(&caller.cwd)
+        .current_dir(&dir)
+        .envs(a.env.iter().map(|(k, v)| (k, v)))
         .env("TABA_SCOPE", &scope)
         .env("TABA_SERVICE", &name)
         .stdin(Stdio::null())
@@ -1077,7 +1145,7 @@ fn cmd_run(a: RunArgs) -> Result<Output> {
         scope: scope.clone(),
         name: name.clone(),
         command,
-        cwd: caller.cwd.clone(),
+        cwd: dir.clone(),
         port,
         pid,
         pgid: spawned.pgid,
@@ -1227,6 +1295,131 @@ fn run_result(
             )))
         }
     }
+}
+
+// ---------------------------------------------------------------- up / down
+
+/// `taba up`: `run --wait` for each selected service of the nearest
+/// `taba.toml`, in order. The first failure ends the command; services
+/// already started stay up and are reported under `results`.
+fn cmd_up(
+    names: Vec<String>,
+    scope_flag: Option<String>,
+    agent: Option<String>,
+    ttl: Option<config::Ttl>,
+) -> Result<Output> {
+    let caller = scope::resolve(scope_flag.clone(), agent.clone())?;
+    let scope = caller.require_scope()?;
+    let project = project::load_from(&caller.cwd)?;
+    let selected = project.select(&names)?;
+    let mut results: Vec<Value> = Vec::new();
+    let mut lines: Vec<String> = Vec::new();
+    let mut warnings = Vec::new();
+    let mut failure = None;
+    for (i, def) in selected.iter().enumerate() {
+        let res = cmd_run(RunArgs {
+            scope: scope_flag.clone(),
+            agent: agent.clone(),
+            name: def.name.clone(),
+            port: def.port.clone(),
+            wait: Some(def.wait),
+            ready: def.ready.clone(),
+            ttl,
+            service_ttl: def.service_ttl,
+            command: def.command.clone(),
+            cwd: Some(def.cwd.clone()),
+            env: def.env.clone(),
+        });
+        match res {
+            Ok(out) => {
+                results.push(Value::Object(out.body));
+                lines.push(out.text);
+                warnings.extend(out.warnings);
+            }
+            Err(e) => {
+                let skipped: Vec<&str> =
+                    selected[i + 1..].iter().map(|d| d.name.as_str()).collect();
+                results.push(json!({
+                    "service": format!("{scope}/{}", def.name),
+                    "status": "failed",
+                    "error": e.to_json(),
+                }));
+                let mut message = format!("taba up stopped at {scope}/{}: {}", def.name, e.message);
+                if !skipped.is_empty() {
+                    message.push_str(&format!("; not started: {}", skipped.join(", ")));
+                }
+                let mut f = TabaError::new(e.code, message).details(json!({
+                    "service": format!("{scope}/{}", def.name),
+                    "not_started": skipped,
+                    "cause": e.to_json(),
+                }));
+                for n in e.next {
+                    f = f.next(n);
+                }
+                failure = Some(f);
+                break;
+            }
+        }
+    }
+    let body = json!({
+        "project": project.path,
+        "scope": scope,
+        "results": results,
+    });
+    let mut out = Output::new(body, lines.join("\n"));
+    out.warnings = warnings;
+    out.failure = failure;
+    Ok(out)
+}
+
+/// `taba down`: stops the selected services of the nearest `taba.toml` in
+/// the caller's scope, with the rules of `taba stop`. A service with no
+/// record is already down.
+fn cmd_down(
+    names: Vec<String>,
+    scope_flag: Option<String>,
+    agent: Option<String>,
+    timeout: f64,
+) -> Result<Output> {
+    if !timeout.is_finite() || timeout < 0.0 {
+        return Err(TabaError::usage(
+            "--timeout must be a non-negative number of seconds",
+        ));
+    }
+    let timeout = Duration::from_secs_f64(timeout);
+    let caller = scope::resolve(scope_flag, agent)?;
+    let scope = caller.require_scope()?;
+    let project = project::load_from(&caller.cwd)?;
+    let selected = project.select(&names)?;
+    let store = Store::open()?;
+    let mut targets = Vec::new();
+    let mut absent = Vec::new();
+    for def in &selected {
+        if store.get(&scope, &def.name)?.is_some() {
+            targets.push((scope.clone(), def.name.clone()));
+        } else {
+            absent.push(format!("{scope}/{}", def.name));
+        }
+    }
+    let mut out = if targets.is_empty() {
+        Output::new(json!({ "results": [] }), String::new())
+    } else {
+        stop_services(&store, &caller, &targets, false, timeout, None)?
+    };
+    let mut lines: Vec<String> = Some(out.text.clone())
+        .filter(|t| !t.is_empty())
+        .into_iter()
+        .collect();
+    if let Some(Value::Array(results)) = out.body.get_mut("results") {
+        for id in &absent {
+            results.push(json!({ "service": id, "result": "absent" }));
+            lines.push(format!("{id}: not running (no record)"));
+        }
+    }
+    out.body.insert("project".into(), json!(project.path));
+    out.body.insert("scope".into(), json!(scope));
+    out.text = lines.join("\n");
+    Ok(out)
 }
 
 // ---------------------------------------------------------------- whoami

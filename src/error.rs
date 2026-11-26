@@ -164,7 +164,7 @@ pub fn exit_code(code: &str) -> u8 {
         | "E_NO_CLAIMANT" | "E_CONFLICT" | "E_STILL_RUNNING" => 3,
         "E_PORT_IN_USE" | "E_PORT_CLAIMED" | "E_NO_FREE_PORT" | "E_START_FAILED"
         | "E_NOT_READY" => 4,
-        "E_NOT_FOUND" | "E_DANGLING" => 5,
+        "E_NOT_FOUND" | "E_DANGLING" | "E_NO_PROJECT" => 5,
         _ => 1,
     }
 }
