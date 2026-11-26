@@ -2,7 +2,6 @@
 use super::archive::verified_binary;
 use super::*;
 use flate2::{Compression, write::GzEncoder};
-use sha2::{Digest, Sha256};
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -395,7 +394,7 @@ fn official(binary: &[u8]) -> Vec<u8> {
 const ASSET: &str = "taba-v0.3.0-x86_64-unknown-linux-gnu.tar.gz";
 
 fn sha(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    super::archive::sha256_hex(bytes)
 }
 
 fn published(archive: &[u8], sums: &str) -> (Mock, Release) {
@@ -1454,4 +1453,12 @@ fn only_http_404_counts_as_not_found() {
 #[test]
 fn https_client_builds_without_network() {
     assert!(GitHub::new(Progress::disabled()).is_ok());
+}
+
+#[test]
+fn sha256_hex_matches_known_vector() {
+    assert_eq!(
+        super::archive::sha256_hex(b"abc"),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
 }
